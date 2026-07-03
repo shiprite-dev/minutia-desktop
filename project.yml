@@ -1,0 +1,56 @@
+name: Minutia
+options:
+  bundleIdPrefix: app.minutia
+  deploymentTarget:
+    macOS: "14.4"
+packages:
+  Supabase:
+    url: https://github.com/supabase/supabase-swift
+    from: 2.48.0
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: 2.9.0
+targets:
+  Minutia:
+    type: application
+    platform: macOS
+    sources: [Minutia/Sources, Minutia/Resources]
+    dependencies:
+      - package: Supabase
+      - package: Sparkle
+    entitlements:
+      path: Minutia/Minutia.entitlements
+      properties:
+        com.apple.security.app-sandbox: false
+    settings:
+      base:
+        SWIFT_VERSION: "5.0"
+        PRODUCT_BUNDLE_IDENTIFIER: app.minutia.desktop
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        ENABLE_HARDENED_RUNTIME: true
+    info:
+      path: Minutia/Info.plist
+      properties:
+        CFBundleDisplayName: Minutia
+        LSUIElement: true
+        LSMinimumSystemVersion: "14.4"
+        NSMicrophoneUsageDescription: Minutia records your side of the meeting through the microphone.
+        NSAudioCaptureUsageDescription: Minutia records meeting audio playing on your Mac (Zoom, Teams, Meet) so it can transcribe the meeting.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        CFBundleURLTypes:
+          - CFBundleURLName: app.minutia.desktop
+            CFBundleURLSchemes: [minutia]
+  MinutiaTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: [Tests]
+    dependencies:
+      - target: Minutia
+schemes:
+  Minutia:
+    build:
+      targets: { Minutia: all }
+    test:
+      targets: [MinutiaTests]
