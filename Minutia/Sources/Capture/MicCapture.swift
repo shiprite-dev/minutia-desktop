@@ -26,6 +26,7 @@ final class MicCapture {
     /// must be enabled before `engine.start()`, and the tap format is re-read after enabling it
     /// because enabling VP changes the input node's output format.
     func start() async throws {
+        guard !running else { return }
         guard await AVCaptureDevice.requestAccess(for: .audio) else {
             throw CaptureError.permissionDenied
         }
@@ -61,6 +62,8 @@ final class MicCapture {
         converter = nil
         running = false
     }
+
+    deinit { stop() }
 
     private func process(_ pcm: AVAudioPCMBuffer) {
         guard let converter, pcm.frameLength > 0 else { return }
