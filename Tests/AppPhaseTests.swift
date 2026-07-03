@@ -28,7 +28,7 @@ final class AppPhaseTests: XCTestCase {
     }
 
     func test_anyState_failed_goesToError() {
-        let states: [AppPhase] = [.idle, .detected(app: "Teams"), .recording, .finalizing, .error("previous")]
+        let states: [AppPhase] = [.signedOut, .idle, .detected(app: "Teams"), .recording, .finalizing, .error("previous")]
         for state in states {
             XCTAssertEqual(state.next(.failed("boom")), .error("boom"))
         }
