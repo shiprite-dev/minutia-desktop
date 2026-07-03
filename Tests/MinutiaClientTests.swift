@@ -1,5 +1,36 @@
 import XCTest
 @testable import Minutia
+import Supabase
+
+/// Minimal URLProtocol stub for exercising MinutiaClient's URLSession.shared calls
+/// without hitting the network. Registered/unregistered per test case.
+final class URLProtocolStub: URLProtocol {
+    static var responseHandler: ((URLRequest) -> (Data, HTTPURLResponse))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let handler = URLProtocolStub.responseHandler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let (data, response) = handler(request)
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: data)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private func makeStubbedClient() -> MinutiaClient {
+    MinutiaClient(
+        instance: URL(string: "https://minutia.example.com")!,
+        supabase: SupabaseClient(supabaseURL: URL(string: "https://supabase.example.com")!, supabaseKey: "anon-key"),
+        tokenProvider: { "test-access-token" }
+    )
+}
 
 final class InstanceConfigNormalizeTests: XCTestCase {
     func test_normalize_addsHttpsWhenNoScheme() {
@@ -175,6 +206,156 @@ final class AgendaItemDecodingTests: XCTestCase {
         {"title":"Bad","startAt":"not-a-date","endAt":"2026-07-03T09:30:00Z"}
         """.data(using: .utf8)!
         XCTAssertThrowsError(try MinutiaClient.jsonDecoder.decode(AgendaItem.self, from: json))
+    }
+}
+
+final class AgendaEnvelopeDecodingTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        URLProtocol.registerClass(URLProtocolStub.self)
+    }
+
+    override func tearDown() {
+        URLProtocolStub.responseHandler = nil
+        URLProtocol.unregisterClass(URLProtocolStub.self)
+        super.tearDown()
+    }
+
+    private func stub(status: Int = 200, body: Data) {
+        URLProtocolStub.responseHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
+            return (body, response)
+        }
+    }
+
+    func test_agenda_decodesEnvelopeAndReturnsEvents() async throws {
+        let json = """
+        {"connected":true,"syncedAt":"2026-07-03T12:00:00.000Z","syncMode":"incremental","events":[{"id":"x1","calendarId":"primary","eventId":"e1","seriesId":"7d9a1c1e-1111-2222-3333-444455556666","meetingId":null,"seriesKind":"recurring","title":"Weekly Sync","description":null,"startAt":"2026-07-03T10:00:00-07:00","endAt":"2026-07-03T11:00:00-07:00","htmlLink":null,"meetingUrl":"https://meet.example.com/abc","attendeeEmails":[],"organizerEmail":null,"eventType":"default","eventStatus":"confirmed","meetingStatus":"upcoming"}]}
+        """.data(using: .utf8)!
+        stub(body: json)
+
+        let events = try await makeStubbedClient().agenda()
+
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events[0].seriesId, UUID(uuidString: "7d9a1c1e-1111-2222-3333-444455556666"))
+        XCTAssertNil(events[0].meetingId)
+        XCTAssertEqual(events[0].meetingUrl, "https://meet.example.com/abc")
+
+        let offsetFormatter = ISO8601DateFormatter()
+        offsetFormatter.formatOptions = [.withInternetDateTime]
+        XCTAssertEqual(events[0].startAt, offsetFormatter.date(from: "2026-07-03T10:00:00-07:00"))
+    }
+
+    func test_agenda_disconnectedEnvelopeDecodesToEmptyEvents() async throws {
+        let json = """
+        {"connected":false,"events":[]}
+        """.data(using: .utf8)!
+        stub(body: json)
+
+        let events = try await makeStubbedClient().agenda()
+        XCTAssertTrue(events.isEmpty)
+    }
+}
+
+final class RegisterSegmentStatusMappingTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        URLProtocol.registerClass(URLProtocolStub.self)
+    }
+
+    override func tearDown() {
+        URLProtocolStub.responseHandler = nil
+        URLProtocol.unregisterClass(URLProtocolStub.self)
+        super.tearDown()
+    }
+
+    private func stub(status: Int) {
+        URLProtocolStub.responseHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
+            return (Data(), response)
+        }
+    }
+
+    /// 2xx/409 succeed; 503 and all other 4xx give up (false, terminal); 5xx (other than 503) retry (throw).
+    func test_registerSegment_mapsEachStatusToContractResult() async {
+        let expected: [Int: Bool?] = [
+            200: true, 409: true,
+            400: false, 402: false, 403: false, 404: false, 415: false, 503: false,
+            500: nil, 502: nil,
+        ]
+
+        for (status, outcome) in expected {
+            stub(status: status)
+            switch outcome {
+            case .some(let value):
+                do {
+                    let result = try await makeStubbedClient().registerSegment(meetingId: "m1", seq: 0)
+                    XCTAssertEqual(result, value, "status \(status)")
+                } catch {
+                    XCTFail("status \(status) unexpectedly threw \(error)")
+                }
+            case .none:
+                do {
+                    _ = try await makeStubbedClient().registerSegment(meetingId: "m1", seq: 0)
+                    XCTFail("status \(status) expected to throw")
+                } catch let error as MinutiaClientError {
+                    guard case .serverError(let thrownStatus) = error else {
+                        return XCTFail("status \(status) threw unexpected error \(error)")
+                    }
+                    XCTAssertEqual(thrownStatus, status)
+                } catch {
+                    XCTFail("status \(status) threw unexpected error \(error)")
+                }
+            }
+        }
+    }
+}
+
+final class RequestTranscriptionStatusTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        URLProtocol.registerClass(URLProtocolStub.self)
+    }
+
+    override func tearDown() {
+        URLProtocolStub.responseHandler = nil
+        URLProtocol.unregisterClass(URLProtocolStub.self)
+        super.tearDown()
+    }
+
+    private func stub(status: Int) {
+        URLProtocolStub.responseHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
+            return (Data(), response)
+        }
+    }
+
+    func test_requestTranscription_doesNotThrowOnNon5xxOr503() async {
+        for status in [200, 400, 404, 503] {
+            stub(status: status)
+            do {
+                try await makeStubbedClient().requestTranscription(meetingId: "m1", expectedSegments: nil)
+            } catch {
+                XCTFail("status \(status) unexpectedly threw \(error)")
+            }
+        }
+    }
+
+    func test_requestTranscription_throwsOn5xxExceptFor503() async {
+        for status in [500, 502] {
+            stub(status: status)
+            do {
+                try await makeStubbedClient().requestTranscription(meetingId: "m1", expectedSegments: nil)
+                XCTFail("status \(status) expected to throw")
+            } catch let error as MinutiaClientError {
+                guard case .serverError(let thrownStatus) = error else {
+                    return XCTFail("status \(status) threw unexpected error \(error)")
+                }
+                XCTAssertEqual(thrownStatus, status)
+            } catch {
+                XCTFail("status \(status) threw unexpected error \(error)")
+            }
+        }
     }
 }
 
