@@ -21,6 +21,11 @@ struct AgendaItem: Codable {
     let meetingUrl: String?
 }
 
+/// GET /api/calendar/agenda envelope: connection state plus the event list.
+private struct AgendaResponse: Codable {
+    let events: [AgendaItem]
+}
+
 enum MinutiaClientError: Error {
     /// A retriable server failure (5xx other than the terminal 503).
     case serverError(status: Int)
@@ -142,8 +147,8 @@ struct MinutiaClient {
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
 
         if (200...299).contains(status) || status == 409 { return true }
-        if status == 503 {
-            Self.logger.notice("Segment transcription unconfigured (503) for meeting \(meetingId, privacy: .public) seq \(seq)")
+        if status == 503 || (400...499).contains(status) {
+            Self.logger.notice("Segment transcription terminal status \(status, privacy: .public) for meeting \(meetingId, privacy: .public) seq \(seq)")
             return false
         }
         throw MinutiaClientError.serverError(status: status)
@@ -182,6 +187,9 @@ struct MinutiaClient {
         let request = Self.finalTranscribeRequest(instance: instance, meetingId: meetingId, expectedSegments: expectedSegments, token: token)
         let (_, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if !(200...299).contains(status) {
+            Self.logger.notice("requestTranscription non-2xx status \(status, privacy: .public) for meeting \(meetingId, privacy: .public)")
+        }
         // 503 is terminal-not-configured; the transcript can still be assembled from
         // fast-lane segments, so it is not a hard failure. Retriable 5xx throws.
         if status >= 500 && status != 503 {
@@ -205,6 +213,6 @@ struct MinutiaClient {
         let token = try await tokenProvider()
         let request = Self.agendaRequest(instance: instance, token: token)
         let (data, _) = try await URLSession.shared.data(for: request)
-        return try Self.jsonDecoder.decode([AgendaItem].self, from: data)
+        return try Self.jsonDecoder.decode(AgendaResponse.self, from: data).events
     }
 }
