@@ -55,34 +55,37 @@ final class SegmentWriter {
         }
         buffer.frameLength = AVAudioFrameCount(count)
         samples.withUnsafeBufferPointer { src in
-            memcpy(buffer.floatChannelData![0], src.baseAddress! + start, count * MemoryLayout<Float>.stride)
+            _ = memcpy(buffer.floatChannelData![0], src.baseAddress! + start, count * MemoryLayout<Float>.stride)
         }
         try file.write(from: buffer)
     }
 
-    /// Appends samples to both files, rotating the segment file when it fills. Returns the closed
-    /// segment when a rotation happened this call (tick sizing guarantees at most one boundary).
-    func append(_ samples: [Float]) throws -> ClosedSegment? {
-        guard !samples.isEmpty, segmentFile != nil, let recording = recordingFile else {
-            return nil
+    /// Appends samples to both files, rotating the segment file whenever it fills. Loops until every
+    /// sample is consumed so a single call spanning multiple rotation boundaries surfaces every
+    /// closed segment (empty array = no rotation this call).
+    func append(_ samples: [Float]) throws -> [ClosedSegment] {
+        guard !samples.isEmpty, let active0 = segmentFile, let recording = recordingFile else {
+            return []
         }
         var idx = 0
-        var closed: ClosedSegment? = nil
-        var active = segmentFile!
+        var closed: [ClosedSegment] = []
+        var active = active0
         while idx < samples.count {
             let remainInSegment = Int(SegmentWriter.segmentFrames - segmentFrameCount)
             let chunk = min(samples.count - idx, remainInSegment, SegmentWriter.chunkFrames)
-            try write(samples, from: idx, count: chunk, to: active)
+
             try write(samples, from: idx, count: chunk, to: recording)
+            try write(samples, from: idx, count: chunk, to: active)
             segmentFrameCount += Int64(chunk)
             totalFrames += Int64(chunk)
             idx += chunk
 
             if segmentFrameCount == SegmentWriter.segmentFrames {
-                closed = ClosedSegment(seq: currentSeq, fileURL: segmentURL(currentSeq), frames: segmentFrameCount)
-                currentSeq += 1
+                let nextSeq = currentSeq + 1
+                active = try openSegment(seq: nextSeq)
+                closed.append(ClosedSegment(seq: currentSeq, fileURL: segmentURL(currentSeq), frames: segmentFrameCount))
+                currentSeq = nextSeq
                 segmentFrameCount = 0
-                active = try openSegment(seq: currentSeq)
                 segmentFile = active
             }
         }
@@ -90,7 +93,8 @@ final class SegmentWriter {
     }
 
     /// Closes both files. Returns the trailing partial segment (nil when it holds no frames) and the
-    /// full recording.
+    /// full recording. An empty trailing segment file (rotation landed exactly on the boundary) is
+    /// deleted from disk rather than left as an orphan.
     func finish() throws -> (finalSegment: ClosedSegment?, recording: ClosedSegment) {
         let partialFrames = segmentFrameCount
         let seq = currentSeq
@@ -98,9 +102,13 @@ final class SegmentWriter {
         segmentFile = nil
         recordingFile = nil
 
-        let finalSegment = partialFrames > 0
-            ? ClosedSegment(seq: seq, fileURL: segmentURL(seq), frames: partialFrames)
-            : nil
+        let finalSegment: ClosedSegment?
+        if partialFrames > 0 {
+            finalSegment = ClosedSegment(seq: seq, fileURL: segmentURL(seq), frames: partialFrames)
+        } else {
+            finalSegment = nil
+            try? FileManager.default.removeItem(at: segmentURL(seq))
+        }
         let recording = ClosedSegment(seq: -1, fileURL: recordingURL, frames: recordingFrames)
         return (finalSegment, recording)
     }
