@@ -34,7 +34,7 @@ final class SegmentWriterTests: XCTestCase {
     func test_shortAppend_noRotation() throws {
         let writer = try SegmentWriter(directory: dir)
         let closed = try writer.append(sine(seconds: 10))
-        XCTAssertNil(closed)
+        XCTAssertTrue(closed.isEmpty)
         XCTAssertEqual(writer.totalFrames, 480_000)
         XCTAssertEqual(writer.currentSeq, 0)
     }
@@ -42,7 +42,8 @@ final class SegmentWriterTests: XCTestCase {
     func test_append301s_rotatesOnce() throws {
         let writer = try SegmentWriter(directory: dir)
         let closed = try writer.append(sine(seconds: 301))
-        let seg = try XCTUnwrap(closed)
+        XCTAssertEqual(closed.count, 1)
+        let seg = closed[0]
         XCTAssertEqual(seg.seq, 0)
         XCTAssertEqual(seg.frames, SegmentWriter.segmentFrames)
         XCTAssertTrue(FileManager.default.fileExists(atPath: seg.fileURL.path))
@@ -51,6 +52,13 @@ final class SegmentWriterTests: XCTestCase {
         XCTAssertEqual(try duration(of: seg.fileURL), 300, accuracy: 1.0)
         XCTAssertEqual(writer.currentSeq, 1)
         XCTAssertEqual(seg.fileURL.deletingLastPathComponent().path, dir.path)
+    }
+
+    func test_append601s_inOneCall_surfacesBothRotations() throws {
+        let writer = try SegmentWriter(directory: dir)
+        let closed = try writer.append(sine(seconds: 601))
+        XCTAssertEqual(closed.map(\.seq), [0, 1])
+        XCTAssertEqual(writer.totalFrames, 48_000 * 601)
     }
 
     func test_finish_after320s_returnsPartialSegmentAndRecording() throws {
@@ -62,6 +70,15 @@ final class SegmentWriterTests: XCTestCase {
         XCTAssertEqual(try duration(of: final.fileURL), 20, accuracy: 1.0)
         XCTAssertEqual(try duration(of: result.recording.fileURL), 320, accuracy: 1.0)
         XCTAssertEqual(result.recording.frames, 320 * 48_000)
+    }
+
+    func test_finish_exactlyOnBoundary_deletesEmptySegmentFile() throws {
+        let writer = try SegmentWriter(directory: dir)
+        _ = try writer.append(sine(seconds: 300))
+        let result = try writer.finish()
+        XCTAssertNil(result.finalSegment)
+        let orphan = dir.appendingPathComponent("seg-1.m4a")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.path))
     }
 
     func test_finishImmediately_returnsNilFinalAndEmptyRecording() throws {
