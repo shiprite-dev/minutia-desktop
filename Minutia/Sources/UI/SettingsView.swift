@@ -31,6 +31,7 @@ struct SettingsView: View {
                     Button("Sign out") {
                         Task { await controller.authManager.signOut() }
                     }
+                    .disabled(AppController.shouldStopCaptureOnSignOut(phase: controller.phase))
                 } else {
                     Text("Not signed in")
                         .foregroundStyle(.secondary)

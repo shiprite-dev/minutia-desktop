@@ -25,25 +25,27 @@ struct MinutiaApp: App {
     }
 }
 
-/// Status item glyph per phase: waveform idle, exclamation on error, and a filled
-/// recording glyph with a gentle 1s opacity pulse while recording.
+/// Status item glyph per phase: waveform idle, exclamation on error, and a recording glyph
+/// that blinks between filled and hollow on a 1s timer while recording. Status items ignore
+/// `withAnimation`, so a real timer drives the affordance; it is invalidated the moment the
+/// icon leaves the recording phase, and stays a static filled glyph under Reduce Motion.
 struct MenuBarIcon: View {
     let phase: AppPhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var dimmed = false
+    @State private var hollow = false
+    @State private var timer: Timer?
 
     var body: some View {
+        glyph
+            .onAppear { syncPulse() }
+            .onChange(of: phase) { _, _ in syncPulse() }
+            .onDisappear { stopPulse() }
+    }
+
+    @ViewBuilder private var glyph: some View {
         switch phase {
         case .recording:
-            Image(systemName: "record.circle.fill")
-                .opacity(dimmed && !reduceMotion ? 0.5 : 1)
-                .onAppear {
-                    guard !reduceMotion else { return }
-                    withAnimation(.easeInOut(duration: 1).repeatForever(autoreverses: true)) {
-                        dimmed = true
-                    }
-                }
-                .onDisappear { dimmed = false }
+            Image(systemName: hollow && !reduceMotion ? "record.circle" : "record.circle.fill")
         case .finalizing:
             Image(systemName: "record.circle")
         case .error:
@@ -51,6 +53,20 @@ struct MenuBarIcon: View {
         default:
             Image(systemName: "waveform")
         }
+    }
+
+    private func syncPulse() {
+        stopPulse()
+        guard phase == .recording, !reduceMotion else { return }
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
+            hollow.toggle()
+        }
+    }
+
+    private func stopPulse() {
+        timer?.invalidate()
+        timer = nil
+        hollow = false
     }
 }
 
@@ -72,6 +88,25 @@ final class AppController: NSObject, ObservableObject {
     let detector = MeetingDetector()
 
     static let lastSeriesKey = "app.minutia.lastSeries"
+
+    /// Record can begin only from a resting or recoverable phase. Guards a stale detection
+    /// notification clicked mid-recording from starting a second server meeting and
+    /// overwriting the recording meeting id (which would open the wrong recap).
+    nonisolated static func canStartRecording(from phase: AppPhase) -> Bool {
+        switch phase {
+        case .idle, .detected, .error: return true
+        default: return false
+        }
+    }
+
+    /// Signing out mid-capture must tear the pipeline down first; mic and system audio would
+    /// otherwise keep recording invisibly with uploads failing auth.
+    nonisolated static func shouldStopCaptureOnSignOut(phase: AppPhase) -> Bool {
+        switch phase {
+        case .recording, .finalizing: return true
+        default: return false
+        }
+    }
 
     private var cancellables: Set<AnyCancellable> = []
     private var recordingMeetingId: UUID?
@@ -128,6 +163,9 @@ final class AppController: NSObject, ObservableObject {
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
             Task { await loadSeries() }
         } else {
+            if Self.shouldStopCaptureOnSignOut(phase: phase) {
+                Task { _ = try? await captureSession.stop() }
+            }
             apply(.signedOut)
             series = []
         }
@@ -173,6 +211,7 @@ final class AppController: NSObject, ObservableObject {
     /// Single start path shared by the Record button, the detection banner, and the
     /// notification action.
     func startRecording() {
+        guard Self.canStartRecording(from: phase) else { return }
         guard let seriesId = selectedSeriesId, let client = authManager.client() else { return }
         Task {
             do {
