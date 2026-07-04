@@ -19,6 +19,9 @@ final class CaptureSession: ObservableObject {
 
     enum CaptureError: Error { case notRunning }
 
+    /// Ceiling for the stop-time network finalize (drain + upload + finalize + transcribe request).
+    static let finalizeTimeout: TimeInterval = 30
+
     private var pipeline: CapturePipeline?
     private var queue: UploadQueue?
     private var client: MinutiaClient?
@@ -30,6 +33,10 @@ final class CaptureSession: ObservableObject {
     /// up asynchronously inside the pipeline so a permission prompt never blocks the caller.
     func start(meetingId: String, client: MinutiaClient) throws {
         guard pipeline == nil else { return }
+
+        // Canonicalize to the lowercase meeting id the DB row and the storage RLS policy use;
+        // Swift's UUID.uuidString is uppercase, which the case-sensitive path check would deny.
+        let meetingId = meetingId.lowercased()
 
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("minutia-capture-\(meetingId)", isDirectory: true)
@@ -86,37 +93,43 @@ final class CaptureSession: ObservableObject {
             queue.enqueue(finalSegment)
         }
 
-        let counts = await queue.drainAndWait()
-        segmentsUploaded = counts.uploaded
-        segmentsTotal = counts.enqueued
+        // Bound the network finalize so a stuck upload/finalize/transcribe (observed: a Kong 504 that
+        // hung 60s+, and indefinite hangs on repeated failures) throws instead of pinning the UI in
+        // .finalizing forever. TimeoutError propagates to the controller, which shows .error (Retry).
+        let outcome = try await withTimeout(seconds: Self.finalizeTimeout) {
+            let counts = await queue.drainAndWait()
+            let total = counts.enqueued
+            let allRegistered = total > 0 && counts.registered == total
 
-        let total = counts.enqueued
-        let allRegistered = total > 0 && counts.registered == total
+            if let recording = finished?.recording {
+                let path = try await client.uploadRecording(meetingId: meetingId, fileURL: recording.fileURL)
+                let duration = Double(recording.frames) / MixPlan.sampleRate
+                let attrs = try? FileManager.default.attributesOfItem(atPath: recording.fileURL.path)
+                let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+                try await client.finalizeMeeting(meetingId: meetingId, audioPath: path, duration: duration, sizeBytes: size)
+            }
 
-        if let recording = finished?.recording {
-            let path = try await client.uploadRecording(meetingId: meetingId, fileURL: recording.fileURL)
-            let duration = Double(recording.frames) / MixPlan.sampleRate
-            let attrs = try? FileManager.default.attributesOfItem(atPath: recording.fileURL.path)
-            let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
-            try await client.finalizeMeeting(meetingId: meetingId, audioPath: path, duration: duration, sizeBytes: size)
+            let expected = allRegistered ? total : nil
+            var transcriptRequested = false
+            do {
+                try await client.requestTranscription(meetingId: meetingId, expectedSegments: expected)
+                transcriptRequested = true
+            } catch {
+                transcriptRequested = false
+            }
+            return (counts: counts, expected: expected, transcriptRequested: transcriptRequested)
         }
 
-        let expected = allRegistered ? total : nil
-        var transcriptRequested = false
-        do {
-            try await client.requestTranscription(meetingId: meetingId, expectedSegments: expected)
-            transcriptRequested = true
-        } catch {
-            transcriptRequested = false
-        }
+        segmentsUploaded = outcome.counts.uploaded
+        segmentsTotal = outcome.counts.enqueued
 
         Task { await client.warmSummary(meetingId: meetingId) }
 
-        if transcriptRequested {
+        if outcome.transcriptRequested {
             try? FileManager.default.removeItem(at: directory)
         }
 
-        return StopResult(expectedSegments: expected, transcriptRequested: transcriptRequested)
+        return StopResult(expectedSegments: outcome.expected, transcriptRequested: outcome.transcriptRequested)
     }
 
     private func handleTick(peak: Float, closedCount: Int) {

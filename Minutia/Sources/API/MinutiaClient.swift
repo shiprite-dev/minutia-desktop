@@ -64,11 +64,20 @@ struct MinutiaClient {
 
     // MARK: - Pure request builders
 
+    // Storage object paths and meeting routes are lowercased at construction: the storage.objects
+    // RLS policy compares the path's meeting folder to the (lowercase, canonical) meeting id
+    // case-sensitively, so a Swift `UUID.uuidString` (uppercase) would be denied on every upload.
+
     static func segmentPath(meetingId: String, seq: Int) -> String {
-        "\(meetingId)/seg-\(seq).m4a"
+        "\(meetingId.lowercased())/seg-\(seq).m4a"
+    }
+
+    static func recordingPath(meetingId: String) -> String {
+        "\(meetingId.lowercased())/recording.m4a"
     }
 
     static func registerSegmentRequest(instance: URL, meetingId: String, seq: Int, token: String) -> URLRequest {
+        let meetingId = meetingId.lowercased()
         var request = bearerRequest(
             instance.appendingPathComponent("api/meetings/\(meetingId)/segments/\(seq)/transcribe"),
             method: "POST",
@@ -80,6 +89,7 @@ struct MinutiaClient {
     }
 
     static func finalTranscribeRequest(instance: URL, meetingId: String, expectedSegments: Int?, token: String) -> URLRequest {
+        let meetingId = meetingId.lowercased()
         var request = bearerRequest(
             instance.appendingPathComponent("api/meetings/\(meetingId)/transcribe"),
             method: "POST",
@@ -93,7 +103,7 @@ struct MinutiaClient {
 
     static func summaryWarmupRequest(instance: URL, meetingId: String, token: String) -> URLRequest {
         bearerRequest(
-            instance.appendingPathComponent("api/meetings/\(meetingId)/summary/stream"),
+            instance.appendingPathComponent("api/meetings/\(meetingId.lowercased())/summary/stream"),
             method: "POST",
             token: token
         )
@@ -170,7 +180,7 @@ struct MinutiaClient {
     }
 
     func uploadRecording(meetingId: String, fileURL: URL) async throws -> String {
-        let path = "\(meetingId)/recording.m4a"
+        let path = Self.recordingPath(meetingId: meetingId)
         try await supabase.storage
             .from(Self.audioBucket)
             .upload(path, fileURL: fileURL, options: FileOptions(contentType: "audio/mp4", upsert: true))
