@@ -58,8 +58,7 @@ struct SignInView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 320)
-        .padding()
+        .fixedSize(horizontal: false, vertical: true)
         .task { hydrateStoredInstance() }
     }
 
