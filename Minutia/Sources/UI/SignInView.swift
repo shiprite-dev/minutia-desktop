@@ -1,15 +1,17 @@
 import AppKit
 import SwiftUI
 
-/// Native macOS sign-in: connect to an instance, then browser sign-in (primary) with
-/// email/password and Google as a collapsed fallback. No custom chrome; HIG form controls.
+/// Native macOS sign-in. The companion auto-connects to the managed cloud instance (or the
+/// stored self-host instance) on appear, so the user never sees instance plumbing: they land
+/// straight on browser sign-in (primary) with email/password and Google as a collapsed
+/// fallback. Instance changes live in Settings, for self-hosters only.
 struct SignInView: View {
     @ObservedObject var authManager: AuthManager
+    @Environment(\.openSettings) private var openSettings
 
-    @State private var instanceText = ""
     @State private var email = ""
     @State private var password = ""
-    @State private var connected = false
+    @State private var connecting = true
     @State private var busy = false
     @State private var showEmailForm = false
     @State private var errorMessage: String?
@@ -24,16 +26,23 @@ struct SignInView: View {
     }
 
     var body: some View {
-        Form {
-            Section("Instance") {
-                TextField("https://minutia.example.com", text: $instanceText)
-                    .textContentType(.URL)
-                    .disabled(connected || busy)
-                Button(connected ? "Connected" : "Connect", action: connect)
-                    .disabled(connected || busy || InstanceConfig.normalize(instanceText) == nil)
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Image(nsImage: NSApp.applicationIconImage)
+                    .resizable()
+                    .frame(width: 28, height: 28)
+                Text("Minutia").font(.headline)
             }
+            .padding(12)
 
-            if connected {
+            form
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var form: some View {
+        Form {
+            if authManager.isConnected {
                 Section("Sign in") {
                     Button("Sign in with browser", action: signInWithBrowser)
                         .keyboardShortcut(.defaultAction)
@@ -49,30 +58,51 @@ struct SignInView: View {
                             .disabled(busy)
                     }
                 }
+            } else if connecting {
+                Section {
+                    HStack(spacing: 10) {
+                        ProgressView().controlSize(.small)
+                        Text("Connecting to Minutia")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
 
             if let message = errorMessage ?? authManager.callbackError {
-                Text(message)
-                    .foregroundStyle(.red)
-                    .font(.callout)
+                Section {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(message)
+                            .foregroundStyle(.red)
+                            .font(.callout)
+                        if !authManager.isConnected {
+                            Button("Change instance in Settings") {
+                                NSApp.activate(ignoringOtherApps: true)
+                                openSettings()
+                            }
+                            .buttonStyle(.link)
+                            .font(.callout)
+                        }
+                    }
+                }
             }
         }
         .formStyle(.grouped)
-        .fixedSize(horizontal: false, vertical: true)
-        .task { hydrateStoredInstance() }
+        .task { await autoConnect() }
     }
 
-    private func hydrateStoredInstance() {
-        // A restored session may have already built the Supabase client; reflect that
-        // so the sign-in fields show without a redundant Connect step.
-        if authManager.supabase != nil { connected = true }
-        guard let stored = InstanceConfig.stored else { return }
-        if instanceText.isEmpty { instanceText = stored.instance.absoluteString }
-    }
-
-    private func connect() {
-        guard let url = InstanceConfig.normalize(instanceText) else { return }
-        run { try await authManager.connect(instance: url); connected = true }
+    /// Connect to the resolved instance the moment the sign-in screen appears. Idempotent with
+    /// restoreSession(): a client already built by session restore short-circuits here.
+    private func autoConnect() async {
+        guard authManager.supabase == nil else { connecting = false; return }
+        connecting = true
+        errorMessage = nil
+        do {
+            try await authManager.ensureConnected()
+        } catch {
+            errorMessage = "Could not connect to Minutia. \(error.localizedDescription)"
+        }
+        connecting = false
     }
 
     private func signInWithBrowser() {

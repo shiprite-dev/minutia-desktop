@@ -10,10 +10,14 @@ final class AuthManager: ObservableObject {
     @Published private(set) var userEmail: String?
     /// Set when the browser sign-in callback fails so SignInView can show it inline.
     @Published var callbackError: String?
+    /// Connection truth: true once a Supabase client is built for an instance. Cleared when a
+    /// (re)connect fails so the status never reports a stale previous connection.
+    @Published private(set) var isConnected = false
 
     private(set) var supabase: SupabaseClient?
     private(set) var instance: URL?
     private var lastHandledTokenHash: String?
+    private var connectTask: Task<Void, Error>?
 
     static let redirectURL = URL(string: "minutia://auth-callback")!
 
@@ -27,22 +31,47 @@ final class AuthManager: ObservableObject {
         return components.queryItems?.first(where: { $0.name == "token_hash" })?.value
     }
 
+    /// Auto-connect for first run and relaunch: use the stored (self-host) instance when
+    /// present, else the managed cloud default. Single-flight, so restoreSession() and
+    /// SignInView's on-appear can fire concurrently without opening two connects; the second
+    /// caller awaits the first's in-flight attempt, and a built client short-circuits both.
+    func ensureConnected() async throws {
+        guard supabase == nil else { return }
+        if let connectTask { return try await connectTask.value }
+        let task = Task { try await connect(instance: InstanceConfig.resolvedInstance) }
+        connectTask = task
+        defer { connectTask = nil }
+        try await task.value
+    }
+
     /// Fetch the instance's public connection details and build the Supabase client.
     /// Rehydrates `userEmail` from any Keychain-persisted session.
     func connect(instance: URL) async throws {
-        let (data, _) = try await URLSession.shared.data(for: InstanceConfig.metaRequest(instance: instance))
-        let meta = try JSONDecoder().decode(InstanceMeta.self, from: data)
+        do {
+            let (data, _) = try await URLSession.shared.data(for: InstanceConfig.metaRequest(instance: instance))
+            let meta = try JSONDecoder().decode(InstanceMeta.self, from: data)
 
-        let client = SupabaseClient(supabaseURL: meta.supabaseUrl, supabaseKey: meta.supabaseAnonKey)
-        self.supabase = client
-        self.instance = instance
-        InstanceConfig.stored = (instance: instance, meta: meta)
+            let client = SupabaseClient(supabaseURL: meta.supabaseUrl, supabaseKey: meta.supabaseAnonKey)
+            self.supabase = client
+            self.instance = instance
+            self.isConnected = true
+            InstanceConfig.stored = (instance: instance, meta: meta)
 
-        // A prior session may already be in the Keychain: surface it so a relaunch
-        // lands signed in without re-prompting.
-        if let session = try? await client.auth.session {
-            userEmail = session.user.email
-            fireHeartbeat()
+            // A prior session may already be in the Keychain: surface it so a relaunch
+            // lands signed in without re-prompting.
+            if let session = try? await client.auth.session {
+                userEmail = session.user.email
+                fireHeartbeat()
+            }
+        } catch {
+            // A failed (re)connect must not leave a stale client reporting connected, nor a
+            // signed-in phase with no client behind it. Clearing userEmail drops the app to the
+            // sign-in screen, whose auto-connect recovers against the still-stored instance.
+            self.supabase = nil
+            self.instance = nil
+            self.isConnected = false
+            self.userEmail = nil
+            throw error
         }
     }
 

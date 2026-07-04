@@ -13,6 +13,17 @@ enum InstanceConfig {
     static var defaults: UserDefaults = .standard
     private static let storageKey = "app.minutia.instance"
 
+    /// The managed cloud instance the companion connects to by default. Self-hosters
+    /// change this to their own instance in Settings, which persists and thereafter wins.
+    static let defaultInstance = URL(string: "https://app.getminutia.com")!
+
+    /// The instance to auto-connect to: a stored (self-host) choice always wins; the
+    /// managed cloud default is only a fallback when nothing has been stored. Reading this
+    /// never writes, so it cannot overwrite a stored self-host URL.
+    static var resolvedInstance: URL {
+        stored?.instance ?? defaultInstance
+    }
+
     static func normalize(_ raw: String) -> URL? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
