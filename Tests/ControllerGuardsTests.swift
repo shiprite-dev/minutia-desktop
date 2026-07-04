@@ -37,4 +37,40 @@ final class ControllerGuardsTests: XCTestCase {
             XCTAssertFalse(AppController.shouldStopCaptureOnSignOut(phase: phase))
         }
     }
+
+    // MARK: - Soft-detection hint
+
+    /// Soft confidence (mic active, no corroborating app/calendar signal) surfaces the quiet
+    /// hint only while resting at idle. It must stay invisible mid-capture and never compete
+    /// with the .high detection banner.
+    func test_shouldShowSoftHint_trueOnlyForSoftAtIdle() {
+        XCTAssertTrue(AppController.shouldShowSoftHint(confidence: .soft, phase: .idle))
+    }
+
+    func test_shouldShowSoftHint_falseForSoftInEveryNonIdlePhase() {
+        let nonIdle: [AppPhase] = [
+            .signedOut, .detected(app: "Zoom"), .detected(app: nil),
+            .recording, .finalizing, .error("boom"),
+        ]
+        for phase in nonIdle {
+            XCTAssertFalse(
+                AppController.shouldShowSoftHint(confidence: .soft, phase: phase),
+                "soft hint must not show in \(phase)")
+        }
+    }
+
+    func test_shouldShowSoftHint_falseForHighAndNoneInEveryPhase() {
+        let phases: [AppPhase] = [
+            .signedOut, .idle, .detected(app: "Zoom"), .detected(app: nil),
+            .recording, .finalizing, .error("boom"),
+        ]
+        let nonSoft: [DetectionConfidence] = [.high(.zoom), .high(.teams), .high(nil), .none]
+        for confidence in nonSoft {
+            for phase in phases {
+                XCTAssertFalse(
+                    AppController.shouldShowSoftHint(confidence: confidence, phase: phase),
+                    "\(confidence) must never show the soft hint (phase \(phase))")
+            }
+        }
+    }
 }

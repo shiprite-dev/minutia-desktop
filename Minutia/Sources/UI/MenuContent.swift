@@ -43,6 +43,8 @@ private struct IdleView: View {
         VStack(alignment: .leading, spacing: 12) {
             if let detectedVia {
                 DetectionBanner(via: detectedVia, controller: controller)
+            } else if controller.softHint {
+                SoftHintRow()
             }
 
             if controller.series.isEmpty {
@@ -69,6 +71,20 @@ private struct IdleView: View {
             .disabled(controller.selectedSeriesId == nil)
         }
         .padding(12)
+    }
+}
+
+/// Quiet soft-detection nudge: mic active but no corroborating meeting signal. Deliberately
+/// styled secondary (not the accent banner) so it reads as a whisper, not an alert.
+private struct SoftHintRow: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "mic")
+            Text("In a meeting? Record picks it up from here.")
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .font(.callout)
+        .foregroundStyle(.secondary)
     }
 }
 
