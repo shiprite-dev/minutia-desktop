@@ -1,93 +1,261 @@
-import SwiftUI
-#if DEBUG
 import AppKit
-#endif
+import Combine
+import SwiftUI
+import UserNotifications
 
 @main
 struct MinutiaApp: App {
-    @StateObject private var authManager = AuthManager()
+    @StateObject private var controller = AppController()
 
     var body: some Scene {
-        MenuBarExtra("Minutia", systemImage: "waveform") {
-            Group {
-                if authManager.userEmail == nil {
-                    SignInView(authManager: authManager)
-                } else {
-                    SignedInView(authManager: authManager)
+        MenuBarExtra {
+            MenuContent(controller: controller)
+                .onOpenURL { url in
+                    Task { await controller.authManager.handleCallback(url) }
                 }
-            }
-            .onOpenURL { url in
-                Task { await authManager.handleCallback(url) }
-            }
-            .task { await restoreSession() }
+                .task { await controller.restoreSession() }
+        } label: {
+            MenuBarIcon(phase: controller.phase)
         }
         .menuBarExtraStyle(.window)
+
+        Settings {
+            SettingsView(controller: controller)
+        }
+    }
+}
+
+/// Status item glyph per phase: waveform idle, exclamation on error, and a filled
+/// recording glyph with a gentle 1s opacity pulse while recording.
+struct MenuBarIcon: View {
+    let phase: AppPhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var dimmed = false
+
+    var body: some View {
+        switch phase {
+        case .recording:
+            Image(systemName: "record.circle.fill")
+                .opacity(dimmed && !reduceMotion ? 0.5 : 1)
+                .onAppear {
+                    guard !reduceMotion else { return }
+                    withAnimation(.easeInOut(duration: 1).repeatForever(autoreverses: true)) {
+                        dimmed = true
+                    }
+                }
+                .onDisappear { dimmed = false }
+        case .finalizing:
+            Image(systemName: "record.circle")
+        case .error:
+            Image(systemName: "waveform.badge.exclamationmark")
+        default:
+            Image(systemName: "waveform")
+        }
+    }
+}
+
+/// Orchestrates the menu bar app: folds auth, detection, and capture signals through the
+/// AppPhase reducer, and owns the record/stop flows. Views stay logic-free; every state
+/// decision lives in `AppPhase.next` under tests.
+@MainActor
+final class AppController: NSObject, ObservableObject {
+    @Published private(set) var phase: AppPhase = .signedOut
+    @Published private(set) var series: [Series] = []
+    @Published var selectedSeriesId: UUID? {
+        didSet {
+            UserDefaults.standard.set(selectedSeriesId?.uuidString, forKey: Self.lastSeriesKey)
+        }
+    }
+
+    let authManager = AuthManager()
+    let captureSession = CaptureSession()
+    let detector = MeetingDetector()
+
+    static let lastSeriesKey = "app.minutia.lastSeries"
+
+    private var cancellables: Set<AnyCancellable> = []
+    private var recordingMeetingId: UUID?
+    private var recordingSeriesId: UUID?
+
+    override init() {
+        super.init()
+        MeetingDetector.registerNotificationCategory()
+        UNUserNotificationCenter.current().delegate = self
+        installURLHandler()
+
+        authManager.$userEmail
+            .removeDuplicates()
+            .sink { [weak self] email in self?.handleAuthChange(signedIn: email != nil) }
+            .store(in: &cancellables)
+
+        detector.$confidence
+            .removeDuplicates()
+            .sink { [weak self] confidence in self?.handleDetection(confidence) }
+            .store(in: &cancellables)
     }
 
     /// Rehydrate the Supabase client from the persisted instance so a Keychain
     /// session lands the app signed in without another Connect step.
-    private func restoreSession() async {
+    func restoreSession() async {
         guard authManager.supabase == nil, let stored = InstanceConfig.stored else { return }
         try? await authManager.connect(instance: stored.instance)
     }
-}
 
-private struct SignedInView: View {
-    @ObservedObject var authManager: AuthManager
+    // MARK: - Phase transitions
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(authManager.userEmail ?? "")
-                .font(.headline)
-            Button("Sign out") {
-                Task { await authManager.signOut() }
-            }
-            #if DEBUG
-            Divider()
-            Button("Debug: 10s capture smoke") {
-                Task { await runCaptureSmoke() }
-            }
-            #endif
+    private func apply(_ event: AppEvent) {
+        let next = phase.next(event)
+        guard next != phase else { return }
+        phase = next
+        syncDetector()
+    }
+
+    /// The detector runs only while signed in and not capturing; our own mic use during a
+    /// recording would otherwise re-trigger detection and post a spurious notification.
+    private func syncDetector() {
+        switch phase {
+        case .idle, .detected:
+            guard let client = authManager.client() else { return }
+            detector.start(agendaProvider: { (try? await client.agenda()) ?? [] })
+        default:
+            detector.stop()
         }
-        .padding()
-        .frame(width: 240)
+    }
+
+    private func handleAuthChange(signedIn: Bool) {
+        if signedIn {
+            apply(.signedIn)
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+            Task { await loadSeries() }
+        } else {
+            apply(.signedOut)
+            series = []
+        }
+    }
+
+    private func handleDetection(_ confidence: DetectionConfidence) {
+        switch confidence {
+        case .high(let app):
+            apply(.meetingDetected(Self.detectionLabel(app)))
+        case .none:
+            // The corroborating signal is gone (mic released): retire a stale banner.
+            if case .detected = phase { apply(.dismissedDetection) }
+        case .soft:
+            break
+        }
+    }
+
+    /// Banner wording source: "Meeting detected via {Zoom/Teams/Calendar}".
+    static func detectionLabel(_ app: MeetingApp?) -> String {
+        switch app {
+        case .zoom: return "Zoom"
+        case .teams: return "Teams"
+        case nil: return "Calendar"
+        }
+    }
+
+    // MARK: - Series
+
+    private func loadSeries() async {
+        guard let client = authManager.client() else { return }
+        guard let owned = try? await client.ownedSeries() else { return }
+        series = owned
+        let last = UserDefaults.standard.string(forKey: Self.lastSeriesKey).flatMap(UUID.init(uuidString:))
+        if let last, owned.contains(where: { $0.id == last }) {
+            selectedSeriesId = last
+        } else if selectedSeriesId == nil || !owned.contains(where: { $0.id == selectedSeriesId }) {
+            selectedSeriesId = owned.first?.id
+        }
+    }
+
+    // MARK: - Record / stop
+
+    /// Single start path shared by the Record button, the detection banner, and the
+    /// notification action.
+    func startRecording() {
+        guard let seriesId = selectedSeriesId, let client = authManager.client() else { return }
+        Task {
+            do {
+                let meeting = try await client.startOrJoinMeeting(seriesId: seriesId)
+                try captureSession.start(meetingId: meeting.id.uuidString, client: client)
+                recordingMeetingId = meeting.id
+                recordingSeriesId = seriesId
+                apply(.recordStarted)
+            } catch {
+                apply(.failed("Could not start recording: \(error.localizedDescription)"))
+            }
+        }
+    }
+
+    func stopRecording() {
+        apply(.recordStopped)
+        Task {
+            do {
+                _ = try await captureSession.stop()
+                apply(.finalized)
+                openRecap()
+            } catch {
+                apply(.failed("Could not finish recording: \(error.localizedDescription)"))
+            }
+        }
+    }
+
+    func dismissDetection() {
+        apply(.dismissedDetection)
+    }
+
+    /// Error-phase actions: Retry re-runs the start path, Dismiss returns to idle.
+    func retry() {
+        startRecording()
+    }
+
+    func dismissError() {
+        apply(.dismissedDetection)
+    }
+
+    /// Land the flowing recap in front of the user the moment finalize completes.
+    private func openRecap() {
+        guard let instance = authManager.instance,
+              let seriesId = recordingSeriesId, let meetingId = recordingMeetingId else { return }
+        recordingMeetingId = nil
+        recordingSeriesId = nil
+        let url = instance.appendingPathComponent(
+            "series/\(seriesId.uuidString.lowercased())/meetings/\(meetingId.uuidString.lowercased())")
+        NSWorkspace.shared.open(url)
+    }
+
+    // MARK: - URL callback
+
+    /// `onOpenURL` is unreliable for MenuBarExtra apps while the panel is closed, so the
+    /// kAEGetURL Apple event is handled directly; AuthManager routes both the browser
+    /// magic-link (token_hash) and the Google PKCE (code) callbacks.
+    private func installURLHandler() {
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleGetURL(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kInternetEventClass),
+            andEventID: AEEventID(kAEGetURL))
+    }
+
+    @objc private func handleGetURL(_ event: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor) {
+        guard let raw = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
+              let url = URL(string: raw) else { return }
+        Task { await authManager.handleCallback(url) }
     }
 }
 
-#if DEBUG
-/// Runs the tap + mic + segment writer for 10 seconds into ~/Downloads/minutia-smoke with no
-/// upload, then reveals the output in Finder. Exercises the capture graph end to end for a manual
-/// TCC/audio smoke check; excluded from release builds.
-private func runCaptureSmoke() async {
-    let dir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Downloads/minutia-smoke", isDirectory: true)
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    guard let writer = try? SegmentWriter(directory: dir) else { return }
-
-    let micBuffer = RingBuffer(capacityFrames: Int(MixPlan.sampleRate) * 12)
-    let sysBuffer = RingBuffer(capacityFrames: Int(MixPlan.sampleRate) * 12)
-    let tap = SystemAudioTap(into: sysBuffer)
-    let mic = MicCapture(into: micBuffer)
-    try? tap.start()
-    try? await mic.start()
-
-    var micScratch = [Float](repeating: 0, count: MixPlan.tickFrames)
-    var sysScratch = [Float](repeating: 0, count: MixPlan.tickFrames)
-    let deadline = Date().addingTimeInterval(10)
-    while Date() < deadline {
-        try? await Task.sleep(nanoseconds: 250_000_000)
-        let plan = MixPlan.plan(micAvailable: micBuffer.availableFrames, sysAvailable: sysBuffer.availableFrames)
-        let micGot = micBuffer.pop(into: &micScratch, count: plan.micFrames)
-        let sysGot = sysBuffer.pop(into: &sysScratch, count: plan.sysFrames)
-        let count = max(micGot, sysGot)
-        guard count > 0 else { continue }
-        let mixed = MixPlan.mix(mic: Array(micScratch[0..<micGot]), sys: Array(sysScratch[0..<sysGot]), count: count)
-        _ = try? writer.append(mixed)
+extension AppController: UNUserNotificationCenterDelegate {
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let actionId = response.actionIdentifier
+        Task { @MainActor in
+            if actionId == MeetingDetector.recordActionId {
+                self.startRecording()
+            }
+            completionHandler()
+        }
     }
-
-    tap.stop()
-    mic.stop()
-    _ = try? writer.finish()
-    NSWorkspace.shared.activateFileViewerSelecting([dir])
 }
-#endif

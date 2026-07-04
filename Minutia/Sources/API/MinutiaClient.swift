@@ -103,6 +103,21 @@ struct MinutiaClient {
         bearerRequest(instance.appendingPathComponent("api/calendar/agenda"), method: "GET", token: token)
     }
 
+    static func heartbeatRequest(instance: URL, token: String) -> URLRequest {
+        bearerRequest(instance.appendingPathComponent("api/companion/heartbeat"), method: "POST", token: token)
+    }
+
+    /// Browser sign-in entry point: the instance mints a companion magic link that redirects back
+    /// to `minutia://auth-callback`. `device` labels the session in the web UI (percent-encoded by
+    /// URLComponents).
+    static func companionAuthorizeURL(instance: URL, device: String) -> URL {
+        var components = URLComponents(
+            url: instance.appendingPathComponent("companion/authorize"),
+            resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "device", value: device)]
+        return components.url!
+    }
+
     private static func bearerRequest(_ url: URL, method: String, token: String) -> URLRequest {
         var request = URLRequest(url: url)
         request.httpMethod = method
@@ -194,6 +209,18 @@ struct MinutiaClient {
         // fast-lane segments, so it is not a hard failure. Retriable 5xx throws.
         if status >= 500 && status != 503 {
             throw MinutiaClientError.serverError(status: status)
+        }
+    }
+
+    /// Announces this companion instance to the web app. Fire-and-forget: failures are ignored so a
+    /// flaky network or a not-yet-deployed route never blocks sign-in or launch.
+    func heartbeat() async {
+        do {
+            let token = try await tokenProvider()
+            let request = Self.heartbeatRequest(instance: instance, token: token)
+            _ = try await URLSession.shared.data(for: request)
+        } catch {
+            Self.logger.debug("heartbeat skipped: \(error.localizedDescription, privacy: .public)")
         }
     }
 

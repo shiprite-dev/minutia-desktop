@@ -15,8 +15,16 @@ final class AppPhaseTests: XCTestCase {
         XCTAssertEqual(AppPhase.detected(app: "Zoom").next(.recordStarted), .recording)
     }
 
+    func test_idle_recordStarted_goesToRecording() {
+        XCTAssertEqual(AppPhase.idle.next(.recordStarted), .recording)
+    }
+
     func test_detected_dismissedDetection_goesToIdle() {
         XCTAssertEqual(AppPhase.detected(app: "Zoom").next(.dismissedDetection), .idle)
+    }
+
+    func test_error_dismissedDetection_goesToIdle() {
+        XCTAssertEqual(AppPhase.error("boom").next(.dismissedDetection), .idle)
     }
 
     func test_recording_recordStopped_goesToFinalizing() {

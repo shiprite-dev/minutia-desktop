@@ -30,9 +30,9 @@ extension AppPhase {
             return .idle
         case (.idle, .meetingDetected(let app)):
             return .detected(app: app)
-        case (.detected, .recordStarted), (.error, .recordStarted):
+        case (.idle, .recordStarted), (.detected, .recordStarted), (.error, .recordStarted):
             return .recording
-        case (.detected, .dismissedDetection):
+        case (.detected, .dismissedDetection), (.error, .dismissedDetection):
             return .idle
         case (.recording, .recordStopped):
             return .finalizing

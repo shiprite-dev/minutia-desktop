@@ -1,7 +1,8 @@
+import AppKit
 import SwiftUI
 
-/// Native macOS sign-in: connect to an instance, then password or Google sign-in.
-/// No custom chrome; standard HIG form controls.
+/// Native macOS sign-in: connect to an instance, then browser sign-in (primary) with
+/// email/password and Google as a collapsed fallback. No custom chrome; HIG form controls.
 struct SignInView: View {
     @ObservedObject var authManager: AuthManager
 
@@ -10,6 +11,7 @@ struct SignInView: View {
     @State private var password = ""
     @State private var connected = false
     @State private var busy = false
+    @State private var showEmailForm = false
     @State private var errorMessage: String?
 
     /// Pure gate for the sign-in button: a plausible email and a non-empty password.
@@ -33,20 +35,24 @@ struct SignInView: View {
 
             if connected {
                 Section("Sign in") {
-                    TextField("Email", text: $email)
-                        .textContentType(.username)
-                    SecureField("Password", text: $password)
-                        .textContentType(.password)
-                    Button("Sign in", action: signIn)
+                    Button("Sign in with browser", action: signInWithBrowser)
                         .keyboardShortcut(.defaultAction)
-                        .disabled(busy || !Self.canSubmit(email: email, password: password))
-                    Button("Sign in with Google", action: signInWithGoogle)
                         .disabled(busy)
+                    DisclosureGroup("Use email instead", isExpanded: $showEmailForm) {
+                        TextField("Email", text: $email)
+                            .textContentType(.username)
+                        SecureField("Password", text: $password)
+                            .textContentType(.password)
+                        Button("Sign in", action: signIn)
+                            .disabled(busy || !Self.canSubmit(email: email, password: password))
+                        Button("Sign in with Google", action: signInWithGoogle)
+                            .disabled(busy)
+                    }
                 }
             }
 
-            if let errorMessage {
-                Text(errorMessage)
+            if let message = errorMessage ?? authManager.callbackError {
+                Text(message)
                     .foregroundStyle(.red)
                     .font(.callout)
             }
@@ -68,6 +74,14 @@ struct SignInView: View {
     private func connect() {
         guard let url = InstanceConfig.normalize(instanceText) else { return }
         run { try await authManager.connect(instance: url); connected = true }
+    }
+
+    private func signInWithBrowser() {
+        guard let instance = authManager.instance else { return }
+        errorMessage = nil
+        authManager.callbackError = nil
+        let device = Host.current().localizedName ?? "Mac"
+        NSWorkspace.shared.open(MinutiaClient.companionAuthorizeURL(instance: instance, device: device))
     }
 
     private func signIn() {

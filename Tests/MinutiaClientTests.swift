@@ -165,6 +165,28 @@ final class MinutiaClientBuilderTests: XCTestCase {
         XCTAssertEqual(request.httpMethod, "GET")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-access-token")
     }
+
+    func test_heartbeatRequest_hasContractPathAndHeaders() {
+        let request = MinutiaClient.heartbeatRequest(instance: instance, token: token)
+
+        XCTAssertEqual(request.url, URL(string: "https://minutia.example.com/api/companion/heartbeat"))
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-access-token")
+    }
+
+    func test_companionAuthorizeURL_percentEncodesDeviceName() {
+        let url = MinutiaClient.companionAuthorizeURL(instance: instance, device: "Pratik's MacBook Pro")
+
+        XCTAssertEqual(
+            url.absoluteString,
+            "https://minutia.example.com/companion/authorize?device=Pratik's%20MacBook%20Pro")
+    }
+
+    func test_companionAuthorizeURL_plainDeviceName() {
+        let url = MinutiaClient.companionAuthorizeURL(instance: instance, device: "studio")
+
+        XCTAssertEqual(url.absoluteString, "https://minutia.example.com/companion/authorize?device=studio")
+    }
 }
 
 final class AgendaItemDecodingTests: XCTestCase {
@@ -394,6 +416,24 @@ final class AuthRedirectTests: XCTestCase {
         let components = URLComponents(url: AuthManager.redirectURL, resolvingAgainstBaseURL: false)
         XCTAssertEqual(components?.scheme, "minutia")
         XCTAssertEqual(components?.host, "auth-callback")
+    }
+
+    @MainActor
+    func test_tokenHash_extractsFromBrowserCallback() {
+        let url = URL(string: "minutia://auth-callback?token_hash=abc-123")!
+        XCTAssertEqual(AuthManager.tokenHash(from: url), "abc-123")
+    }
+
+    @MainActor
+    func test_tokenHash_nilForPKCECodeCallback() {
+        let url = URL(string: "minutia://auth-callback?code=pkce-code")!
+        XCTAssertNil(AuthManager.tokenHash(from: url))
+    }
+
+    @MainActor
+    func test_tokenHash_nilForForeignURL() {
+        XCTAssertNil(AuthManager.tokenHash(from: URL(string: "https://example.com?token_hash=abc")!))
+        XCTAssertNil(AuthManager.tokenHash(from: URL(string: "minutia://other?token_hash=abc")!))
     }
 }
 
