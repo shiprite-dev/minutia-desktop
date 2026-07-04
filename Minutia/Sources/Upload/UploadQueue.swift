@@ -25,7 +25,13 @@ actor UploadQueue {
     private var uploaded = 0
     private var registered = 0
     private var failed = 0
-    private var tasks: [Task<Void, Never>] = []
+
+    // Nonisolated intake so a synchronous caller (the audio tick) hands a segment over without a
+    // detached Task or an actor hop. drainAndWait snapshots under the same lock, so every segment
+    // enqueued before the drain begins is always tracked, awaited, and counted.
+    private let intakeLock = NSLock()
+    nonisolated(unsafe) private var pendingTasks: [Task<Void, Never>] = []
+    nonisolated(unsafe) private var enqueuedCount = 0
 
     init(
         transport: any SegmentTransport,
@@ -46,19 +52,31 @@ actor UploadQueue {
         return min(60, TimeInterval(1 << (attempt - 1)))
     }
 
-    /// Kicks off upload+register for one closed segment. Fire-and-forget; `drainAndWait` settles it.
-    func enqueue(_ segment: SegmentWriter.ClosedSegment) {
-        tasks.append(Task { await self.process(segment) })
+    /// Kicks off upload+register for one closed segment. Synchronous and nonisolated so the caller
+    /// can hand off from the audio tick without awaiting; `drainAndWait` settles it.
+    nonisolated func enqueue(_ segment: SegmentWriter.ClosedSegment) {
+        let task = Task { await self.process(segment) }
+        intakeLock.lock()
+        pendingTasks.append(task)
+        enqueuedCount += 1
+        intakeLock.unlock()
     }
 
-    /// Awaits every in-flight segment (including its retries) and returns the running totals.
-    func drainAndWait() async -> (uploaded: Int, registered: Int, failed: Int) {
-        while !tasks.isEmpty {
-            let pending = tasks
-            tasks.removeAll()
+    /// Awaits every in-flight segment (including its retries) and returns the running totals. Any
+    /// segment enqueued before this call is guaranteed to be included in `enqueued` and awaited.
+    func drainAndWait() async -> (uploaded: Int, registered: Int, failed: Int, enqueued: Int) {
+        while true {
+            intakeLock.lock()
+            let pending = pendingTasks
+            pendingTasks.removeAll()
+            intakeLock.unlock()
+            if pending.isEmpty { break }
             for task in pending { await task.value }
         }
-        return (uploaded, registered, failed)
+        intakeLock.lock()
+        let total = enqueuedCount
+        intakeLock.unlock()
+        return (uploaded, registered, failed, total)
     }
 
     private func process(_ segment: SegmentWriter.ClosedSegment) async {

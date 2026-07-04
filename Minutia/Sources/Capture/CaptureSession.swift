@@ -43,8 +43,12 @@ final class CaptureSession: ObservableObject {
                 await MainActor.run { self?.segmentsUploaded = uploaded }
             }
         )
-        pipeline.onTick = { [weak self] peak, closed in
-            Task { @MainActor in self?.handleTick(peak: peak, closed: closed) }
+        // Segments are handed to the queue synchronously on the tick queue, so `finishCapture`'s
+        // tick-queue barrier guarantees every enqueue lands before `stop` drains. The main-actor
+        // tick only drives UI (elapsed, level, live segment count).
+        pipeline.onSegment = { segment in queue.enqueue(segment) }
+        pipeline.onTick = { [weak self] peak, closedCount in
+            Task { @MainActor in self?.handleTick(peak: peak, closedCount: closedCount) }
         }
         try pipeline.start()
 
@@ -66,17 +70,27 @@ final class CaptureSession: ObservableObject {
         guard let pipeline, let queue, let client, let meetingId, let directory else {
             throw CaptureError.notRunning
         }
+        // Teardown must happen even if uploadRecording/finalize throws below; otherwise `pipeline`
+        // stays non-nil and every future `start` silently no-ops. The error still propagates.
+        defer {
+            self.pipeline = nil
+            self.queue = nil
+            self.client = nil
+            self.meetingId = nil
+            self.directory = nil
+            self.startedAt = nil
+        }
 
         let finished = pipeline.finishCapture()
         if let finalSegment = finished?.finalSegment {
-            segmentsTotal += 1
-            await queue.enqueue(finalSegment)
+            queue.enqueue(finalSegment)
         }
 
         let counts = await queue.drainAndWait()
         segmentsUploaded = counts.uploaded
+        segmentsTotal = counts.enqueued
 
-        let total = segmentsTotal
+        let total = counts.enqueued
         let allRegistered = total > 0 && counts.registered == total
 
         if let recording = finished?.recording {
@@ -102,25 +116,14 @@ final class CaptureSession: ObservableObject {
             try? FileManager.default.removeItem(at: directory)
         }
 
-        self.pipeline = nil
-        self.queue = nil
-        self.client = nil
-        self.meetingId = nil
-        self.directory = nil
-        self.startedAt = nil
-
         return StopResult(expectedSegments: expected, transcriptRequested: transcriptRequested)
     }
 
-    private func handleTick(peak: Float, closed: [SegmentWriter.ClosedSegment]) {
+    private func handleTick(peak: Float, closedCount: Int) {
         if let startedAt { elapsed = Date().timeIntervalSince(startedAt) }
         // Peak-hold with decay: snappy attack, gentle release for a readable meter.
         level = max(peak, level * 0.85)
-        guard let queue else { return }
-        for segment in closed {
-            segmentsTotal += 1
-            Task { await queue.enqueue(segment) }
-        }
+        segmentsTotal += closedCount
     }
 }
 
@@ -128,7 +131,10 @@ final class CaptureSession: ObservableObject {
 /// and the 250ms mix/write tick. Reports the tick's peak level and any freshly closed segments
 /// through `onTick`.
 private final class CapturePipeline {
-    var onTick: ((Float, [SegmentWriter.ClosedSegment]) -> Void)?
+    /// Reports the tick's peak level and the number of segments closed this tick (for UI).
+    var onTick: ((Float, Int) -> Void)?
+    /// Hands each freshly closed segment off synchronously on `tickQueue` for immediate upload.
+    var onSegment: ((SegmentWriter.ClosedSegment) -> Void)?
 
     private let micBuffer: RingBuffer
     private let sysBuffer: RingBuffer
@@ -167,6 +173,10 @@ private final class CapturePipeline {
     func finishCapture() -> (finalSegment: SegmentWriter.ClosedSegment?, recording: SegmentWriter.ClosedSegment)? {
         timer?.cancel()
         timer = nil
+        // cancel() does not wait for an in-flight handler; barrier on tickQueue so no tick() is
+        // running (or can start) before we stop the sources and close the writer. AVAudioFile is not
+        // thread-safe, so append() must never overlap finish().
+        tickQueue.sync {}
         tap.stop()
         mic.stop()
         return try? writer.finish()
@@ -178,7 +188,7 @@ private final class CapturePipeline {
         let sysGot = sysBuffer.pop(into: &sysScratch, count: plan.sysFrames)
         let count = max(micGot, sysGot)
         guard count > 0 else {
-            onTick?(0, [])
+            onTick?(0, 0)
             return
         }
 
@@ -188,8 +198,9 @@ private final class CapturePipeline {
             count: count
         )
         let closed = (try? writer.append(mixed)) ?? []
+        for segment in closed { onSegment?(segment) }
         var peak: Float = 0
         for sample in mixed { peak = max(peak, abs(sample)) }
-        onTick?(peak, closed)
+        onTick?(peak, closed.count)
     }
 }
