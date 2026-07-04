@@ -23,12 +23,33 @@ struct MinutiaApp: App {
     }
 }
 
-/// AppKit URL-scheme delivery. `application(_:open:)` is the reliable entry point for a
-/// custom scheme: it fires regardless of the menu bar panel's window state and is not
-/// overridden by SwiftUI's scene machinery. `.onOpenURL` on a MenuBarExtra is dead while the
-/// panel is closed, and a manual kAEGetURL handler is clobbered when SwiftUI installs its own
-/// during finish-launching, so both former paths swallowed the sign-in callback.
+/// AppKit URL-scheme delivery. Two paths cover the two ways macOS delivers a `minutia://`
+/// URL, and both funnel into `AppController.handleURL`:
+///  - `application(_:open:)` fires on a COLD launch (the URL starts the app). It is reliable
+///    for that case and untouched by SwiftUI's scene machinery.
+///  - a manual `kAEGetURL` Apple Event handler covers the WARM case (app already running). In
+///    a pure SwiftUI `MenuBarExtra`/`LSUIElement` app, macOS delivers a warm URL as a
+///    `kAEGetURL` Apple Event that SwiftUI never forwards to `application(_:open:)`, so without
+///    this handler the sign-in callback is silently dropped for every already-running user.
+/// The handler is registered in `applicationDidFinishLaunching`, which runs AFTER SwiftUI
+/// installs its own event handlers; registering earlier (e.g. in AppController.init) is
+/// clobbered by SwiftUI. Double-delivery is safe: `AuthManager.handleCallback` dedupes the
+/// single-use token hash.
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleGetURLEvent(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kInternetEventClass),
+            andEventID: AEEventID(kAEGetURL))
+    }
+
+    @objc func handleGetURLEvent(_ event: NSAppleEventDescriptor, withReplyEvent: NSAppleEventDescriptor) {
+        guard let string = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue,
+              let url = URL(string: string) else { return }
+        Task { @MainActor in await AppController.shared.handleURL(url) }
+    }
+
     func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls {
             Task { @MainActor in await AppController.shared.handleURL(url) }
