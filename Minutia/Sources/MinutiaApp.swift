@@ -15,7 +15,7 @@ struct MinutiaApp: App {
                 }
                 .task { await controller.restoreSession() }
         } label: {
-            MenuBarIcon(phase: controller.phase)
+            MenuBarIcon(phase: controller.phase, softHint: controller.softHint)
         }
         .menuBarExtraStyle(.window)
 
@@ -29,8 +29,11 @@ struct MinutiaApp: App {
 /// that blinks between filled and hollow on a 1s timer while recording. Status items ignore
 /// `withAnimation`, so a real timer drives the affordance; it is invalidated the moment the
 /// icon leaves the recording phase, and stays a static filled glyph under Reduce Motion.
+/// Soft detection swaps the idle waveform for a static mic-badged waveform (no animation,
+/// no notification), reverting to the plain waveform the instant the hint clears.
 struct MenuBarIcon: View {
     let phase: AppPhase
+    let softHint: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hollow = false
     @State private var timer: Timer?
@@ -51,7 +54,7 @@ struct MenuBarIcon: View {
         case .error:
             Image(systemName: "waveform.badge.exclamationmark")
         default:
-            Image(systemName: "waveform")
+            Image(systemName: softHint ? "waveform.badge.mic" : "waveform")
         }
     }
 
@@ -77,6 +80,9 @@ struct MenuBarIcon: View {
 final class AppController: NSObject, ObservableObject {
     @Published private(set) var phase: AppPhase = .signedOut
     @Published private(set) var series: [Series] = []
+    /// Soft detection: mic active with no corroborating app/calendar signal. Surfaced quietly
+    /// (menu bar glyph + one secondary row), never a notification. See `shouldShowSoftHint`.
+    @Published private(set) var softHint: Bool = false
     @Published var selectedSeriesId: UUID? {
         didSet {
             UserDefaults.standard.set(selectedSeriesId?.uuidString, forKey: Self.lastSeriesKey)
@@ -108,7 +114,16 @@ final class AppController: NSObject, ObservableObject {
         }
     }
 
+    /// The soft hint shows only when mic-only detection meets a resting idle app: quiet by
+    /// design (no notification). Any capture, finalize, error, or the .high banner suppresses
+    /// it so it never competes for attention or lingers over a live recording.
+    nonisolated static func shouldShowSoftHint(confidence: DetectionConfidence, phase: AppPhase) -> Bool {
+        guard case .soft = confidence, case .idle = phase else { return false }
+        return true
+    }
+
     private var cancellables: Set<AnyCancellable> = []
+    private var lastConfidence: DetectionConfidence = .none
     private var recordingMeetingId: UUID?
     private var recordingSeriesId: UUID?
 
@@ -142,7 +157,14 @@ final class AppController: NSObject, ObservableObject {
         let next = phase.next(event)
         guard next != phase else { return }
         phase = next
+        refreshSoftHint()
         syncDetector()
+    }
+
+    /// Derive the published hint from the latest confidence and phase together, so leaving
+    /// idle (record, error, sign-out) clears it and re-entering idle under soft restores it.
+    private func refreshSoftHint() {
+        softHint = Self.shouldShowSoftHint(confidence: lastConfidence, phase: phase)
     }
 
     /// The detector runs only while signed in and not capturing; our own mic use during a
@@ -172,6 +194,7 @@ final class AppController: NSObject, ObservableObject {
     }
 
     private func handleDetection(_ confidence: DetectionConfidence) {
+        lastConfidence = confidence
         switch confidence {
         case .high(let app):
             apply(.meetingDetected(Self.detectionLabel(app)))
@@ -179,8 +202,10 @@ final class AppController: NSObject, ObservableObject {
             // The corroborating signal is gone (mic released): retire a stale banner.
             if case .detected = phase { apply(.dismissedDetection) }
         case .soft:
+            // Quiet by design: no phase change, no notification, just the menu bar hint.
             break
         }
+        refreshSoftHint()
     }
 
     /// Banner wording source: "Meeting detected via {Zoom/Teams/Calendar}".
