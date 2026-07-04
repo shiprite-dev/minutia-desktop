@@ -124,6 +124,38 @@ final class MinutiaClientBuilderTests: XCTestCase {
         XCTAssertEqual(MinutiaClient.segmentPath(meetingId: "abc", seq: 12), "abc/seg-12.m4a")
     }
 
+    // Storage RLS compares the path's meeting folder to the lowercase canonical id case-sensitively,
+    // so a Swift UUID.uuidString (uppercase) must be lowercased before it reaches storage or a route.
+    private let upperUUID = "EDA64C8E-901A-4B7C-8F21-0A1B2C3D4E5F"
+    private let lowerUUID = "eda64c8e-901a-4b7c-8f21-0a1b2c3d4e5f"
+
+    func test_segmentPath_lowercasesUppercaseMeetingId() {
+        XCTAssertEqual(MinutiaClient.segmentPath(meetingId: upperUUID, seq: 3), "\(lowerUUID)/seg-3.m4a")
+    }
+
+    func test_recordingPath_lowercasesUppercaseMeetingId() {
+        XCTAssertEqual(MinutiaClient.recordingPath(meetingId: upperUUID), "\(lowerUUID)/recording.m4a")
+    }
+
+    func test_registerSegmentRequest_lowercasesRouteAndBodyPath() {
+        let request = MinutiaClient.registerSegmentRequest(instance: instance, meetingId: upperUUID, seq: 0, token: token)
+
+        XCTAssertEqual(request.url, URL(string: "https://minutia.example.com/api/meetings/\(lowerUUID)/segments/0/transcribe"))
+        XCTAssertEqual(jsonBody(request), ["path": "\(lowerUUID)/seg-0.m4a"] as NSDictionary)
+    }
+
+    func test_finalTranscribeRequest_lowercasesRoute() {
+        let request = MinutiaClient.finalTranscribeRequest(instance: instance, meetingId: upperUUID, expectedSegments: nil, token: token)
+
+        XCTAssertEqual(request.url, URL(string: "https://minutia.example.com/api/meetings/\(lowerUUID)/transcribe"))
+    }
+
+    func test_summaryWarmupRequest_lowercasesRoute() {
+        let request = MinutiaClient.summaryWarmupRequest(instance: instance, meetingId: upperUUID, token: token)
+
+        XCTAssertEqual(request.url, URL(string: "https://minutia.example.com/api/meetings/\(lowerUUID)/summary/stream"))
+    }
+
     func test_registerSegmentRequest_hasContractPathHeadersAndBody() {
         let request = MinutiaClient.registerSegmentRequest(instance: instance, meetingId: "m1", seq: 0, token: token)
 
