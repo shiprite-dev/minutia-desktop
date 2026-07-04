@@ -5,14 +5,12 @@ import UserNotifications
 
 @main
 struct MinutiaApp: App {
-    @StateObject private var controller = AppController()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @StateObject private var controller = AppController.shared
 
     var body: some Scene {
         MenuBarExtra {
             MenuContent(controller: controller)
-                .onOpenURL { url in
-                    Task { await controller.authManager.handleCallback(url) }
-                }
                 .task { await controller.restoreSession() }
         } label: {
             MenuBarIcon(phase: controller.phase, softHint: controller.softHint)
@@ -21,6 +19,19 @@ struct MinutiaApp: App {
 
         Settings {
             SettingsView(controller: controller)
+        }
+    }
+}
+
+/// AppKit URL-scheme delivery. `application(_:open:)` is the reliable entry point for a
+/// custom scheme: it fires regardless of the menu bar panel's window state and is not
+/// overridden by SwiftUI's scene machinery. `.onOpenURL` on a MenuBarExtra is dead while the
+/// panel is closed, and a manual kAEGetURL handler is clobbered when SwiftUI installs its own
+/// during finish-launching, so both former paths swallowed the sign-in callback.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls {
+            Task { @MainActor in await AppController.shared.handleURL(url) }
         }
     }
 }
@@ -78,6 +89,11 @@ struct MenuBarIcon: View {
 /// decision lives in `AppPhase.next` under tests.
 @MainActor
 final class AppController: NSObject, ObservableObject {
+    /// One graph shared by the SwiftUI scene (`@StateObject`) and the AppKit URL handler
+    /// (`AppDelegate.application(_:open:)`), so a deep link reaches the live AuthManager
+    /// rather than a second, disconnected instance.
+    static let shared = AppController()
+
     @Published private(set) var phase: AppPhase = .signedOut
     @Published private(set) var series: [Series] = []
     /// Soft detection: mic active with no corroborating app/calendar signal. Surfaced quietly
@@ -127,11 +143,10 @@ final class AppController: NSObject, ObservableObject {
     private var recordingMeetingId: UUID?
     private var recordingSeriesId: UUID?
 
-    override init() {
+    private override init() {
         super.init()
         MeetingDetector.registerNotificationCategory()
         UNUserNotificationCenter.current().delegate = self
-        installURLHandler()
 
         authManager.$userEmail
             .removeDuplicates()
@@ -290,21 +305,15 @@ final class AppController: NSObject, ObservableObject {
 
     // MARK: - URL callback
 
-    /// `onOpenURL` is unreliable for MenuBarExtra apps while the panel is closed, so the
-    /// kAEGetURL Apple event is handled directly; AuthManager routes both the browser
-    /// magic-link (token_hash) and the Google PKCE (code) callbacks.
-    private func installURLHandler() {
-        NSAppleEventManager.shared().setEventHandler(
-            self,
-            andSelector: #selector(handleGetURL(_:withReplyEvent:)),
-            forEventClass: AEEventClass(kInternetEventClass),
-            andEventID: AEEventID(kAEGetURL))
-    }
-
-    @objc private func handleGetURL(_ event: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor) {
-        guard let raw = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
-              let url = URL(string: raw) else { return }
-        Task { await authManager.handleCallback(url) }
+    /// Deliver a `minutia://` deep link from the AppKit URL handler. Ensures the Supabase
+    /// client is built first: a cold start launches the app via the URL before
+    /// `restoreSession()` runs, and `verifyOTP` needs the client. Idempotent with
+    /// `restoreSession`'s single-flight connect; AuthManager dedupes the single-use token
+    /// hash across repeat deliveries. Routes both the browser magic-link (token_hash) and
+    /// the Google PKCE (code) callbacks.
+    func handleURL(_ url: URL) async {
+        try? await authManager.ensureConnected()
+        await authManager.handleCallback(url)
     }
 }
 
