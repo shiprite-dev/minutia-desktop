@@ -474,3 +474,56 @@ final class InstanceConfigStoredTests: XCTestCase {
         XCTAssertEqual(readBack?.meta, meta)
     }
 }
+
+/// The auto-connect fallback decision: the managed cloud default is used only when nothing is
+/// stored; a stored self-host instance always wins and is never overwritten by reading it.
+final class InstanceConfigResolvedTests: XCTestCase {
+    private var suiteName = ""
+    private var testDefaults: UserDefaults!
+
+    override func setUp() {
+        super.setUp()
+        suiteName = "app.minutia.instance.resolved.tests.\(UUID().uuidString)"
+        testDefaults = UserDefaults(suiteName: suiteName)
+        InstanceConfig.defaults = testDefaults
+    }
+
+    override func tearDown() {
+        InstanceConfig.defaults = .standard
+        testDefaults.removePersistentDomain(forName: suiteName)
+        testDefaults = nil
+        super.tearDown()
+    }
+
+    private func storeSelfHost() -> URL {
+        let instance = URL(string: "https://oil.internal.example.com")!
+        let meta = InstanceMeta(
+            name: "Self Host",
+            supabaseUrl: URL(string: "https://sb.internal.example.com")!,
+            supabaseAnonKey: "anon"
+        )
+        InstanceConfig.stored = (instance: instance, meta: meta)
+        return instance
+    }
+
+    func test_defaultInstance_isManagedCloud() {
+        XCTAssertEqual(InstanceConfig.defaultInstance, URL(string: "https://app.getminutia.com"))
+    }
+
+    func test_resolved_usesDefaultWhenNothingStored() {
+        XCTAssertNil(InstanceConfig.stored)
+        XCTAssertEqual(InstanceConfig.resolvedInstance, InstanceConfig.defaultInstance)
+    }
+
+    func test_resolved_prefersStoredSelfHostOverDefault() {
+        let instance = storeSelfHost()
+        XCTAssertEqual(InstanceConfig.resolvedInstance, instance)
+        XCTAssertNotEqual(InstanceConfig.resolvedInstance, InstanceConfig.defaultInstance)
+    }
+
+    func test_resolved_doesNotOverwriteStored() {
+        let instance = storeSelfHost()
+        _ = InstanceConfig.resolvedInstance
+        XCTAssertEqual(InstanceConfig.stored?.instance, instance)
+    }
+}

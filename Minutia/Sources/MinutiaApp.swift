@@ -129,11 +129,11 @@ final class AppController: NSObject, ObservableObject {
             .store(in: &cancellables)
     }
 
-    /// Rehydrate the Supabase client from the persisted instance so a Keychain
-    /// session lands the app signed in without another Connect step.
+    /// Rehydrate the Supabase client from the stored instance (or the managed cloud
+    /// default on first run) so a Keychain session lands the app signed in with no
+    /// Connect step. Idempotent with SignInView's on-appear auto-connect.
     func restoreSession() async {
-        guard authManager.supabase == nil, let stored = InstanceConfig.stored else { return }
-        try? await authManager.connect(instance: stored.instance)
+        try? await authManager.ensureConnected()
     }
 
     // MARK: - Phase transitions

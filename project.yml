@@ -30,10 +30,13 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         ENABLE_HARDENED_RUNTIME: true
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
     info:
       path: Minutia/Info.plist
       properties:
         CFBundleDisplayName: Minutia
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSUIElement: true
         LSMinimumSystemVersion: "14.4"
         NSMicrophoneUsageDescription: Minutia records your side of the meeting through the microphone.

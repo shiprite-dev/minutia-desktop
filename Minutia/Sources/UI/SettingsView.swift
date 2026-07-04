@@ -1,3 +1,4 @@
+import AppKit
 import ServiceManagement
 import SwiftUI
 
@@ -5,17 +6,33 @@ import SwiftUI
 /// Opens as the standard Settings window (Cmd+,) from the menu footer.
 struct SettingsView: View {
     @ObservedObject var controller: AppController
+    @ObservedObject private var authManager: AuthManager
 
     @State private var instanceText = ""
     @State private var busy = false
     @State private var statusMessage: String?
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
 
+    init(controller: AppController) {
+        _controller = ObservedObject(wrappedValue: controller)
+        _authManager = ObservedObject(wrappedValue: controller.authManager)
+    }
+
     var body: some View {
         Form {
             Section("Instance") {
                 TextField("https://minutia.example.com", text: $instanceText)
                     .textContentType(.URL)
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(authManager.isConnected ? Color.green : Color.secondary)
+                        .frame(width: 8, height: 8)
+                    Text(authManager.isConnected
+                         ? "Connected to \(connectedHost)"
+                         : "Not connected")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
                 Button("Reconnect", action: reconnect)
                     .disabled(busy || InstanceConfig.normalize(instanceText) == nil)
                 if let statusMessage {
@@ -26,10 +43,10 @@ struct SettingsView: View {
             }
 
             Section("Account") {
-                if let email = controller.authManager.userEmail {
+                if let email = authManager.userEmail {
                     LabeledContent("Signed in as", value: email)
                     Button("Sign out") {
-                        Task { await controller.authManager.signOut() }
+                        Task { await authManager.signOut() }
                     }
                     .disabled(AppController.shouldStopCaptureOnSignOut(phase: controller.phase))
                 } else {
@@ -47,19 +64,24 @@ struct SettingsView: View {
 
             Section("About") {
                 LabeledContent("Version", value: Self.versionString)
-                Button("Check for Updates") {}
-                    .disabled(true)
             }
         }
         .formStyle(.grouped)
-        .frame(width: 380)
+        .frame(width: 420)
         .fixedSize(horizontal: false, vertical: true)
+        .onAppear(perform: activateForEditing)
+        .onDisappear { NSApp.setActivationPolicy(.accessory) }
         .task {
             if instanceText.isEmpty {
-                instanceText = controller.authManager.instance?.absoluteString
-                    ?? InstanceConfig.stored?.instance.absoluteString ?? ""
+                instanceText = authManager.instance?.absoluteString
+                    ?? InstanceConfig.stored?.instance.absoluteString
+                    ?? InstanceConfig.defaultInstance.absoluteString
             }
         }
+    }
+
+    private var connectedHost: String {
+        authManager.instance?.host ?? authManager.instance?.absoluteString ?? ""
     }
 
     static var versionString: String {
@@ -68,13 +90,21 @@ struct SettingsView: View {
         return "\(version) (\(build))"
     }
 
+    /// A menu-bar (LSUIElement) app opens Settings without becoming active, so the window never
+    /// takes key and text fields cannot focus. Promote to a regular app while Settings is open
+    /// (restored to accessory on close) so the window is key and editable, with a Dock presence.
+    private func activateForEditing() {
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     private func reconnect() {
         guard let url = InstanceConfig.normalize(instanceText) else { return }
         busy = true
         statusMessage = nil
         Task {
             do {
-                try await controller.authManager.connect(instance: url)
+                try await authManager.connect(instance: url)
                 statusMessage = "Connected to \(url.host ?? url.absoluteString)."
             } catch {
                 statusMessage = "Could not connect: \(error.localizedDescription)"
