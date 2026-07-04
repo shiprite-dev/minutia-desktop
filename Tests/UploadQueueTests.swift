@@ -73,8 +73,8 @@ final class UploadQueueBehaviorTests: XCTestCase {
     func test_happyPath_uploadsAndRegistersEachSegment() async {
         let transport = StubTransport()
         let queue = makeQueue(transport)
-        await queue.enqueue(segment(0))
-        await queue.enqueue(segment(1))
+        queue.enqueue(segment(0))
+        queue.enqueue(segment(1))
         let counts = await queue.drainAndWait()
 
         XCTAssertEqual(counts.uploaded, 2)
@@ -87,7 +87,7 @@ final class UploadQueueBehaviorTests: XCTestCase {
     func test_oneUploadFailure_thenSucceedsOnRetry() async {
         let transport = StubTransport(behavior: .init(uploadFailures: 1))
         let queue = makeQueue(transport)
-        await queue.enqueue(segment(0))
+        queue.enqueue(segment(0))
         let counts = await queue.drainAndWait()
 
         XCTAssertEqual(counts.uploaded, 1)
@@ -99,7 +99,7 @@ final class UploadQueueBehaviorTests: XCTestCase {
     func test_oneRegisterFailure_thenSucceedsWithoutReuploading() async {
         let transport = StubTransport(behavior: .init(registerFailures: 1))
         let queue = makeQueue(transport)
-        await queue.enqueue(segment(0))
+        queue.enqueue(segment(0))
         let counts = await queue.drainAndWait()
 
         XCTAssertEqual(counts.uploaded, 1)
@@ -112,7 +112,7 @@ final class UploadQueueBehaviorTests: XCTestCase {
     func test_permanentUploadFailure_parksFileAfterMaxAttempts() async {
         let transport = StubTransport(behavior: .init(uploadAlwaysFails: true))
         let queue = makeQueue(transport)
-        await queue.enqueue(segment(0))
+        queue.enqueue(segment(0))
         let counts = await queue.drainAndWait()
 
         XCTAssertEqual(counts.uploaded, 0)
@@ -124,7 +124,7 @@ final class UploadQueueBehaviorTests: XCTestCase {
     func test_permanentRegisterFailure_uploadsButParksAsFailed() async {
         let transport = StubTransport(behavior: .init(registerAlwaysThrows: true))
         let queue = makeQueue(transport)
-        await queue.enqueue(segment(0))
+        queue.enqueue(segment(0))
         let counts = await queue.drainAndWait()
 
         XCTAssertEqual(counts.uploaded, 1, "upload succeeded before register began throwing")
@@ -136,13 +136,30 @@ final class UploadQueueBehaviorTests: XCTestCase {
     func test_terminalRegister_countsUploadedNotRegisteredNotFailed() async {
         let transport = StubTransport(behavior: .init(registerResult: false))
         let queue = makeQueue(transport)
-        await queue.enqueue(segment(0))
+        queue.enqueue(segment(0))
         let counts = await queue.drainAndWait()
 
         XCTAssertEqual(counts.uploaded, 1)
         XCTAssertEqual(counts.registered, 0)
         XCTAssertEqual(counts.failed, 0)
         XCTAssertEqual(transport.registerAttempts, 1, "a terminal (false) register is not retried")
+    }
+
+    func test_syncEnqueue_beforeDrain_alwaysIncludedInCounts() async {
+        // Regression: enqueue is synchronous, so every segment handed over before drainAndWait is
+        // called must appear in its counts. A detached-Task enqueue could strand the final segment.
+        let transport = StubTransport()
+        let queue = makeQueue(transport)
+        let n = 50
+        for i in 0..<n { queue.enqueue(segment(i)) }
+        let counts = await queue.drainAndWait()
+
+        XCTAssertEqual(counts.enqueued, n, "all synchronously enqueued segments are tracked")
+        XCTAssertEqual(counts.uploaded, n)
+        XCTAssertEqual(counts.registered, n)
+        XCTAssertEqual(counts.failed, 0)
+        XCTAssertEqual(transport.uploadedCount, n)
+        XCTAssertEqual(transport.registeredCount, n)
     }
 
     func test_drainAndWait_returnsOnlyAfterInFlightRetriesSettle() async {
@@ -154,7 +171,7 @@ final class UploadQueueBehaviorTests: XCTestCase {
             meetingId: "m1",
             sleep: { _ in try? await Task.sleep(nanoseconds: 1_000_000) }
         )
-        await queue.enqueue(segment(0))
+        queue.enqueue(segment(0))
         let counts = await queue.drainAndWait()
 
         XCTAssertEqual(counts.uploaded, 1)
