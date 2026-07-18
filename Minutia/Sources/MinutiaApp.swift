@@ -142,6 +142,33 @@ final class AppController: NSObject, ObservableObject {
         }
     }
 
+    /// What a `minutia://record?meeting_id=` command from the browser should do.
+    enum RecordCommandDecision: Equatable {
+        case start
+        case ignoreSameMeeting
+        case rejectOtherMeeting
+        case signInRequired
+    }
+
+    /// Decide how to handle a web-triggered record command. Pure so the branch matrix (signed
+    /// out, already recording this meeting, recording a different one, free to start) is tested
+    /// without a live client or capture pipeline. Phase is the source of truth for "actively
+    /// recording"; `recordingMeetingId` (lowercased) only distinguishes same vs different.
+    nonisolated static func recordCommandDecision(
+        requestedMeetingId: String,
+        phase: AppPhase,
+        signedIn: Bool,
+        recordingMeetingId: String?
+    ) -> RecordCommandDecision {
+        guard signedIn else { return .signInRequired }
+        switch phase {
+        case .recording, .finalizing:
+            return recordingMeetingId == requestedMeetingId ? .ignoreSameMeeting : .rejectOtherMeeting
+        default:
+            return .start
+        }
+    }
+
     /// Signing out mid-capture must tear the pipeline down first; mic and system audio would
     /// otherwise keep recording invisibly with uploads failing auth.
     nonisolated static func shouldStopCaptureOnSignOut(phase: AppPhase) -> Bool {
@@ -287,6 +314,56 @@ final class AppController: NSObject, ObservableObject {
         }
     }
 
+    /// Record against a meeting id handed in from the browser (which already started/resolved
+    /// the meeting), so skip the start-or-join RPC and attach capture straight to the given id.
+    /// No series is known, so the stop-time recap is left to the browser tab the user came from.
+    func startRecording(meetingId: String) {
+        guard Self.canStartRecording(from: phase), let client = authManager.client() else { return }
+        do {
+            try captureSession.start(meetingId: meetingId, client: client)
+            recordingMeetingId = UUID(uuidString: meetingId)
+            recordingSeriesId = nil
+            apply(.recordStarted)
+        } catch {
+            apply(.failed("Could not start recording: \(error.localizedDescription)"))
+        }
+    }
+
+    /// Route a web-triggered `minutia://record` command through the pure decision, then act:
+    /// prompt sign-in when unauthed, no-op when already recording this same meeting, warn when
+    /// a different meeting is live, else start capture against the given id.
+    func handleRecordCommand(meetingId: String) {
+        let decision = Self.recordCommandDecision(
+            requestedMeetingId: meetingId,
+            phase: phase,
+            signedIn: authManager.userEmail != nil,
+            recordingMeetingId: recordingMeetingId?.uuidString.lowercased())
+        switch decision {
+        case .signInRequired:
+            NSApp.activate(ignoringOtherApps: true)
+            Self.postNotification(
+                title: "Sign in to record",
+                body: "Open Minutia and sign in, then start the recording again.")
+        case .ignoreSameMeeting:
+            return
+        case .rejectOtherMeeting:
+            Self.postNotification(
+                title: "Already recording another meeting",
+                body: "Stop the current recording before starting a new one.")
+        case .start:
+            startRecording(meetingId: meetingId)
+        }
+    }
+
+    private static func postNotification(title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+
     func stopRecording() {
         apply(.recordStopped)
         Task {
@@ -313,12 +390,15 @@ final class AppController: NSObject, ObservableObject {
         apply(.dismissedDetection)
     }
 
-    /// Land the flowing recap in front of the user the moment finalize completes.
+    /// Land the flowing recap in front of the user the moment finalize completes. Clears the
+    /// recording ids unconditionally: a web-triggered record has no series id, so without an
+    /// unconditional clear the stale meeting id would make the next record command misfire.
     private func openRecap() {
-        guard let instance = authManager.instance,
-              let seriesId = recordingSeriesId, let meetingId = recordingMeetingId else { return }
+        let seriesId = recordingSeriesId
+        let meetingId = recordingMeetingId
         recordingMeetingId = nil
         recordingSeriesId = nil
+        guard let instance = authManager.instance, let seriesId, let meetingId else { return }
         let url = instance.appendingPathComponent(
             "series/\(seriesId.uuidString.lowercased())/meetings/\(meetingId.uuidString.lowercased())")
         NSWorkspace.shared.open(url)
@@ -333,7 +413,14 @@ final class AppController: NSObject, ObservableObject {
     /// hash across repeat deliveries. Routes both the browser magic-link (token_hash) and
     /// the Google PKCE (code) callbacks.
     func handleURL(_ url: URL) async {
+        // Rehydrate first for both paths: a cold start launches the app via the URL before
+        // restoreSession() runs, so without this a record command sees no session/client (and
+        // verifyOTP has no client). Single-flight and idempotent, so always running it is safe.
         try? await authManager.ensureConnected()
+        if case .record(let meetingId) = DeepLink.parse(url) {
+            handleRecordCommand(meetingId: meetingId)
+            return
+        }
         await authManager.handleCallback(url)
     }
 }
