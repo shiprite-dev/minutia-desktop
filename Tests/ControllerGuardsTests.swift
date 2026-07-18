@@ -24,6 +24,52 @@ final class ControllerGuardsTests: XCTestCase {
         XCTAssertFalse(AppController.canStartRecording(from: .signedOut))
     }
 
+    // MARK: - Web-triggered record command
+
+    private let meetingA = "0f9c2c9a-1a2b-4c3d-8e4f-5a6b7c8d9e0f"
+    private let meetingB = "11111111-2222-3333-4444-555555555555"
+
+    func test_recordCommand_signInRequiredWhenSignedOut() {
+        XCTAssertEqual(
+            AppController.recordCommandDecision(
+                requestedMeetingId: meetingA, phase: .signedOut,
+                signedIn: false, recordingMeetingId: nil),
+            .signInRequired)
+    }
+
+    func test_recordCommand_startsFromRestingPhases() {
+        for phase in [AppPhase.idle, .detected(app: "Zoom"), .error("boom")] {
+            XCTAssertEqual(
+                AppController.recordCommandDecision(
+                    requestedMeetingId: meetingA, phase: phase,
+                    signedIn: true, recordingMeetingId: nil),
+                .start,
+                "expected .start from \(phase)")
+        }
+    }
+
+    func test_recordCommand_ignoresSameMeetingWhileRecording() {
+        for phase in [AppPhase.recording, .finalizing] {
+            XCTAssertEqual(
+                AppController.recordCommandDecision(
+                    requestedMeetingId: meetingA, phase: phase,
+                    signedIn: true, recordingMeetingId: meetingA),
+                .ignoreSameMeeting,
+                "expected no-op for the same meeting in \(phase)")
+        }
+    }
+
+    func test_recordCommand_rejectsDifferentMeetingWhileRecording() {
+        for phase in [AppPhase.recording, .finalizing] {
+            XCTAssertEqual(
+                AppController.recordCommandDecision(
+                    requestedMeetingId: meetingB, phase: phase,
+                    signedIn: true, recordingMeetingId: meetingA),
+                .rejectOtherMeeting,
+                "expected reject for a different meeting in \(phase)")
+        }
+    }
+
     // MARK: - C1: sign-out capture teardown
 
     func test_shouldStopCaptureOnSignOut_trueWhileCapturing() {
