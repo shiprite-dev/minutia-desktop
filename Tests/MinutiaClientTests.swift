@@ -137,6 +137,25 @@ final class MinutiaClientBuilderTests: XCTestCase {
         XCTAssertEqual(MinutiaClient.recordingPath(meetingId: upperUUID), "\(lowerUUID)/recording.m4a")
     }
 
+    // meetingSeriesId issues its filter through the supabase-swift builder (no inspectable URL), so
+    // the lowercasing that keeps the query off an uppercase id is tested at its pure seam.
+    func test_meetingLookupId_lowercasesUppercaseMeetingId() {
+        XCTAssertEqual(MinutiaClient.meetingLookupId(upperUUID), lowerUUID)
+        XCTAssertEqual(MinutiaClient.meetingLookupId(lowerUUID), lowerUUID)
+    }
+
+    // Pins the web app's recap route (src/app/(app)/series/[id]/meetings/[meetingId]) and the
+    // lowercase-id rule for the one URL every stop/refinalize/recovery flow opens.
+    func test_recapURL_matchesWebRouteAndLowercasesIds() {
+        let url = MinutiaClient.recapURL(
+            instance: URL(string: "https://minutia.example.com")!,
+            seriesId: UUID(uuidString: "11111111-2222-3333-4444-555555555555")!,
+            meetingId: UUID(uuidString: lowerUUID)!)
+        XCTAssertEqual(
+            url.absoluteString,
+            "https://minutia.example.com/series/11111111-2222-3333-4444-555555555555/meetings/\(lowerUUID)")
+    }
+
     func test_registerSegmentRequest_lowercasesRouteAndBodyPath() {
         let request = MinutiaClient.registerSegmentRequest(instance: instance, meetingId: upperUUID, seq: 0, token: token)
 
@@ -338,12 +357,14 @@ final class RegisterSegmentStatusMappingTests: XCTestCase {
         }
     }
 
-    /// 2xx/409 succeed; 503 and all other 4xx give up (false, terminal); 5xx (other than 503) retry (throw).
+    /// 2xx/409 succeed; 401/403 throw so the backoff retries with a refreshed token (supabase-swift
+    /// refreshes transparently, so an auth failure here is transient far more often than terminal);
+    /// 503 and the other 4xx give up (false, terminal); 5xx other than 503 retry (throw).
     func test_registerSegment_mapsEachStatusToContractResult() async {
         let expected: [Int: Bool?] = [
             200: true, 409: true,
-            400: false, 402: false, 403: false, 404: false, 415: false, 503: false,
-            500: nil, 502: nil,
+            400: false, 402: false, 404: false, 415: false, 503: false,
+            401: nil, 403: nil, 500: nil, 502: nil,
         ]
 
         for (status, outcome) in expected {
@@ -392,8 +413,10 @@ final class RequestTranscriptionStatusTests: XCTestCase {
         }
     }
 
-    func test_requestTranscription_doesNotThrowOnNon5xxOr503() async {
-        for status in [200, 400, 404, 503] {
+    /// Only 2xx and the terminal 503 are non-throwing. Anything else must throw so the stop path
+    /// never treats a rejected request as accepted and deletes the local audio (data loss).
+    func test_requestTranscription_doesNotThrowOnlyFor2xxAnd503() async {
+        for status in [200, 204, 503] {
             stub(status: status)
             do {
                 try await makeStubbedClient().requestTranscription(meetingId: "m1", expectedSegments: nil)
@@ -403,8 +426,10 @@ final class RequestTranscriptionStatusTests: XCTestCase {
         }
     }
 
-    func test_requestTranscription_throwsOn5xxExceptFor503() async {
-        for status in [500, 502] {
+    /// A 401/403 (auth) or any other 4xx, and every non-503 5xx, throws serverError so the caller
+    /// keeps the local audio instead of deleting it with no server transcript.
+    func test_requestTranscription_throwsOnAnyStatusOutside2xxAnd503() async {
+        for status in [400, 401, 403, 404, 500, 502] {
             stub(status: status)
             do {
                 try await makeStubbedClient().requestTranscription(meetingId: "m1", expectedSegments: nil)

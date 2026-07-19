@@ -223,6 +223,8 @@ final class AppController: NSObject, ObservableObject {
     static let webRecordCategoryId = "app.minutia.webRecord"
     static let confirmWebRecordActionId = "app.minutia.webRecord.confirm"
     static let dismissWebRecordActionId = "app.minutia.webRecord.dismiss"
+    /// userInfo key carrying a recovered recording's recap URL, opened when the notification is tapped.
+    static let recapURLUserInfoKey = "app.minutia.recapURL"
 
     /// Record can begin only from a resting or recoverable phase. Guards a stale detection
     /// notification clicked mid-recording from starting a second server meeting and
@@ -270,16 +272,79 @@ final class AppController: NSObject, ObservableObject {
     }
 
     /// Which start path last failed and is sitting in `.error`, so Retry re-runs the right one:
-    /// a web-triggered record needs its meeting id, not the selected series.
+    /// a web-triggered record needs its meeting id, a finalize failure needs to finish the preserved
+    /// audio (not start fresh), and everything else falls back to the selected series.
     enum FailedStart: Equatable {
         case series
         case meeting(String)
+        case finalize(meetingId: String)
     }
 
-    /// Route a Retry from the error phase. A remembered `.meeting` failure retries that meeting id;
-    /// a `.series` failure or nothing remembered falls back to the series start path.
+    /// Route a Retry from the error phase. A remembered `.meeting`/`.finalize` failure retries that
+    /// meeting; a `.series` failure or nothing remembered falls back to the series start path.
     nonisolated static func retryTarget(lastFailedStart: FailedStart?) -> FailedStart {
         lastFailedStart ?? .series
+    }
+
+    /// Route a mid-capture fatal to the Retry path that finishes the right work. Preserved audio
+    /// (disk-full, stall) means Retry must finalize the durable directory, not start over. A
+    /// non-preserved fatal (mic denied with nothing written) retries the original start: the web
+    /// meeting id when there is no series, else the selected series.
+    nonisolated static func fatalRetryTarget(
+        preservedForRecovery: Bool, recordingMeetingId: String?, hasSeries: Bool
+    ) -> FailedStart {
+        guard let id = recordingMeetingId else { return .series }
+        if preservedForRecovery { return .finalize(meetingId: id) }
+        return hasSeries ? .series : .meeting(id)
+    }
+
+    /// What `finishForQuit` should do from the current phase: stop a live recording, or wait out an
+    /// already-running finalize (calling `stop()` again would throw `notRunning` and flip the UI to
+    /// error mid-quit). Anything else needs no finish work.
+    enum QuitFinishAction: Equatable {
+        case stop
+        case awaitFinalizing
+        case none
+    }
+
+    nonisolated static func quitFinishAction(phase: AppPhase) -> QuitFinishAction {
+        switch phase {
+        case .recording: return .stop
+        case .finalizing: return .awaitFinalizing
+        default: return .none
+        }
+    }
+
+    /// Whether a Record press must be refused before any server call because the mic is already
+    /// denied/restricted; starting the RPC first would orphan an empty server meeting. A
+    /// `.notDetermined` status flows through unchanged so the deliberate prompt-during-capture design
+    /// (which preserves system audio recorded while the dialog is up) is untouched.
+    nonisolated static func micPreCheckFails(status: AVAuthorizationStatus) -> Bool {
+        status == .denied || status == .restricted
+    }
+
+    /// The pre-flight branch for a series Record press: refuse before any server call when the mic is
+    /// denied, guide the user (never silently return) when no series is selected, else proceed. Pure
+    /// so the guard matrix is tested without a live client.
+    enum RecordPreflight: Equatable {
+        case micDenied
+        case noSeries
+        case proceed
+    }
+
+    nonisolated static func recordPreflight(micStatus: AVAuthorizationStatus, hasSeries: Bool) -> RecordPreflight {
+        if micPreCheckFails(status: micStatus) { return .micDenied }
+        if !hasSeries { return .noSeries }
+        return .proceed
+    }
+
+    /// User-facing copy for a failed finalize. A timeout is honest that the audio is safe locally and
+    /// recoverable via Retry, since the durable directory outlives the timed-out network step.
+    nonisolated static func finalizeFailureMessage(for error: Error) -> String {
+        if error is TimeoutError {
+            return "Finishing the recording timed out. Your audio is saved locally; Retry to finish uploading."
+        }
+        return "Could not finish recording: \(error.localizedDescription)"
     }
 
     /// Signing out mid-capture must tear the pipeline down first; mic and system audio would
@@ -312,6 +377,9 @@ final class AppController: NSObject, ObservableObject {
     private var lastConfidence: DetectionConfidence = .none
     private var recordingMeetingId: UUID?
     private var recordingSeriesId: UUID?
+    /// The instance capture started against, captured at start so the recap URL survives an instance
+    /// switch made while the meeting was recording.
+    private var recordingInstance: URL?
     private var lastFailedStart: FailedStart?
     /// The instance the detector's agenda provider is currently bound to. When it changes (an
     /// instance switch), the detector must be torn down and restarted so it stops polling the old
@@ -326,8 +394,18 @@ final class AppController: NSObject, ObservableObject {
         Self.registerNotificationCategories()
         UNUserNotificationCenter.current().delegate = self
 
-        // A mid-capture fatal (denied mic, disk-full) flips the UI to .error with a user message.
-        captureSession.onFailure = { [weak self] message in self?.apply(.failed(message)) }
+        // A mid-capture fatal (denied mic, disk-full, stall) flips the UI to .error with a message.
+        // Route Retry to the right recovery: preserved audio must be finalized, not re-recorded, so
+        // remember the failed-start target BEFORE apply(.failed) (which keeps it only on the way into
+        // .error).
+        captureSession.onFailure = { [weak self] message, preserved in
+            guard let self else { return }
+            self.lastFailedStart = Self.fatalRetryTarget(
+                preservedForRecovery: preserved,
+                recordingMeetingId: self.recordingMeetingId?.uuidString,
+                hasSeries: self.recordingSeriesId != nil)
+            self.apply(.failed(message))
+        }
 
         authManager.$sessionIdentity
             .removeDuplicates()
@@ -429,10 +507,12 @@ final class AppController: NSObject, ObservableObject {
                     _ = try? await captureSession.stop()
                     recordingMeetingId = nil
                     recordingSeriesId = nil
+                    recordingInstance = nil
                 }
             } else {
                 recordingMeetingId = nil
                 recordingSeriesId = nil
+                recordingInstance = nil
             }
             lastFailedStart = nil
             pendingRecordConsent = nil
@@ -479,19 +559,46 @@ final class AppController: NSObject, ObservableObject {
         }
     }
 
+    /// Re-fetch the owned series so a series created on the web while the app was already open is
+    /// picked up. Called when the idle menu appears, the cheapest correct refresh point.
+    func reloadSeries() {
+        Task { await loadSeries() }
+    }
+
     // MARK: - Record / stop
 
     /// Single start path shared by the Record button, the detection banner, and the
     /// notification action.
     func startRecording() {
         guard Self.canStartRecording(from: phase) else { return }
-        guard let seriesId = selectedSeriesId, let client = authManager.client() else { return }
+        guard let client = authManager.client() else { return }
+        switch Self.recordPreflight(
+            micStatus: AVCaptureDevice.authorizationStatus(for: .audio),
+            hasSeries: selectedSeriesId != nil) {
+        case .micDenied:
+            // Refuse before any server call: starting the RPC first would orphan an empty meeting.
+            apply(.failed(CaptureSession.failureMessage(for: MicCapture.CaptureError.permissionDenied)))
+            return
+        case .noSeries:
+            // Guide the user rather than returning silently, and post a notification too so the
+            // notification-action Record path is never a dead click.
+            let message = "Create a series in Minutia on the web, then record."
+            recordFeedback = message
+            Self.postNotification(title: "Can't record yet", body: message)
+            return
+        case .proceed:
+            break
+        }
+        guard let seriesId = selectedSeriesId else { return }
+        let instance = client.instance
         Task {
             do {
                 let meeting = try await client.startOrJoinMeeting(seriesId: seriesId)
-                try captureSession.start(meetingId: meeting.id.uuidString, seriesId: seriesId, client: client)
+                let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
+                try captureSession.start(meetingId: meeting.id.uuidString, seriesId: seriesId, userId: userId, client: client)
                 recordingMeetingId = meeting.id
                 recordingSeriesId = seriesId
+                recordingInstance = instance
                 apply(.recordStarted)
             } catch {
                 lastFailedStart = .series
@@ -505,14 +612,23 @@ final class AppController: NSObject, ObservableObject {
     /// No series is known, so the stop-time recap is left to the browser tab the user came from.
     func startRecording(meetingId: String) {
         guard Self.canStartRecording(from: phase), let client = authManager.client() else { return }
-        do {
-            try captureSession.start(meetingId: meetingId, seriesId: nil, client: client)
-            recordingMeetingId = UUID(uuidString: meetingId)
-            recordingSeriesId = nil
-            apply(.recordStarted)
-        } catch {
-            lastFailedStart = .meeting(meetingId)
-            apply(.failed("Could not start recording: \(error.localizedDescription)"))
+        if Self.micPreCheckFails(status: AVCaptureDevice.authorizationStatus(for: .audio)) {
+            apply(.failed(CaptureSession.failureMessage(for: MicCapture.CaptureError.permissionDenied)))
+            return
+        }
+        let instance = client.instance
+        Task {
+            do {
+                let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
+                try captureSession.start(meetingId: meetingId, seriesId: nil, userId: userId, client: client)
+                recordingMeetingId = UUID(uuidString: meetingId)
+                recordingSeriesId = nil
+                recordingInstance = instance
+                apply(.recordStarted)
+            } catch {
+                lastFailedStart = .meeting(meetingId)
+                apply(.failed("Could not start recording: \(error.localizedDescription)"))
+            }
         }
     }
 
@@ -600,14 +716,28 @@ final class AppController: NSObject, ObservableObject {
     }
 
     func stopRecording() {
+        // Re-entrancy guard: a second Stop press while already finalizing must not call
+        // captureSession.stop() again (it would throw notRunning and flip the UI to error).
+        guard case .recording = phase else { return }
         apply(.recordStopped)
+        let meetingId = recordingMeetingId
+        let seriesId = recordingSeriesId
+        let instance = recordingInstance
         Task {
             do {
                 _ = try await captureSession.stop()
+                recordingMeetingId = nil
+                recordingSeriesId = nil
+                recordingInstance = nil
                 apply(.finalized)
-                openRecap()
+                if let meetingId, let instance {
+                    await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance)
+                }
             } catch {
-                apply(.failed("Could not finish recording: \(error.localizedDescription)"))
+                // The durable directory survives a timed-out finalize, so Retry finishes the upload
+                // rather than starting a new recording.
+                lastFailedStart = meetingId.map { .finalize(meetingId: $0.uuidString) } ?? .series
+                apply(.failed(Self.finalizeFailureMessage(for: error)))
             }
         }
     }
@@ -617,12 +747,32 @@ final class AppController: NSObject, ObservableObject {
     /// tolerated: even on throw/timeout the durable capture directory remains, so next-launch
     /// recovery finalizes it. No recap is opened; the app is quitting.
     func finishForQuit() async {
-        apply(.recordStopped)
-        do {
-            _ = try await captureSession.stop()
-            apply(.finalized)
-        } catch {
-            apply(.failed("Could not finish recording: \(error.localizedDescription)"))
+        switch Self.quitFinishAction(phase: phase) {
+        case .stop:
+            apply(.recordStopped)
+            do {
+                _ = try await captureSession.stop()
+                recordingMeetingId = nil
+                recordingSeriesId = nil
+                recordingInstance = nil
+                apply(.finalized)
+            } catch {
+                apply(.failed(Self.finalizeFailureMessage(for: error)))
+            }
+        case .awaitFinalizing:
+            // A stop is already in flight (the user pressed Stop, then quit). Calling stop() again
+            // would throw notRunning; instead wait for the running finalize to settle, bounded so a
+            // wedged upload cannot block termination forever.
+            await waitWhileFinalizing()
+        case .none:
+            return
+        }
+    }
+
+    private func waitWhileFinalizing() async {
+        let deadline = Date().addingTimeInterval(CaptureSession.finalizeTimeout + 5)
+        while case .finalizing = phase, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 100_000_000)
         }
     }
 
@@ -635,25 +785,62 @@ final class AppController: NSObject, ObservableObject {
         guard recoveryTask == nil, let client = authManager.client(), let instance = authManager.instance else { return }
         let activeId = recordingMeetingId?.uuidString
         recoveryTask = Task { [weak self] in
-            await Self.recoverAll(client: client, instance: instance, excluding: activeId)
+            let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
+            let recovered = await Self.recoverAll(
+                client: client, instance: instance, connectedUserId: userId, excluding: activeId)
+            // Recovery is otherwise silent; tell the user each rescued meeting is being finished, and
+            // make tapping the notification open its recap.
+            for manifest in recovered {
+                await self?.postRecoveryNotification(manifest: manifest, client: client)
+            }
             self?.recoveryTask = nil
         }
     }
 
-    nonisolated static func recoverAll(client: MinutiaClient, instance: URL, excluding activeMeetingId: String?) async {
-        guard let root = try? CaptureStore.capturesRoot() else { return }
+    /// Sweeps orphaned capture directories, finalizing each recoverable one, and returns the
+    /// manifests it successfully recovered (and deleted) so the caller can notify. Nonisolated and
+    /// static so it stays testable and off the main actor.
+    nonisolated static func recoverAll(
+        client: MinutiaClient, instance: URL, connectedUserId: String?, excluding activeMeetingId: String?
+    ) async -> [CaptureManifest] {
+        var recovered: [CaptureManifest] = []
+        guard let root = try? CaptureStore.capturesRoot() else { return recovered }
         for dir in CaptureRecovery.recoverableDirectories(in: root, excluding: activeMeetingId) {
             guard let manifest = CaptureRecovery.loadManifest(from: dir) else { continue }
-            // Skip dirs captured against a different instance: the current client cannot finalize a
-            // meeting that does not exist on the connected instance, and retrying orphans it forever.
-            guard CaptureRecovery.shouldRecover(manifest: manifest, connectedInstance: instance) else { continue }
+            // Skip dirs captured against a different instance or a different user: the current client
+            // cannot finalize a meeting that does not exist for this session, and retrying orphans it
+            // forever.
+            guard CaptureRecovery.shouldRecover(
+                manifest: manifest, connectedInstance: instance, connectedUserId: connectedUserId) else { continue }
             do {
                 try await CaptureRecovery.recover(directory: dir, manifest: manifest, client: client)
                 try? FileManager.default.removeItem(at: dir)
+                recovered.append(manifest)
             } catch {
                 // Best-effort: leave the directory for the next launch to retry.
             }
         }
+        return recovered
+    }
+
+    /// Posts the "Recovered your recording" notification, carrying the recap URL in userInfo so the
+    /// default tap action opens it. Resolves the series id (nil in the manifest for web-triggered
+    /// records) before building the URL from the manifest's own instance.
+    private func postRecoveryNotification(manifest: CaptureManifest, client: MinutiaClient) async {
+        var seriesId = manifest.seriesId.flatMap { UUID(uuidString: $0) }
+        if seriesId == nil {
+            seriesId = try? await client.meetingSeriesId(meetingId: manifest.meetingId)
+        }
+        let content = UNMutableNotificationContent()
+        content.title = "Recovered your recording"
+        content.body = "A meeting that didn't finish uploading has been recovered. The recap is being prepared."
+        if let seriesId, let meetingId = UUID(uuidString: manifest.meetingId) {
+            let url = MinutiaClient.recapURL(
+                instance: manifest.instanceURL, seriesId: seriesId, meetingId: meetingId)
+            content.userInfo = [Self.recapURLUserInfoKey: url.absoluteString]
+        }
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        try? await UNUserNotificationCenter.current().add(request)
     }
 
     func dismissDetection() {
@@ -666,6 +853,38 @@ final class AppController: NSObject, ObservableObject {
         switch Self.retryTarget(lastFailedStart: lastFailedStart) {
         case .meeting(let id): startRecording(meetingId: id)
         case .series: startRecording()
+        case .finalize(let id): refinalize(meetingId: id)
+        }
+    }
+
+    /// Retry a failed finalize by re-running the durable-directory recovery for that meeting, exactly
+    /// as startup recovery does, instead of starting a fresh recording. On success the recap opens;
+    /// on failure the app parks back in `.error` with the finalize target still remembered.
+    private func refinalize(meetingId: String) {
+        guard case .error = phase, let client = authManager.client() else { return }
+        apply(.refinalizeStarted)
+        Task {
+            do {
+                let dir = try CaptureStore.capturesRoot()
+                    .appendingPathComponent(meetingId.lowercased(), isDirectory: true)
+                guard let manifest = CaptureRecovery.loadManifest(from: dir) else {
+                    throw CaptureSession.CaptureError.notRunning
+                }
+                try await CaptureRecovery.recover(directory: dir, manifest: manifest, client: client)
+                try? FileManager.default.removeItem(at: dir)
+                apply(.finalized)
+                if let meetingUUID = UUID(uuidString: manifest.meetingId) {
+                    await openRecap(
+                        meetingId: meetingUUID,
+                        seriesId: manifest.seriesId.flatMap { UUID(uuidString: $0) },
+                        instance: manifest.instanceURL)
+                }
+            } catch {
+                // Re-arm the finalize target: apply(.refinalizeStarted) moved through .finalizing,
+                // which retires lastFailedStart, so set it again before parking back in .error.
+                lastFailedStart = .finalize(meetingId: meetingId)
+                apply(.failed(Self.finalizeFailureMessage(for: error)))
+            }
         }
     }
 
@@ -673,18 +892,23 @@ final class AppController: NSObject, ObservableObject {
         apply(.dismissedDetection)
     }
 
-    /// Land the flowing recap in front of the user the moment finalize completes. Clears the
-    /// recording ids unconditionally: a web-triggered record has no series id, so without an
-    /// unconditional clear the stale meeting id would make the next record command misfire.
-    private func openRecap() {
-        let seriesId = recordingSeriesId
-        let meetingId = recordingMeetingId
-        recordingMeetingId = nil
-        recordingSeriesId = nil
-        guard let instance = authManager.instance, let seriesId, let meetingId else { return }
-        let url = instance.appendingPathComponent(
-            "series/\(seriesId.uuidString.lowercased())/meetings/\(meetingId.uuidString.lowercased())")
-        NSWorkspace.shared.open(url)
+    /// Land the flowing recap in front of the user the moment finalize completes. Resolves the series
+    /// id when unknown (a web-triggered record carries none) via the meetings table; if it still
+    /// cannot be resolved, falls back to a notification rather than doing nothing. The URL is built
+    /// from the instance capture started against, not the currently-connected one.
+    private func openRecap(meetingId: UUID, seriesId: UUID?, instance: URL) async {
+        var resolvedSeries = seriesId
+        if resolvedSeries == nil, let client = authManager.client() {
+            resolvedSeries = try? await client.meetingSeriesId(meetingId: meetingId.uuidString)
+        }
+        guard let resolvedSeries else {
+            Self.postNotification(
+                title: "Recording saved",
+                body: "Open Minutia on the web to see the recap.")
+            return
+        }
+        NSWorkspace.shared.open(
+            MinutiaClient.recapURL(instance: instance, seriesId: resolvedSeries, meetingId: meetingId))
     }
 
     // MARK: - URL callback
@@ -734,6 +958,7 @@ extension AppController: UNUserNotificationCenterDelegate {
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let actionId = response.actionIdentifier
+        let userInfo = response.notification.request.content.userInfo
         Task { @MainActor in
             switch actionId {
             case MeetingDetector.recordActionId:
@@ -742,6 +967,15 @@ extension AppController: UNUserNotificationCenterDelegate {
                 self.confirmPendingRecord()
             case Self.dismissWebRecordActionId:
                 self.dismissPendingRecord()
+            case UNNotificationDefaultActionIdentifier:
+                // Tapping the recovered-recording notification opens its recap. The URL round-trips
+                // through userInfo, so re-check the scheme: a corrupt manifest must never make a
+                // notification tap open an arbitrary non-web scheme.
+                if let urlString = userInfo[Self.recapURLUserInfoKey] as? String,
+                   let url = URL(string: urlString),
+                   url.scheme == "https" || url.scheme == "http" {
+                    NSWorkspace.shared.open(url)
+                }
             default:
                 break
             }

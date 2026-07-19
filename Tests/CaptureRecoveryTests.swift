@@ -7,6 +7,7 @@ final class CaptureManifestTests: XCTestCase {
             meetingId: "0f9c2c9a-1a2b-4c3d-8e4f-5a6b7c8d9e0f",
             seriesId: "11111111-2222-3333-4444-555555555555",
             instanceURL: URL(string: "https://app.minutia.example")!,
+            userId: "aaaa1111-2222-3333-4444-555566667777",
             createdAt: Date(timeIntervalSince1970: 1_700_000_000))
         let data = try JSONEncoder().encode(manifest)
         let decoded = try JSONDecoder().decode(CaptureManifest.self, from: data)
@@ -18,11 +19,23 @@ final class CaptureManifestTests: XCTestCase {
             meetingId: "abc",
             seriesId: nil,
             instanceURL: URL(string: "https://x.example")!,
+            userId: nil,
             createdAt: Date(timeIntervalSince1970: 0))
         let data = try JSONEncoder().encode(manifest)
         let decoded = try JSONDecoder().decode(CaptureManifest.self, from: data)
         XCTAssertNil(decoded.seriesId)
         XCTAssertEqual(decoded, manifest)
+    }
+
+    // Manifests written by builds before the userId field must still decode (nil), so an older
+    // orphaned recording is never lost just because its manifest predates cross-account gating.
+    func test_decode_missingUserIdKeyDecodesAsNil() throws {
+        let json = """
+        {"meetingId":"abc","seriesId":null,"instanceURL":"https://x.example","createdAt":0}
+        """.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode(CaptureManifest.self, from: json)
+        XCTAssertNil(decoded.userId)
+        XCTAssertEqual(decoded.meetingId, "abc")
     }
 }
 
@@ -76,6 +89,7 @@ final class CaptureRecoveryDirectoriesTests: XCTestCase {
         let manifest = CaptureManifest(
             meetingId: "with-manifest", seriesId: nil,
             instanceURL: URL(string: "https://x.example")!,
+            userId: nil,
             createdAt: Date(timeIntervalSince1970: 42))
         try JSONEncoder().encode(manifest).write(to: dir.appendingPathComponent("manifest.json"))
         XCTAssertEqual(CaptureRecovery.loadManifest(from: dir), manifest)
@@ -85,29 +99,69 @@ final class CaptureRecoveryDirectoriesTests: XCTestCase {
 /// BUG A: recovery is scoped to the connected instance so a recording captured against instance A
 /// is never re-uploaded (and orphaned forever) while signed into instance B.
 final class CaptureRecoveryScopingTests: XCTestCase {
-    private func manifest(instance: String) -> CaptureManifest {
+    private func manifest(instance: String, userId: String? = nil) -> CaptureManifest {
         CaptureManifest(
             meetingId: "m", seriesId: nil,
             instanceURL: URL(string: instance)!,
+            userId: userId,
             createdAt: Date(timeIntervalSince1970: 0))
     }
 
     func test_shouldRecover_trueWhenInstancesMatch() {
         XCTAssertTrue(CaptureRecovery.shouldRecover(
             manifest: manifest(instance: "https://a.example"),
-            connectedInstance: URL(string: "https://a.example")!))
+            connectedInstance: URL(string: "https://a.example")!,
+            connectedUserId: nil))
     }
 
     func test_shouldRecover_falseWhenInstancesDiffer() {
         XCTAssertFalse(CaptureRecovery.shouldRecover(
             manifest: manifest(instance: "https://a.example"),
-            connectedInstance: URL(string: "https://b.example")!))
+            connectedInstance: URL(string: "https://b.example")!,
+            connectedUserId: nil))
     }
 
     func test_shouldRecover_trueAcrossTrailingSlashDifference() {
         XCTAssertTrue(CaptureRecovery.shouldRecover(
             manifest: manifest(instance: "https://a.example/"),
-            connectedInstance: URL(string: "https://a.example")!))
+            connectedInstance: URL(string: "https://a.example")!,
+            connectedUserId: nil))
+    }
+
+    // Cross-account gate matrix (instances already matched): only refuse when both user ids are
+    // known and differ; a nil on either side stays recoverable.
+    private let instance = URL(string: "https://a.example")!
+    private let userA = "aaaa1111-2222-3333-4444-555566667777"
+    private let userB = "bbbb1111-2222-3333-4444-555566667777"
+
+    func test_shouldRecover_trueWhenUserIdsEqual() {
+        XCTAssertTrue(CaptureRecovery.shouldRecover(
+            manifest: manifest(instance: "https://a.example", userId: userA),
+            connectedInstance: instance, connectedUserId: userA))
+    }
+
+    func test_shouldRecover_falseWhenUserIdsDiffer() {
+        XCTAssertFalse(CaptureRecovery.shouldRecover(
+            manifest: manifest(instance: "https://a.example", userId: userA),
+            connectedInstance: instance, connectedUserId: userB))
+    }
+
+    func test_shouldRecover_trueWhenManifestUserIdNil() {
+        XCTAssertTrue(CaptureRecovery.shouldRecover(
+            manifest: manifest(instance: "https://a.example", userId: nil),
+            connectedInstance: instance, connectedUserId: userA))
+    }
+
+    func test_shouldRecover_trueWhenConnectedUserIdNil() {
+        XCTAssertTrue(CaptureRecovery.shouldRecover(
+            manifest: manifest(instance: "https://a.example", userId: userA),
+            connectedInstance: instance, connectedUserId: nil))
+    }
+
+    func test_shouldRecover_falseWhenInstancesDifferEvenIfUsersMatch() {
+        XCTAssertFalse(CaptureRecovery.shouldRecover(
+            manifest: manifest(instance: "https://a.example", userId: userA),
+            connectedInstance: URL(string: "https://b.example")!, connectedUserId: userA))
     }
 }
 

@@ -23,6 +23,11 @@ struct CaptureManifest: Codable, Equatable {
     let meetingId: String
     let seriesId: String?
     let instanceURL: URL
+    /// The lowercased uuid of the user who recorded this meeting, so cross-account recovery can be
+    /// gated (a recording captured by user A must not be re-uploaded while user B is signed in on the
+    /// same instance). Nil-tolerant: manifests written by older builds have no user id and are
+    /// treated as recoverable.
+    let userId: String?
     let createdAt: Date
 }
 
@@ -66,10 +71,19 @@ enum CaptureRecovery {
     /// when the manifest's instance matches the connected one, compared through InstanceConfig
     /// .normalize so a trailing slash or scheme/host casing difference never splits an otherwise
     /// identical instance.
-    nonisolated static func shouldRecover(manifest: CaptureManifest, connectedInstance: URL) -> Bool {
+    nonisolated static func shouldRecover(
+        manifest: CaptureManifest, connectedInstance: URL, connectedUserId: String?
+    ) -> Bool {
         let manifestInstance = InstanceConfig.normalize(manifest.instanceURL.absoluteString) ?? manifest.instanceURL
         let connected = InstanceConfig.normalize(connectedInstance.absoluteString) ?? connectedInstance
-        return manifestInstance == connected
+        guard manifestInstance == connected else { return false }
+        // Cross-account gate: only refuse when both ids are known and differ. A nil on either side
+        // (older manifest, or an unavailable session) stays recoverable so the instance match alone
+        // still salvages the recording.
+        if let manifestUser = manifest.userId, let connectedUserId, manifestUser != connectedUserId {
+            return false
+        }
+        return true
     }
 
     /// Finalize an orphaned recording: best-effort re-upload of any fast-lane segments (server

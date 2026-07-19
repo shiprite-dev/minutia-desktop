@@ -46,6 +46,21 @@ final class AppPhaseTests: XCTestCase {
         XCTAssertEqual(AppPhase.error("boom").next(.recordStarted), .recording)
     }
 
+    func test_error_refinalizeStarted_goesToFinalizing() {
+        XCTAssertEqual(AppPhase.error("boom").next(.refinalizeStarted), .finalizing)
+    }
+
+    /// refinalizeStarted moves only from .error; every other phase ignores it (self-transition),
+    /// so a stray refinalize can never yank a live recording or a resting app into .finalizing.
+    func test_refinalizeStarted_isNoOpFromEveryNonErrorPhase() {
+        let nonError: [AppPhase] = [
+            .signedOut, .idle, .detected(app: "Zoom"), .detected(app: nil), .recording, .finalizing,
+        ]
+        for state in nonError {
+            XCTAssertEqual(state.next(.refinalizeStarted), state, "refinalizeStarted must be a no-op from \(state)")
+        }
+    }
+
     func test_anyState_signedOut_goesToSignedOut() {
         let states: [AppPhase] = [.signedOut, .idle, .detected(app: "Meet"), .recording, .finalizing, .error("boom")]
         for state in states {

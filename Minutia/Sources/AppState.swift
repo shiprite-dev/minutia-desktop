@@ -18,6 +18,9 @@ enum AppEvent {
     case finalized
     case failed(String)
     case dismissedDetection
+    /// Retry of a failed finalize: re-runs the durable-directory finalize from `.error` rather than
+    /// starting a fresh recording, so the preserved audio is what gets uploaded.
+    case refinalizeStarted
 }
 
 extension AppPhase {
@@ -35,6 +38,8 @@ extension AppPhase {
         case (.detected, .dismissedDetection), (.error, .dismissedDetection):
             return .idle
         case (.recording, .recordStopped):
+            return .finalizing
+        case (.error, .refinalizeStarted):
             return .finalizing
         case (.finalizing, .finalized):
             return .idle

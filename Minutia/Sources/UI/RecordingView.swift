@@ -43,6 +43,13 @@ struct RecordingView: View {
                     .foregroundStyle(.secondary)
             }
 
+            if session.systemAudioDegraded {
+                Text("System audio isn't being captured. Recording your microphone only.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             Button {
                 onStop()
             } label: {

@@ -175,6 +175,12 @@ struct MinutiaClient {
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
 
         if (200...299).contains(status) || status == 409 { return true }
+        // 401/403 are transient far more often than terminal here: supabase-swift refreshes the
+        // access token transparently, so throwing lets UploadQueue's backoff retry with a fresh
+        // token instead of abandoning the segment as unregistered.
+        if status == 401 || status == 403 {
+            throw MinutiaClientError.serverError(status: status)
+        }
         if status == 503 || (400...499).contains(status) {
             Self.logger.notice("Segment transcription terminal status \(status, privacy: .public) for meeting \(meetingId, privacy: .public) seq \(seq)")
             return false
@@ -218,11 +224,39 @@ struct MinutiaClient {
         if !(200...299).contains(status) {
             Self.logger.notice("requestTranscription non-2xx status \(status, privacy: .public) for meeting \(meetingId, privacy: .public)")
         }
-        // 503 is terminal-not-configured; the transcript can still be assembled from
-        // fast-lane segments, so it is not a hard failure. Retriable 5xx throws.
-        if status >= 500 && status != 503 {
+        // Any status outside 2xx and the terminal 503 must throw so the caller never treats the
+        // request as accepted: on the stop path a false "accepted" deletes the local audio with no
+        // server transcript (data loss). 503 is terminal-not-configured; the transcript can still be
+        // assembled from fast-lane segments, so it alone is not a hard failure.
+        if !(200...299).contains(status) && status != 503 {
             throw MinutiaClientError.serverError(status: status)
         }
+    }
+
+    /// Resolves a meeting's parent series id so the recap URL can be built for a web-triggered
+    /// record (which carries no series at start). Decodes tolerant of a null `series_id`. The id is
+    /// lowercased through `meetingLookupId` to match the canonical DB row.
+    func meetingSeriesId(meetingId: String) async throws -> UUID? {
+        struct Row: Decodable { let series_id: UUID? }
+        let response: PostgrestResponse<Row> = try await supabase
+            .from("meetings")
+            .select("series_id")
+            .eq("id", value: Self.meetingLookupId(meetingId))
+            .single()
+            .execute()
+        return response.value.series_id
+    }
+
+    /// The meetings-table lookup id: lowercased to match the canonical DB id (Swift `UUID.uuidString`
+    /// is uppercase). The shared seam so a recap-resolution query is never issued with an uppercase id.
+    static func meetingLookupId(_ meetingId: String) -> String { meetingId.lowercased() }
+
+    /// The web app's recap route for a meeting (src/app/(app)/series/[id]/meetings/[meetingId] on
+    /// the server). The single builder for every place that opens a recap, so the shape and the
+    /// lowercase-id rule cannot drift between call sites.
+    static func recapURL(instance: URL, seriesId: UUID, meetingId: UUID) -> URL {
+        instance.appendingPathComponent(
+            "series/\(seriesId.uuidString.lowercased())/meetings/\(meetingId.uuidString.lowercased())")
     }
 
     /// Announces this companion instance to the web app. Fire-and-forget: failures are ignored so a
