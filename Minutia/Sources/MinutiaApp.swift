@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Combine
 import Sparkle
 import SwiftUI
@@ -126,9 +127,21 @@ struct MenuBarIcon: View {
 
     var body: some View {
         glyph
+            .accessibilityLabel(Self.accessibilityLabel(phase: phase))
             .onAppear { syncPulse() }
             .onChange(of: phase) { _, _ in syncPulse() }
             .onDisappear { stopPulse() }
+    }
+
+    /// VoiceOver text for the status item, since the glyph alone conveys the phase.
+    static func accessibilityLabel(phase: AppPhase) -> String {
+        switch phase {
+        case .recording: return "Minutia, recording"
+        case .finalizing: return "Minutia, finishing recording"
+        case .detected: return "Minutia, meeting detected"
+        case .error: return "Minutia, error"
+        default: return "Minutia, idle"
+        }
     }
 
     @ViewBuilder private var glyph: some View {
@@ -186,6 +199,15 @@ final class AppController: NSObject, ObservableObject {
     /// Soft detection: mic active with no corroborating app/calendar signal. Surfaced quietly
     /// (menu bar glyph + one secondary row), never a notification. See `shouldShowSoftHint`.
     @Published private(set) var softHint: Bool = false
+    /// True when the app has microphone access; drives the in-menu "grant access" banner. System
+    /// audio TCC has no queryable status, so only the mic is reflected here.
+    @Published private(set) var micAuthorized = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    /// True when notification permission is denied; drives the Settings row nudging the user to
+    /// enable it, since detection and consent prompts otherwise have no way to reach them.
+    @Published private(set) var notificationsDenied = false
+    /// Transient in-menu feedback (e.g. a rejected web-record) so the message exists even when
+    /// notifications are off. Cleared on the next phase change.
+    @Published private(set) var recordFeedback: String?
     @Published var selectedSeriesId: UUID? {
         didSet {
             UserDefaults.standard.set(selectedSeriesId?.uuidString, forKey: Self.lastSeriesKey)
@@ -247,6 +269,19 @@ final class AppController: NSObject, ObservableObject {
         }
     }
 
+    /// Which start path last failed and is sitting in `.error`, so Retry re-runs the right one:
+    /// a web-triggered record needs its meeting id, not the selected series.
+    enum FailedStart: Equatable {
+        case series
+        case meeting(String)
+    }
+
+    /// Route a Retry from the error phase. A remembered `.meeting` failure retries that meeting id;
+    /// a `.series` failure or nothing remembered falls back to the series start path.
+    nonisolated static func retryTarget(lastFailedStart: FailedStart?) -> FailedStart {
+        lastFailedStart ?? .series
+    }
+
     /// Signing out mid-capture must tear the pipeline down first; mic and system audio would
     /// otherwise keep recording invisibly with uploads failing auth.
     nonisolated static func shouldStopCaptureOnSignOut(phase: AppPhase) -> Bool {
@@ -277,6 +312,7 @@ final class AppController: NSObject, ObservableObject {
     private var lastConfidence: DetectionConfidence = .none
     private var recordingMeetingId: UUID?
     private var recordingSeriesId: UUID?
+    private var lastFailedStart: FailedStart?
     /// Single-flight guard for the startup recovery sweep.
     private var recoveryTask: Task<Void, Never>?
 
@@ -316,8 +352,26 @@ final class AppController: NSObject, ObservableObject {
         // Drop it the moment we leave one (recording started by any path, finalizing, or sign-out)
         // so a stale banner cannot linger past the meeting or a sign-out.
         if !Self.canStartRecording(from: next) { pendingRecordConsent = nil }
+        // Transient feedback lives for exactly one phase; any transition clears it.
+        recordFeedback = nil
+        // The remembered failed-start route is only meaningful while parked in .error. Any
+        // transition to a non-error phase (recording actually started, or the error dismissed)
+        // retires it; a transition into .error keeps the route set by the catch that triggered it.
+        if case .error = next {} else { lastFailedStart = nil }
+        if case .idle = next { refreshPermissionState() }
         refreshSoftHint()
         syncDetector()
+    }
+
+    /// Refresh the mic-authorization and notification-permission flags that drive the in-menu and
+    /// Settings guidance. Called on idle entry and when the menu/Settings appear.
+    func refreshPermissionState() {
+        micAuthorized = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            Task { @MainActor in
+                self.notificationsDenied = settings.authorizationStatus == .denied
+            }
+        }
     }
 
     /// Derive the published hint from the latest confidence and phase together, so leaving
@@ -348,6 +402,10 @@ final class AppController: NSObject, ObservableObject {
             if Self.shouldStopCaptureOnSignOut(phase: phase) {
                 Task { _ = try? await captureSession.stop() }
             }
+            recordingMeetingId = nil
+            recordingSeriesId = nil
+            lastFailedStart = nil
+            pendingRecordConsent = nil
             apply(.signedOut)
             series = []
         }
@@ -406,6 +464,7 @@ final class AppController: NSObject, ObservableObject {
                 recordingSeriesId = seriesId
                 apply(.recordStarted)
             } catch {
+                lastFailedStart = .series
                 apply(.failed("Could not start recording: \(error.localizedDescription)"))
             }
         }
@@ -422,6 +481,7 @@ final class AppController: NSObject, ObservableObject {
             recordingSeriesId = nil
             apply(.recordStarted)
         } catch {
+            lastFailedStart = .meeting(meetingId)
             apply(.failed("Could not start recording: \(error.localizedDescription)"))
         }
     }
@@ -444,6 +504,7 @@ final class AppController: NSObject, ObservableObject {
         case .ignoreSameMeeting:
             return
         case .rejectOtherMeeting:
+            recordFeedback = "Already recording another meeting. Stop it first to record this one."
             Self.postNotification(
                 title: "Already recording another meeting",
                 body: "Stop the current recording before starting a new one.")
@@ -569,9 +630,13 @@ final class AppController: NSObject, ObservableObject {
         apply(.dismissedDetection)
     }
 
-    /// Error-phase actions: Retry re-runs the start path, Dismiss returns to idle.
+    /// Error-phase actions: Retry re-runs the failed start path (series or the web meeting id),
+    /// Dismiss returns to idle.
     func retry() {
-        startRecording()
+        switch Self.retryTarget(lastFailedStart: lastFailedStart) {
+        case .meeting(let id): startRecording(meetingId: id)
+        case .series: startRecording()
+        }
     }
 
     func dismissError() {
@@ -614,6 +679,16 @@ final class AppController: NSObject, ObservableObject {
 }
 
 extension AppController: UNUserNotificationCenterDelegate {
+    /// Show detection/consent notifications even while the app is foreground (e.g. the Settings
+    /// window makes it `.regular`); otherwise macOS suppresses the banner and the prompt is lost.
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+
     nonisolated func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse,

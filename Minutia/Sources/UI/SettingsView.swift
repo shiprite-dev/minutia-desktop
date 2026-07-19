@@ -12,7 +12,8 @@ struct SettingsView: View {
     @State private var instanceText = ""
     @State private var busy = false
     @State private var statusMessage: String?
-    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var launchAtLogin = SettingsView.loginItemState(SMAppService.mainApp.status) != .disabled
+    @State private var loginRequiresApproval = SettingsView.loginItemState(SMAppService.mainApp.status) == .requiresApproval
 
     init(controller: AppController, updater: UpdaterController) {
         _controller = ObservedObject(wrappedValue: controller)
@@ -62,6 +63,16 @@ struct SettingsView: View {
                     .onChange(of: launchAtLogin) { _, enabled in
                         setLaunchAtLogin(enabled)
                     }
+                if loginRequiresApproval {
+                    Link("Pending approval in System Settings > General > Login Items",
+                         destination: URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension")!)
+                        .font(.callout)
+                }
+                if controller.notificationsDenied {
+                    Link("Enable notifications for meeting prompts",
+                         destination: URL(string: "x-apple.systempreferences:com.apple.preference.notifications")!)
+                        .font(.callout)
+                }
             }
 
             Section("About") {
@@ -73,7 +84,11 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: 420)
         .fixedSize(horizontal: false, vertical: true)
-        .onAppear(perform: activateForEditing)
+        .onAppear {
+            activateForEditing()
+            refreshLoginItemState()
+            controller.refreshPermissionState()
+        }
         .onDisappear { NSApp.setActivationPolicy(.accessory) }
         .task {
             if instanceText.isEmpty {
@@ -86,6 +101,23 @@ struct SettingsView: View {
 
     private var connectedHost: String {
         authManager.instance?.host ?? authManager.instance?.absoluteString ?? ""
+    }
+
+    /// Login-item registration state distilled from `SMAppService.Status`. `.requiresApproval`
+    /// (the user must approve the item in System Settings) is distinct from a plain OFF, so the
+    /// UI can nudge instead of reading as disabled.
+    enum LoginItemState: Equatable {
+        case enabled
+        case disabled
+        case requiresApproval
+    }
+
+    nonisolated static func loginItemState(_ status: SMAppService.Status) -> LoginItemState {
+        switch status {
+        case .enabled: return .enabled
+        case .requiresApproval: return .requiresApproval
+        default: return .disabled
+        }
     }
 
     static var versionString: String {
@@ -125,8 +157,16 @@ struct SettingsView: View {
                 try SMAppService.mainApp.unregister()
             }
         } catch {
-            // Registration failed (e.g. sandbox/test rig): reflect reality, not the toggle.
-            launchAtLogin = SMAppService.mainApp.status == .enabled
+            // Registration failed (e.g. sandbox/test rig): fall through to reflect reality.
         }
+        refreshLoginItemState()
+    }
+
+    /// Mirror the toggle and the pending-approval note to the real service status. `.requiresApproval`
+    /// counts as ON (the user opted in; macOS is waiting on their approval), not OFF.
+    private func refreshLoginItemState() {
+        let state = SettingsView.loginItemState(SMAppService.mainApp.status)
+        launchAtLogin = state != .disabled
+        loginRequiresApproval = state == .requiresApproval
     }
 }

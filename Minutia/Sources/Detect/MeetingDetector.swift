@@ -26,6 +26,14 @@ final class MeetingDetector: ObservableObject {
             identifier: notificationCategoryId, actions: [record], intentIdentifiers: [], options: [])
     }
 
+    /// Post the "Record this meeting?" notification only on the rising edge into `.high`: high now
+    /// and not already notified for this mic session. `notifiedHigh` resets solely when the mic goes
+    /// inactive (a true meeting boundary), so a transient confidence dip during one continuous
+    /// session (e.g. a missed CptHost poll: high -> soft -> high) never re-notifies for it.
+    nonisolated static func shouldNotify(isHigh: Bool, alreadyNotified: Bool) -> Bool {
+        isHigh && !alreadyNotified
+    }
+
     private let controlQueue = DispatchQueue(label: "app.minutia.detector.control")
 
     private var inputDeviceID = AudioObjectID(kAudioObjectUnknown)
@@ -206,20 +214,25 @@ final class MeetingDetector: ObservableObject {
 
     private func evaluate() async {
         guard micActive else { return }
+        // `proc_listallpids` plus a `proc_name` syscall per PID is hundreds of syscalls; run it off
+        // the main actor so the 5s poll never stalls the UI. Re-check micActive after the hop: the
+        // mic can go inactive while it runs, and refreshMicState would already have reset state.
+        let signals = await Task.detached {
+            (processNames: Self.runningProcessNames(), bundleIds: Self.runningBundleIds())
+        }.value
+        guard micActive else { return }
         let app = DetectionRules.detectApp(
-            processNames: Self.runningProcessNames(), bundleIds: Self.runningBundleIds())
+            processNames: signals.processNames, bundleIds: signals.bundleIds)
         let agenda = await agendaSnapshot()
         let calendarLive = DetectionRules.liveAgendaItem(agenda, now: Date()) != nil
         let result = DetectionRules.assess(micActive: micActive, app: app, calendarLive: calendarLive)
 
         confidence = result
-        if case .high = result {
-            if !notifiedHigh {
-                notifiedHigh = true
-                postRecordNotification(app: app)
-            }
-        } else {
-            notifiedHigh = false
+        let isHigh: Bool
+        if case .high = result { isHigh = true } else { isHigh = false }
+        if Self.shouldNotify(isHigh: isHigh, alreadyNotified: notifiedHigh) {
+            notifiedHigh = true
+            postRecordNotification(app: app)
         }
     }
 
@@ -250,7 +263,7 @@ final class MeetingDetector: ObservableObject {
     /// `NSWorkspace.runningApplications` misses helper processes like Zoom's `CptHost`, which never
     /// registers as a full running application, so bundle ids alone cannot detect an active Zoom
     /// call; process names via libproc catch it.
-    private static func runningProcessNames() -> [String] {
+    nonisolated private static func runningProcessNames() -> [String] {
         let neededSize = proc_listallpids(nil, 0)
         guard neededSize > 0 else { return [] }
         let capacity = Int(neededSize) / MemoryLayout<pid_t>.size + 32
@@ -275,7 +288,7 @@ final class MeetingDetector: ObservableObject {
         return names
     }
 
-    private static func runningBundleIds() -> [String] {
+    nonisolated private static func runningBundleIds() -> [String] {
         NSWorkspace.shared.runningApplications.compactMap { $0.bundleIdentifier }
     }
 }
