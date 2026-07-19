@@ -210,6 +210,22 @@ final class UploadQueueBehaviorTests: XCTestCase {
         XCTAssertEqual(events, [true, false], "true after the 3rd failed attempt, false once upload succeeds")
     }
 
+    func test_cancelAll_haltsRetryLoopBeforeMaxAttempts() async {
+        // BUG B: an abandoned segment (upload always throws) would otherwise retry up to the runaway
+        // ceiling. cancelAll must stop the loop cooperatively so it returns promptly, not after 1000
+        // attempts, and the segment stays counted as enqueued so drainAndWait's invariant holds.
+        let transport = StubTransport(behavior: .init(uploadAlwaysFails: true))
+        let queue = makeQueue(transport)
+        queue.enqueue(segment(0))
+        queue.cancelAll()
+        let counts = await queue.drainAndWait()
+
+        XCTAssertLessThan(
+            transport.uploadAttempts, UploadQueue.maxAttempts,
+            "cancellation stops the retry loop well before the runaway ceiling")
+        XCTAssertEqual(counts.enqueued, 1, "the cancelled segment is still counted as enqueued")
+    }
+
     func test_drainAndWait_returnsOnlyAfterInFlightRetriesSettle() async {
         // A real (tiny) sleep forces genuine suspension between retries; drainAndWait must still
         // observe the eventual success, proving it awaits the full retry chain.

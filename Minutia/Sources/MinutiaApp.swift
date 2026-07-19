@@ -511,18 +511,21 @@ final class AppController: NSObject, ObservableObject {
     /// finalize each. Single-flight and best-effort: a failure leaves the directory for a later
     /// launch. The live recording's directory (if any) is never swept.
     private func runRecovery() {
-        guard recoveryTask == nil, let client = authManager.client() else { return }
+        guard recoveryTask == nil, let client = authManager.client(), let instance = authManager.instance else { return }
         let activeId = recordingMeetingId?.uuidString
         recoveryTask = Task { [weak self] in
-            await Self.recoverAll(client: client, excluding: activeId)
+            await Self.recoverAll(client: client, instance: instance, excluding: activeId)
             self?.recoveryTask = nil
         }
     }
 
-    nonisolated static func recoverAll(client: MinutiaClient, excluding activeMeetingId: String?) async {
+    nonisolated static func recoverAll(client: MinutiaClient, instance: URL, excluding activeMeetingId: String?) async {
         guard let root = try? CaptureStore.capturesRoot() else { return }
         for dir in CaptureRecovery.recoverableDirectories(in: root, excluding: activeMeetingId) {
             guard let manifest = CaptureRecovery.loadManifest(from: dir) else { continue }
+            // Skip dirs captured against a different instance: the current client cannot finalize a
+            // meeting that does not exist on the connected instance, and retrying orphans it forever.
+            guard CaptureRecovery.shouldRecover(manifest: manifest, connectedInstance: instance) else { continue }
             do {
                 try await CaptureRecovery.recover(directory: dir, manifest: manifest, client: client)
                 try? FileManager.default.removeItem(at: dir)

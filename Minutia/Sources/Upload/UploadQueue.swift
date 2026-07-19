@@ -40,6 +40,9 @@ actor UploadQueue {
     // enqueued before the drain begins is always tracked, awaited, and counted.
     private let intakeLock = NSLock()
     nonisolated(unsafe) private var pendingTasks: [Task<Void, Never>] = []
+    // Append-only mirror of every spawned task, kept alive independently of drainAndWait's draining
+    // so cancelAll can still reach in-flight retry loops after they leave pendingTasks.
+    nonisolated(unsafe) private var spawnedTasks: [Task<Void, Never>] = []
     nonisolated(unsafe) private var enqueuedCount = 0
 
     init(
@@ -69,8 +72,21 @@ actor UploadQueue {
         let task = Task { await self.process(segment) }
         intakeLock.lock()
         pendingTasks.append(task)
+        spawnedTasks.append(task)
         enqueuedCount += 1
         intakeLock.unlock()
+    }
+
+    /// Cancels every spawned segment task so an abandoned retry loop (a segment stuck failing for up
+    /// to the runaway ceiling) stops promptly once its capture ends. `process` checks `Task
+    /// .isCancelled` cooperatively, so cancelled loops return instead of spinning ~16h. Nonisolated
+    /// so `CaptureSession.stop`'s synchronous defer and the fatal teardown can call it without an
+    /// actor hop. Idempotent: cancelling a finished task is a no-op.
+    nonisolated func cancelAll() {
+        intakeLock.lock()
+        let tasks = spawnedTasks
+        intakeLock.unlock()
+        for task in tasks { task.cancel() }
     }
 
     /// Awaits every in-flight segment (including its retries) and returns the running totals. Any
@@ -94,6 +110,7 @@ actor UploadQueue {
         var didUpload = false
         var attempt = 1
         while attempt <= Self.maxAttempts {
+            if Task.isCancelled { return }
             do {
                 if !didUpload {
                     try await transport.uploadSegment(meetingId: meetingId, seq: segment.seq, fileURL: segment.fileURL)
@@ -115,6 +132,7 @@ actor UploadQueue {
                     await setReconnecting(true)
                 }
                 await sleep(Self.backoffSchedule(attempt: attempt))
+                if Task.isCancelled { return }
                 attempt += 1
             }
         }

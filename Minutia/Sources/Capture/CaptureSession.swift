@@ -35,6 +35,10 @@ final class CaptureSession: ObservableObject {
     private var meetingId: String?
     private var directory: URL?
     private var startedAt: Date?
+    /// Bumped on every `start`. The upload queue's progress/reconnecting callbacks capture the
+    /// generation live at their creation; a callback from a superseded capture (a stale retry loop
+    /// from a prior meeting) is gated out so it can never write onto the current meeting's UI.
+    private var captureGeneration = 0
 
     /// Wires the capture graph and starts recording. Synchronous by contract; the mic engine spins
     /// up asynchronously inside the pipeline so a permission prompt never blocks the caller. The
@@ -58,15 +62,24 @@ final class CaptureSession: ObservableObject {
             createdAt: Date())
         try JSONEncoder().encode(manifest).write(to: dir.appendingPathComponent(CaptureRecovery.manifestName))
 
+        captureGeneration += 1
+        let generation = captureGeneration
+
         let pipeline = try CapturePipeline(directory: dir)
         let queue = UploadQueue(
             transport: client,
             meetingId: meetingId,
             onProgress: { [weak self] uploaded in
-                await MainActor.run { self?.segmentsUploaded = uploaded }
+                await MainActor.run {
+                    guard let self, self.captureGeneration == generation else { return }
+                    self.segmentsUploaded = uploaded
+                }
             },
             onReconnecting: { [weak self] value in
-                await MainActor.run { self?.reconnecting = value }
+                await MainActor.run {
+                    guard let self, self.captureGeneration == generation else { return }
+                    self.reconnecting = value
+                }
             }
         )
         // Segments are handed to the queue synchronously on the tick queue, so `finishCapture`'s
@@ -104,7 +117,10 @@ final class CaptureSession: ObservableObject {
         }
         // Teardown must happen even if uploadRecording/finalize throws below; otherwise `pipeline`
         // stays non-nil and every future `start` silently no-ops. The error still propagates.
+        // cancelAll stops any segment retry loop still running after the finalize window (drained
+        // ones are already finished, so this only bites the abandoned-on-timeout case).
         defer {
+            queue.cancelAll()
             self.pipeline = nil
             self.queue = nil
             self.client = nil
@@ -172,6 +188,7 @@ final class CaptureSession: ObservableObject {
     private func handleFatal(_ error: Error, preserveForRecovery: Bool) {
         guard let pipeline else { return }
         pipeline.teardown()
+        queue?.cancelAll()
         if !preserveForRecovery, let directory {
             try? FileManager.default.removeItem(at: directory)
         }
@@ -187,6 +204,14 @@ final class CaptureSession: ObservableObject {
         segmentsTotal = 0
         reconnecting = false
         onFailure?(Self.failureMessage(for: error))
+    }
+
+    /// Whether a mic-start failure should preserve the capture dir for recovery. The system-audio
+    /// tap runs synchronously and the 250ms tick writes the other participants' audio the whole time
+    /// the mic permission dialog is up, so any frames on disk are real meeting audio worth salvaging;
+    /// only a zero-frame denial (immediate/persisted) leaves nothing to keep.
+    nonisolated static func shouldPreserve(framesWritten: Int64) -> Bool {
+        framesWritten > 0
     }
 
     nonisolated static func failureMessage(for error: Error) -> String {
@@ -233,8 +258,12 @@ private final class CapturePipeline {
     func start() throws {
         try tap.start()
         // A denied mic must surface, not be swallowed: without this a permission-denied recording
-        // looks healthy but captures only system audio.
-        Task { do { try await mic.start() } catch { self.onFatal?(error, false) } }
+        // looks healthy but captures only system audio. Preserve the dir when the tick has already
+        // written system audio during the permission prompt; deleting it would lose that audio.
+        Task {
+            do { try await mic.start() }
+            catch { self.onFatal?(error, CaptureSession.shouldPreserve(framesWritten: self.writer.totalFrames)) }
+        }
 
         let timer = DispatchSource.makeTimerSource(queue: tickQueue)
         timer.schedule(deadline: .now() + 0.25, repeating: 0.25)

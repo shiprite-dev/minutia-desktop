@@ -81,3 +81,45 @@ final class CaptureRecoveryDirectoriesTests: XCTestCase {
         XCTAssertEqual(CaptureRecovery.loadManifest(from: dir), manifest)
     }
 }
+
+/// BUG A: recovery is scoped to the connected instance so a recording captured against instance A
+/// is never re-uploaded (and orphaned forever) while signed into instance B.
+final class CaptureRecoveryScopingTests: XCTestCase {
+    private func manifest(instance: String) -> CaptureManifest {
+        CaptureManifest(
+            meetingId: "m", seriesId: nil,
+            instanceURL: URL(string: instance)!,
+            createdAt: Date(timeIntervalSince1970: 0))
+    }
+
+    func test_shouldRecover_trueWhenInstancesMatch() {
+        XCTAssertTrue(CaptureRecovery.shouldRecover(
+            manifest: manifest(instance: "https://a.example"),
+            connectedInstance: URL(string: "https://a.example")!))
+    }
+
+    func test_shouldRecover_falseWhenInstancesDiffer() {
+        XCTAssertFalse(CaptureRecovery.shouldRecover(
+            manifest: manifest(instance: "https://a.example"),
+            connectedInstance: URL(string: "https://b.example")!))
+    }
+
+    func test_shouldRecover_trueAcrossTrailingSlashDifference() {
+        XCTAssertTrue(CaptureRecovery.shouldRecover(
+            manifest: manifest(instance: "https://a.example/"),
+            connectedInstance: URL(string: "https://a.example")!))
+    }
+}
+
+/// BUG C: a mic-start failure preserves the capture dir whenever the tick has already written
+/// system audio during the permission prompt; only a zero-frame denial deletes it.
+final class CapturePreserveTests: XCTestCase {
+    func test_shouldPreserve_falseWhenNoFramesWritten() {
+        XCTAssertFalse(CaptureSession.shouldPreserve(framesWritten: 0))
+    }
+
+    func test_shouldPreserve_trueWhenSystemAudioAlreadyWritten() {
+        XCTAssertTrue(CaptureSession.shouldPreserve(framesWritten: 1))
+        XCTAssertTrue(CaptureSession.shouldPreserve(framesWritten: 48_000))
+    }
+}

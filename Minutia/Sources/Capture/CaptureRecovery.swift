@@ -60,6 +60,18 @@ enum CaptureRecovery {
         return try? JSONDecoder().decode(CaptureManifest.self, from: data)
     }
 
+    /// Recovery is scoped to the connected instance: a recording captured against instance A must
+    /// never be re-uploaded while signed into instance B (no such meeting row exists there, so every
+    /// attempt throws and the directory orphans forever, re-uploading on every launch). True only
+    /// when the manifest's instance matches the connected one, compared through InstanceConfig
+    /// .normalize so a trailing slash or scheme/host casing difference never splits an otherwise
+    /// identical instance.
+    nonisolated static func shouldRecover(manifest: CaptureManifest, connectedInstance: URL) -> Bool {
+        let manifestInstance = InstanceConfig.normalize(manifest.instanceURL.absoluteString) ?? manifest.instanceURL
+        let connected = InstanceConfig.normalize(connectedInstance.absoluteString) ?? connectedInstance
+        return manifestInstance == connected
+    }
+
     /// Finalize an orphaned recording: best-effort re-upload of any fast-lane segments (server
     /// register is idempotent by seq), then upload the full recording, finalize the meeting, and
     /// request transcription. On success the CALLER deletes the directory; a throw leaves it intact
