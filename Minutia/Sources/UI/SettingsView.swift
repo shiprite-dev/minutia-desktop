@@ -95,7 +95,7 @@ struct SettingsView: View {
             Section("About") {
                 LabeledContent("Version", value: Self.versionString)
                 if updater.updateAvailable {
-                    Button("Update available — install now") { updater.checkForUpdates() }
+                    Button("Update available: install now") { updater.checkForUpdates() }
                 }
                 Button("Check for Updates…") { updater.checkForUpdates() }
                     .disabled(!updater.canCheckForUpdates)
