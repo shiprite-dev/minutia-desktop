@@ -69,21 +69,34 @@ struct SignInView: View {
                 }
             }
 
-            if let message = errorMessage ?? authManager.callbackError {
+            if !authManager.isConnected, !connecting, let message = errorMessage {
+                // Connection failure (not a sign-in failure): a first-run user most often hits this
+                // because the network was not ready at launch, so lead with a warm retry rather than
+                // a raw transport error, and keep the self-host option as a quiet secondary link.
                 Section {
-                    VStack(alignment: .leading, spacing: 6) {
+                    VStack(alignment: .leading, spacing: 10) {
                         Text(message)
-                            .foregroundStyle(.red)
                             .font(.callout)
-                        if !authManager.isConnected {
-                            Button("Change instance in Settings") {
-                                NSApp.activate(ignoringOtherApps: true)
-                                openSettings()
-                            }
-                            .buttonStyle(.link)
-                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button("Try again") { Task { await attemptConnect() } }
+                            .buttonStyle(.borderedProminent)
+                            .keyboardShortcut(.defaultAction)
+                        Button("Using a self-hosted server?") {
+                            NSApp.activate(ignoringOtherApps: true)
+                            openSettings()
                         }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     }
+                }
+            } else if authManager.isConnected, let message = errorMessage ?? authManager.callbackError {
+                Section {
+                    Text(message)
+                        .foregroundStyle(.red)
+                        .font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
@@ -95,12 +108,29 @@ struct SignInView: View {
     /// restoreSession(): a client already built by session restore short-circuits here.
     private func autoConnect() async {
         guard authManager.supabase == nil else { connecting = false; return }
+        await attemptConnect()
+    }
+
+    /// Connect with a short backoff so a transient failure at launch (network not ready yet)
+    /// self-heals within a few seconds before the manual "Try again" affordance is shown.
+    private func attemptConnect() async {
         connecting = true
         errorMessage = nil
-        do {
-            try await authManager.ensureConnected()
-        } catch {
-            errorMessage = "Could not connect to Minutia. \(error.localizedDescription)"
+        let backoffs: [Double] = [0, 1, 2, 4]
+        for (index, delay) in backoffs.enumerated() {
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+            if authManager.supabase != nil { break }
+            do {
+                try await authManager.ensureConnected()
+                errorMessage = nil
+                break
+            } catch {
+                if index == backoffs.count - 1 {
+                    errorMessage = "Couldn't reach Minutia. Check your internet connection, then try again."
+                }
+            }
         }
         connecting = false
     }
