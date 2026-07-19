@@ -219,6 +219,14 @@ final class MinutiaClientBuilderTests: XCTestCase {
 
         XCTAssertEqual(url.absoluteString, "https://minutia.example.com/companion/authorize?device=studio")
     }
+
+    func test_companionAuthorizeURL_appendsStateWhenProvided() {
+        let url = MinutiaClient.companionAuthorizeURL(instance: instance, device: "studio", state: "nonce-7")
+
+        XCTAssertEqual(
+            url.absoluteString,
+            "https://minutia.example.com/companion/authorize?device=studio&state=nonce-7")
+    }
 }
 
 final class AgendaItemDecodingTests: XCTestCase {

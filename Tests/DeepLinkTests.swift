@@ -30,12 +30,17 @@ final class DeepLinkTests: XCTestCase {
 
     func test_authCallback_tokenHashStillParses() {
         let url = URL(string: "minutia://auth-callback?token_hash=abc123")!
-        XCTAssertEqual(DeepLink.parse(url), .authCallback(tokenHash: "abc123"))
+        XCTAssertEqual(DeepLink.parse(url), .authCallback(tokenHash: "abc123", state: nil))
     }
 
     func test_authCallback_withoutTokenHash_isPkceFlavor() {
         let url = URL(string: "minutia://auth-callback?code=xyz")!
-        XCTAssertEqual(DeepLink.parse(url), .authCallback(tokenHash: nil))
+        XCTAssertEqual(DeepLink.parse(url), .authCallback(tokenHash: nil, state: nil))
+    }
+
+    func test_authCallback_carriesStateWhenPresent() {
+        let url = URL(string: "minutia://auth-callback?token_hash=abc123&state=nonce-9")!
+        XCTAssertEqual(DeepLink.parse(url), .authCallback(tokenHash: "abc123", state: "nonce-9"))
     }
 
     func test_unknownHostAndScheme_areInvalid() {

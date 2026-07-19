@@ -105,6 +105,14 @@ struct MenuBarIcon: View {
     }
 }
 
+/// An outstanding request to record, triggered by the browser via `minutia://record`. Capture
+/// never starts from the deep link itself: this pending consent gates it behind an explicit user
+/// confirm (notification action or in-menu banner).
+struct PendingRecordConsent: Equatable {
+    let meetingId: String
+    let requestedAt: Date
+}
+
 /// Orchestrates the menu bar app: folds auth, detection, and capture signals through the
 /// AppPhase reducer, and owns the record/stop flows. Views stay logic-free; every state
 /// decision lives in `AppPhase.next` under tests.
@@ -117,6 +125,10 @@ final class AppController: NSObject, ObservableObject {
 
     @Published private(set) var phase: AppPhase = .signedOut
     @Published private(set) var series: [Series] = []
+    /// Set when the browser fires `minutia://record`: capture is held here until the user confirms,
+    /// so a web page can never start a covert recording. Surfaced as a notification and an in-menu
+    /// banner (the fallback when notifications are denied).
+    @Published private(set) var pendingRecordConsent: PendingRecordConsent?
     /// Soft detection: mic active with no corroborating app/calendar signal. Surfaced quietly
     /// (menu bar glyph + one secondary row), never a notification. See `shouldShowSoftHint`.
     @Published private(set) var softHint: Bool = false
@@ -132,6 +144,10 @@ final class AppController: NSObject, ObservableObject {
 
     static let lastSeriesKey = "app.minutia.lastSeries"
 
+    static let webRecordCategoryId = "app.minutia.webRecord"
+    static let confirmWebRecordActionId = "app.minutia.webRecord.confirm"
+    static let dismissWebRecordActionId = "app.minutia.webRecord.dismiss"
+
     /// Record can begin only from a resting or recoverable phase. Guards a stale detection
     /// notification clicked mid-recording from starting a second server meeting and
     /// overwriting the recording meeting id (which would open the wrong recap).
@@ -140,6 +156,14 @@ final class AppController: NSObject, ObservableObject {
         case .idle, .detected, .error: return true
         default: return false
         }
+    }
+
+    /// A web-triggered record consent is honored only within [0, ttl] of when it was requested.
+    /// The lower bound rejects clock skew; the upper bound expires a stale confirm the user left
+    /// sitting in a notification or the menu.
+    nonisolated static func isRecordConsentValid(requestedAt: Date, now: Date, ttl: TimeInterval = 120) -> Bool {
+        let elapsed = now.timeIntervalSince(requestedAt)
+        return elapsed >= 0 && elapsed <= ttl
     }
 
     /// What a `minutia://record?meeting_id=` command from the browser should do.
@@ -193,7 +217,7 @@ final class AppController: NSObject, ObservableObject {
 
     private override init() {
         super.init()
-        MeetingDetector.registerNotificationCategory()
+        Self.registerNotificationCategories()
         UNUserNotificationCenter.current().delegate = self
 
         authManager.$userEmail
@@ -220,6 +244,10 @@ final class AppController: NSObject, ObservableObject {
         let next = phase.next(event)
         guard next != phase else { return }
         phase = next
+        // A pending web-record consent is only actionable from a resting/recoverable phase.
+        // Drop it the moment we leave one (recording started by any path, finalizing, or sign-out)
+        // so a stale banner cannot linger past the meeting or a sign-out.
+        if !Self.canStartRecording(from: next) { pendingRecordConsent = nil }
         refreshSoftHint()
         syncDetector()
     }
@@ -351,8 +379,55 @@ final class AppController: NSObject, ObservableObject {
                 title: "Already recording another meeting",
                 body: "Stop the current recording before starting a new one.")
         case .start:
-            startRecording(meetingId: meetingId)
+            promptRecordConsent(meetingId: meetingId)
         }
+    }
+
+    /// Hold a web-triggered record behind an explicit confirm: capture must never start silently
+    /// from a deep link. Stores the pending consent, brings the app forward, and posts a two-action
+    /// notification. A duplicate request for the same meeting does not stack a second prompt.
+    func promptRecordConsent(meetingId: String) {
+        if let pending = pendingRecordConsent, pending.meetingId == meetingId { return }
+        pendingRecordConsent = PendingRecordConsent(meetingId: meetingId, requestedAt: Date())
+        NSApp.activate(ignoringOtherApps: true)
+        let content = UNMutableNotificationContent()
+        content.title = "Record this meeting from your browser?"
+        content.body = "Minutia will start recording only after you confirm."
+        content.categoryIdentifier = Self.webRecordCategoryId
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    /// Confirm a pending web-triggered record: start capture only if the consent is still valid and
+    /// the phase can start recording. Clears the pending consent either way so a stale confirm can
+    /// never start capture later.
+    func confirmPendingRecord() {
+        guard let pending = pendingRecordConsent else { return }
+        pendingRecordConsent = nil
+        guard Self.isRecordConsentValid(requestedAt: pending.requestedAt, now: Date()),
+              Self.canStartRecording(from: phase) else { return }
+        startRecording(meetingId: pending.meetingId)
+    }
+
+    func dismissPendingRecord() {
+        pendingRecordConsent = nil
+    }
+
+    /// Registers both notification categories (the detector's "Record this meeting?" and the
+    /// web-record consent prompt) in a single synchronous `setNotificationCategories` call, so
+    /// neither can clobber the other through a read-modify-write race.
+    private static func registerNotificationCategories() {
+        let confirm = UNNotificationAction(
+            identifier: confirmWebRecordActionId, title: "Start recording", options: [.foreground])
+        let dismiss = UNNotificationAction(
+            identifier: dismissWebRecordActionId, title: "Ignore", options: [])
+        let webRecord = UNNotificationCategory(
+            identifier: webRecordCategoryId, actions: [confirm, dismiss],
+            intentIdentifiers: [], options: [])
+        UNUserNotificationCenter.current().setNotificationCategories([
+            MeetingDetector.notificationCategory, webRecord,
+        ])
     }
 
     private static func postNotification(title: String, body: String) {
@@ -433,8 +508,15 @@ extension AppController: UNUserNotificationCenterDelegate {
     ) {
         let actionId = response.actionIdentifier
         Task { @MainActor in
-            if actionId == MeetingDetector.recordActionId {
+            switch actionId {
+            case MeetingDetector.recordActionId:
                 self.startRecording()
+            case Self.confirmWebRecordActionId:
+                self.confirmPendingRecord()
+            case Self.dismissWebRecordActionId:
+                self.dismissPendingRecord()
+            default:
+                break
             }
             completionHandler()
         }

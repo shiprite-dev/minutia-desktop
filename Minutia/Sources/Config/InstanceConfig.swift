@@ -40,6 +40,16 @@ enum InstanceConfig {
         return components.url
     }
 
+    /// Guards the discovered `supabaseUrl` against a hostile instance pointing auth and storage
+    /// at an attacker host. https is always allowed; plaintext http only when the instance itself
+    /// is loopback (local self-host dev). Any other scheme or a missing host is rejected.
+    static func isValidSupabaseURL(_ url: URL, instance: URL) -> Bool {
+        guard let host = url.host, !host.isEmpty else { return false }
+        if url.scheme == "https" { return true }
+        let instanceIsLoopback = instance.host == "localhost" || instance.host == "127.0.0.1"
+        return url.scheme == "http" && instanceIsLoopback
+    }
+
     static func metaRequest(instance: URL) -> URLRequest {
         var request = URLRequest(url: instance.appendingPathComponent("api/instance-meta"))
         request.httpMethod = "GET"
