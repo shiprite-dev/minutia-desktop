@@ -115,6 +115,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             andSelector: #selector(handleGetURLEvent(_:withReplyEvent:)),
             forEventClass: AEEventClass(kInternetEventClass),
             andEventID: AEEventID(kAEGetURL))
+
+        // Restore the Keychain session at launch so meeting detection starts without the menu ever
+        // being opened; MenuBarExtra builds its content (and its .task) lazily on first open, so
+        // relying on that alone leaves a freshly launched app unconnected until the user clicks it.
+        // AuthManager.ensureConnected is single-flight and idempotent, so this racing MenuContent's
+        // own restoreSession() is safe.
+        Task { @MainActor in await AppController.shared.restoreSession() }
     }
 
     @objc func handleGetURLEvent(_ event: NSAppleEventDescriptor, withReplyEvent: NSAppleEventDescriptor) {

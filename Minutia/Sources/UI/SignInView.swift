@@ -170,6 +170,7 @@ struct SignInView: View {
         connecting = true
         errorMessage = nil
         retryable = true
+        let host = InstanceConfig.resolvedInstance.host
         let backoffs: [Double] = [0, 1, 2, 4]
         for (index, delay) in backoffs.enumerated() {
             if Task.isCancelled { return }
@@ -186,12 +187,12 @@ struct SignInView: View {
                 // A deterministic verdict (untrusted, not a Minutia instance) cannot change on
                 // retry: stop the backoff loop immediately and drop the retry affordance.
                 if !AuthManager.isRetryableConnectFailure(error) {
-                    errorMessage = AuthManager.connectFailureMessage(for: error)
+                    errorMessage = AuthManager.connectFailureMessage(for: error, host: host)
                     retryable = false
                     break
                 }
                 if index == backoffs.count - 1 {
-                    errorMessage = AuthManager.connectFailureMessage(for: error)
+                    errorMessage = AuthManager.connectFailureMessage(for: error, host: host)
                 }
             }
         }

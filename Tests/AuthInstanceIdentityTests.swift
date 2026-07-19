@@ -75,30 +75,39 @@ final class AuthInstanceIdentityTests: XCTestCase {
 
     // MARK: - A4: differentiated connect-failure copy
 
-    func test_connectFailureMessage_notAMinutiaInstance() {
+    func test_connectFailureMessage_notAMinutiaInstance_namesHost() {
         XCTAssertEqual(
-            AuthManager.connectFailureMessage(for: AuthManager.AuthError.notAMinutiaInstance),
-            "This URL doesn't look like a Minutia instance. Check the address.")
+            AuthManager.connectFailureMessage(
+                for: AuthManager.AuthError.notAMinutiaInstance, host: "localhost:3000"),
+            "localhost:3000 doesn't look like a Minutia instance. Check the address.")
+    }
+
+    func test_connectFailureMessage_notAMinutiaInstance_nilHostFallsBack() {
+        XCTAssertEqual(
+            AuthManager.connectFailureMessage(for: AuthManager.AuthError.notAMinutiaInstance, host: nil),
+            "the server doesn't look like a Minutia instance. Check the address.")
     }
 
     func test_connectFailureMessage_untrustedInstance() {
-        let message = AuthManager.connectFailureMessage(for: AuthManager.AuthError.untrustedInstance)
+        // The trust copy names no host and stays exactly as is regardless of the host passed.
+        let message = AuthManager.connectFailureMessage(
+            for: AuthManager.AuthError.untrustedInstance, host: "minutia.acme.com")
         XCTAssertEqual(message, "This server's configuration isn't trusted. Contact your administrator.")
         // Must never blame the network for a trust failure: retrying/checking internet would loop.
         XCTAssertFalse(message.lowercased().contains("internet"))
         XCTAssertFalse(message.lowercased().contains("try again"))
     }
 
-    func test_connectFailureMessage_urlErrorSuggestsNetwork() {
+    func test_connectFailureMessage_urlError_namesHost() {
         XCTAssertEqual(
-            AuthManager.connectFailureMessage(for: URLError(.notConnectedToInternet)),
-            "Couldn't reach the server. Check your internet connection and try again.")
+            AuthManager.connectFailureMessage(for: URLError(.notConnectedToInternet), host: "app.getminutia.com"),
+            "Couldn't reach app.getminutia.com. Check your internet connection and try again.")
     }
 
-    func test_connectFailureMessage_unknownErrorFallsBackToNetwork() {
+    func test_connectFailureMessage_unknownError_nilHostFallsBack() {
         let other = NSError(domain: "x", code: 1)
         XCTAssertEqual(
-            AuthManager.connectFailureMessage(for: other),
+            AuthManager.connectFailureMessage(for: other, host: nil),
             "Couldn't reach the server. Check your internet connection and try again.")
     }
 

@@ -95,14 +95,17 @@ final class AuthManager: ObservableObject {
 
     /// User-facing copy for a failed connect, differentiated by cause. A trust failure must not
     /// suggest retrying or checking the internet (it would loop); only a transport failure does.
-    nonisolated static func connectFailureMessage(for error: Error) -> String {
+    /// Naming the host keeps a dev-instance failure from reading as a cloud outage; `nil` falls
+    /// back to "the server".
+    nonisolated static func connectFailureMessage(for error: Error, host: String?) -> String {
+        let hostOrFallback = host ?? "the server"
         switch error {
         case AuthError.notAMinutiaInstance:
-            return "This URL doesn't look like a Minutia instance. Check the address."
+            return "\(hostOrFallback) doesn't look like a Minutia instance. Check the address."
         case AuthError.untrustedInstance:
             return "This server's configuration isn't trusted. Contact your administrator."
         default:
-            return "Couldn't reach the server. Check your internet connection and try again."
+            return "Couldn't reach \(hostOrFallback). Check your internet connection and try again."
         }
     }
 

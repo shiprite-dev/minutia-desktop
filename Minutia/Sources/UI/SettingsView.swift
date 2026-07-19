@@ -179,7 +179,7 @@ struct SettingsView: View {
                 try await authManager.connect(instance: url)
                 statusMessage = "Connected to \(url.host ?? url.absoluteString)."
             } catch {
-                statusMessage = AuthManager.connectFailureMessage(for: error)
+                statusMessage = AuthManager.connectFailureMessage(for: error, host: url.host)
             }
             busy = false
         }
