@@ -24,7 +24,7 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section("Instance") {
-                TextField("https://minutia.example.com", text: $instanceText)
+                TextField(InstanceConfig.defaultInstance.absoluteString, text: $instanceText)
                     .textContentType(.URL)
                 HStack(spacing: 6) {
                     Circle()

@@ -63,7 +63,7 @@ Then: `git tag v0.2.0 && git push origin v0.2.0`.
 
 ## Configuration
 
-Minutia Desktop connects to the managed Minutia Cloud instance by default, so there is nothing to configure: launch it and sign in. Self-hosters point it at their own instance in Settings, paste the URL (for example `https://minutia.example.com`), hit Reconnect, and a status line confirms the connection. Launch-at-login, sign out, and the app version (0.1.0) live in the same Settings window.
+Minutia Desktop connects to the managed Minutia Cloud instance by default, so there is nothing to configure: launch it and sign in. Self-hosters point it at their own instance in Settings: paste the instance URL, hit Reconnect, and a status line confirms the connection. Launch-at-login, sign out, and the app version (0.1.0) live in the same Settings window.
 
 ## Privacy
 
