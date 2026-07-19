@@ -106,11 +106,10 @@ struct SignInView: View {
     }
 
     private func signInWithBrowser() {
-        guard let instance = authManager.instance else { return }
         errorMessage = nil
         authManager.callbackError = nil
         let device = Host.current().localizedName ?? "Mac"
-        NSWorkspace.shared.open(MinutiaClient.companionAuthorizeURL(instance: instance, device: device))
+        NSWorkspace.shared.open(authManager.beginBrowserSignIn(device: device))
     }
 
     private func signIn() {

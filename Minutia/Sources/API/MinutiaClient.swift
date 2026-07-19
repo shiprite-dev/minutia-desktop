@@ -119,12 +119,15 @@ struct MinutiaClient {
 
     /// Browser sign-in entry point: the instance mints a companion magic link that redirects back
     /// to `minutia://auth-callback`. `device` labels the session in the web UI (percent-encoded by
-    /// URLComponents).
-    static func companionAuthorizeURL(instance: URL, device: String) -> URL {
+    /// URLComponents). `state` carries the locally-generated nonce that binds the callback to this
+    /// sign-in attempt; appended only when present so the server can echo it back.
+    static func companionAuthorizeURL(instance: URL, device: String, state: String? = nil) -> URL {
         var components = URLComponents(
             url: instance.appendingPathComponent("companion/authorize"),
             resolvingAgainstBaseURL: false)!
-        components.queryItems = [URLQueryItem(name: "device", value: device)]
+        var items = [URLQueryItem(name: "device", value: device)]
+        if let state { items.append(URLQueryItem(name: "state", value: state)) }
+        components.queryItems = items
         return components.url!
     }
 

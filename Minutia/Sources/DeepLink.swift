@@ -6,7 +6,9 @@ import Foundation
 enum DeepLink: Equatable {
     /// `minutia://auth-callback?token_hash=...` (browser magic link) or the Google PKCE
     /// callback (host `auth-callback`, carrying `code` instead). `tokenHash` is nil for PKCE.
-    case authCallback(tokenHash: String?)
+    /// `state` is the nonce echoed back to bind the callback to a locally-initiated sign-in;
+    /// nil when the server does not echo it.
+    case authCallback(tokenHash: String?, state: String?)
     /// `minutia://record?meeting_id=<uuid>`. The id is uuid-validated and lowercased.
     case record(meetingId: String)
     case invalid
@@ -22,7 +24,7 @@ enum DeepLink: Equatable {
 
         switch url.host {
         case "auth-callback":
-            return .authCallback(tokenHash: query("token_hash"))
+            return .authCallback(tokenHash: query("token_hash"), state: query("state"))
         case "record":
             guard let raw = query("meeting_id"), let uuid = UUID(uuidString: raw) else {
                 return .invalid

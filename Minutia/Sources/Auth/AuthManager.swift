@@ -20,8 +20,61 @@ final class AuthManager: ObservableObject {
     private var connectTask: Task<Void, Error>?
 
     static let redirectURL = URL(string: "minutia://auth-callback")!
+    private static let pendingAuthKey = "app.minutia.pendingAuth"
 
     private static let logger = Logger(subsystem: "app.minutia.desktop", category: "AuthManager")
+
+    /// Marks a locally-initiated sign-in so an inbound auth callback can be bound to it. Persisted
+    /// in UserDefaults because the magic link round-trips through email and the app may be cold
+    /// launched by the callback, so the marker must survive relaunch.
+    struct PendingAuth: Codable, Equatable {
+        let nonce: String
+        let startedAt: Date
+    }
+
+    /// Whether an inbound `minutia://auth-callback` should be honored. Pure so the gate matrix
+    /// (already signed in, no pending flow, expired, state mismatch, valid) is tested in isolation.
+    enum AuthCallbackDecision: Equatable {
+        case accept
+        case rejectAlreadySignedIn
+        case rejectNoPendingFlow
+        case rejectStateMismatch
+    }
+
+    /// A signed-in app must never process a new sign-in token (session fixation). An unsolicited
+    /// or expired callback (no pending flow) is rejected. When the server echoes `state`, it must
+    /// match the pending nonce; a nil state with a valid pending flow still accepts, because the
+    /// pending-flow plus not-already-signed-in gates are the client-side protection and the state
+    /// match only tightens it once the server echoes it.
+    nonisolated static func authCallbackDecision(
+        alreadySignedIn: Bool,
+        pending: PendingAuth?,
+        callbackState: String?,
+        now: Date,
+        ttl: TimeInterval = 900
+    ) -> AuthCallbackDecision {
+        if alreadySignedIn { return .rejectAlreadySignedIn }
+        guard let pending else { return .rejectNoPendingFlow }
+        let elapsed = now.timeIntervalSince(pending.startedAt)
+        guard elapsed >= 0, elapsed <= ttl else { return .rejectNoPendingFlow }
+        if let callbackState, callbackState != pending.nonce { return .rejectStateMismatch }
+        return .accept
+    }
+
+    private var pendingAuth: PendingAuth? {
+        get {
+            guard let data = UserDefaults.standard.data(forKey: Self.pendingAuthKey),
+                  let decoded = try? JSONDecoder().decode(PendingAuth.self, from: data) else { return nil }
+            return decoded
+        }
+        set {
+            guard let value = newValue, let data = try? JSONEncoder().encode(value) else {
+                UserDefaults.standard.removeObject(forKey: Self.pendingAuthKey)
+                return
+            }
+            UserDefaults.standard.set(data, forKey: Self.pendingAuthKey)
+        }
+    }
 
     /// Extracts the magic-link token hash from a `minutia://auth-callback?token_hash=...` URL.
     /// Returns nil for any other URL (notably the Google PKCE callback, which carries `code`).
@@ -29,6 +82,24 @@ final class AuthManager: ObservableObject {
         guard url.scheme == "minutia", url.host == "auth-callback",
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
         return components.queryItems?.first(where: { $0.name == "token_hash" })?.value
+    }
+
+    /// Extracts the `state` nonce echoed back on a `minutia://auth-callback` URL, mirroring
+    /// `tokenHash(from:)`. Returns nil for any other URL or when the server did not echo it.
+    static func state(from url: URL) -> String? {
+        guard url.scheme == "minutia", url.host == "auth-callback",
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+        return components.queryItems?.first(where: { $0.name == "state" })?.value
+    }
+
+    /// Begin a browser magic-link sign-in: persist a fresh pending marker (nonce + timestamp) and
+    /// return the authorize URL carrying that nonce as `state`, so the resulting callback can be
+    /// bound to this attempt.
+    func beginBrowserSignIn(device: String) -> URL {
+        let nonce = UUID().uuidString
+        pendingAuth = PendingAuth(nonce: nonce, startedAt: Date())
+        let instance = self.instance ?? InstanceConfig.resolvedInstance
+        return MinutiaClient.companionAuthorizeURL(instance: instance, device: device, state: nonce)
     }
 
     /// Auto-connect for first run and relaunch: use the stored (self-host) instance when
@@ -50,6 +121,10 @@ final class AuthManager: ObservableObject {
         do {
             let (data, _) = try await URLSession.shared.data(for: InstanceConfig.metaRequest(instance: instance))
             let meta = try JSONDecoder().decode(InstanceMeta.self, from: data)
+
+            guard InstanceConfig.isValidSupabaseURL(meta.supabaseUrl, instance: instance) else {
+                throw AuthError.untrustedInstance
+            }
 
             let client = SupabaseClient(supabaseURL: meta.supabaseUrl, supabaseKey: meta.supabaseAnonKey)
             self.supabase = client
@@ -84,8 +159,10 @@ final class AuthManager: ObservableObject {
 
     func signInWithGoogle() async throws {
         guard let supabase else { throw AuthError.notConnected }
+        pendingAuth = PendingAuth(nonce: UUID().uuidString, startedAt: Date())
         let session = try await supabase.auth.signInWithOAuth(provider: .google, redirectTo: Self.redirectURL)
         userEmail = session.user.email
+        pendingAuth = nil
         fireHeartbeat()
     }
 
@@ -94,6 +171,21 @@ final class AuthManager: ObservableObject {
     /// else is treated as the Google PKCE callback and closed via session(from:).
     func handleCallback(_ url: URL) async {
         guard let supabase else { return }
+
+        // Bind the callback to a locally-initiated sign-in before touching any token: an attacker
+        // can feed a victim a token_hash for the attacker's account, so an unsolicited callback,
+        // one that arrives while already signed in, or one whose echoed state does not match must
+        // never reach verifyOTP/session(from:).
+        let decision = Self.authCallbackDecision(
+            alreadySignedIn: userEmail != nil,
+            pending: pendingAuth,
+            callbackState: Self.state(from: url),
+            now: Date())
+        guard decision == .accept else {
+            Self.logger.error("Rejected auth callback: \(String(describing: decision), privacy: .public)")
+            return
+        }
+
         if let hash = Self.tokenHash(from: url) {
             // The URL can arrive through both onOpenURL and the kAEGetURL Apple event;
             // a token hash is single-use, so the second delivery must not report an error.
@@ -103,6 +195,7 @@ final class AuthManager: ObservableObject {
                 let session = try await supabase.auth.verifyOTP(tokenHash: hash, type: .magiclink)
                 userEmail = session.user.email
                 callbackError = nil
+                pendingAuth = nil
                 fireHeartbeat()
             } catch {
                 Self.logger.error("Browser sign-in failed: \(error.localizedDescription, privacy: .public)")
@@ -113,6 +206,7 @@ final class AuthManager: ObservableObject {
         do {
             let session = try await supabase.auth.session(from: url)
             userEmail = session.user.email
+            pendingAuth = nil
             fireHeartbeat()
         } catch {
             Self.logger.error("OAuth callback failed: \(error.localizedDescription, privacy: .public)")
@@ -149,5 +243,6 @@ final class AuthManager: ObservableObject {
 
     enum AuthError: Error {
         case notConnected
+        case untrustedInstance
     }
 }

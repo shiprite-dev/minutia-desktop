@@ -16,18 +16,14 @@ final class MeetingDetector: ObservableObject {
     static let notificationCategoryId = "app.minutia.meetingDetected"
     static let recordActionId = "app.minutia.record"
 
-    private static var categoryRegistered = false
-
-    /// Registers the "Record this meeting?" notification category and its Record action. Safe to
-    /// call more than once (e.g. every app launch); only the first call does any work.
-    static func registerNotificationCategory() {
-        guard !categoryRegistered else { return }
-        categoryRegistered = true
+    /// The "Record this meeting?" notification category and its Record action. Exposed so the app
+    /// can register it together with the web-record consent category in a single
+    /// `setNotificationCategories` call, avoiding a read-modify-write race between two registrations.
+    static var notificationCategory: UNNotificationCategory {
         let record = UNNotificationAction(
             identifier: recordActionId, title: "Record", options: [.foreground])
-        let category = UNNotificationCategory(
+        return UNNotificationCategory(
             identifier: notificationCategoryId, actions: [record], intentIdentifiers: [], options: [])
-        UNUserNotificationCenter.current().setNotificationCategories([category])
     }
 
     private let controlQueue = DispatchQueue(label: "app.minutia.detector.control")

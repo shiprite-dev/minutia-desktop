@@ -7,6 +7,14 @@ struct MenuContent: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            // Above the phase switch so the consent affordance is reachable in every phase a
+            // web-record can be pending (idle, detected, error), not only the idle layout. This
+            // is the guaranteed fallback when notification permission is denied.
+            if controller.pendingRecordConsent != nil {
+                WebRecordConsentBanner(controller: controller)
+                    .padding(12)
+            }
+
             Group {
                 switch controller.phase {
                 case .signedOut:
@@ -85,6 +93,42 @@ private struct SoftHintRow: View {
         }
         .font(.callout)
         .foregroundStyle(.secondary)
+    }
+}
+
+/// Consent gate for a browser-triggered `minutia://record`. The guaranteed fallback when
+/// notifications are denied, so it must be reachable from the menu: capture starts only when the
+/// user taps Start recording here (or in the notification).
+private struct WebRecordConsentBanner: View {
+    @ObservedObject var controller: AppController
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "record.circle")
+                    .foregroundStyle(.tint)
+                Text("Record this meeting from your browser?")
+                    .font(.callout)
+                    .fontWeight(.medium)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 8) {
+                Button {
+                    controller.confirmPendingRecord()
+                } label: {
+                    Text("Start recording")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                Button("Ignore") {
+                    controller.dismissPendingRecord()
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(10)
+        .background(.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
     }
 }
 
