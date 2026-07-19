@@ -84,18 +84,44 @@ final class ControllerGuardsTests: XCTestCase {
         }
     }
 
-    // MARK: - Quit-while-recording guard
+    // MARK: - Quit-while-recording/recovering guard (C7)
 
     func test_shouldConfirmQuit_trueWhileCapturing() {
-        XCTAssertTrue(AppController.shouldConfirmQuit(phase: .recording))
-        XCTAssertTrue(AppController.shouldConfirmQuit(phase: .finalizing))
+        XCTAssertTrue(AppController.shouldConfirmQuit(phase: .recording, recoveryActive: false))
+        XCTAssertTrue(AppController.shouldConfirmQuit(phase: .finalizing, recoveryActive: false))
     }
 
-    func test_shouldConfirmQuit_falseOtherwise() {
+    func test_shouldConfirmQuit_falseWhenRestingAndNoRecovery() {
         let restingPhases: [AppPhase] = [.signedOut, .idle, .detected(app: "Zoom"), .detected(app: nil), .error("boom")]
         for phase in restingPhases {
-            XCTAssertFalse(AppController.shouldConfirmQuit(phase: phase), "must not confirm quit from \(phase)")
+            XCTAssertFalse(
+                AppController.shouldConfirmQuit(phase: phase, recoveryActive: false),
+                "must not confirm quit from \(phase)")
         }
+    }
+
+    /// An in-flight startup recovery sweep must block a quit even from a resting phase, so the
+    /// rescue of a prior recording is not abandoned on the way out.
+    func test_shouldConfirmQuit_trueWheneverRecoveryActive() {
+        let phases: [AppPhase] = [.signedOut, .idle, .detected(app: "Zoom"), .detected(app: nil), .recording, .finalizing, .error("boom")]
+        for phase in phases {
+            XCTAssertTrue(
+                AppController.shouldConfirmQuit(phase: phase, recoveryActive: true),
+                "recovery in flight must confirm quit from \(phase)")
+        }
+    }
+
+    // MARK: - Mic-permission error classification (C6)
+
+    func test_isMicPermissionError_matchesTheCaptureConstant() {
+        let message = CaptureSession.failureMessage(for: MicCapture.CaptureError.permissionDenied)
+        XCTAssertTrue(AppController.isMicPermissionError(message: message))
+    }
+
+    func test_isMicPermissionError_falseForOtherMessages() {
+        XCTAssertFalse(AppController.isMicPermissionError(message: "Recording stopped: audio capture stalled."))
+        XCTAssertFalse(AppController.isMicPermissionError(message: "Could not start recording: network error"))
+        XCTAssertFalse(AppController.isMicPermissionError(message: ""))
     }
 
     // MARK: - Soft-detection hint

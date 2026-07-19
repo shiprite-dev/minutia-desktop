@@ -14,6 +14,7 @@ struct SettingsView: View {
     @State private var statusMessage: String?
     @State private var launchAtLogin = SettingsView.loginItemState(SMAppService.mainApp.status) != .disabled
     @State private var loginRequiresApproval = SettingsView.loginItemState(SMAppService.mainApp.status) == .requiresApproval
+    @State private var loginItemError: String?
 
     init(controller: AppController, updater: UpdaterController) {
         _controller = ObservedObject(wrappedValue: controller)
@@ -78,6 +79,12 @@ struct SettingsView: View {
                          destination: URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension")!)
                         .font(.callout)
                 }
+                if let loginItemError {
+                    Text(loginItemError)
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if controller.notificationsDenied {
                     Link("Enable notifications for meeting prompts",
                          destination: URL(string: "x-apple.systempreferences:com.apple.preference.notifications")!)
@@ -87,6 +94,9 @@ struct SettingsView: View {
 
             Section("About") {
                 LabeledContent("Version", value: Self.versionString)
+                if updater.updateAvailable {
+                    Button("Update available — install now") { updater.checkForUpdates() }
+                }
                 Button("Check for Updates…") { updater.checkForUpdates() }
                     .disabled(!updater.canCheckForUpdates)
             }
@@ -100,6 +110,13 @@ struct SettingsView: View {
             controller.refreshPermissionState()
         }
         .onDisappear { NSApp.setActivationPolicy(.accessory) }
+        // Login-item and permission state can change out from under an open Settings window (the user
+        // toggles the item or grants a permission in System Settings, then returns). Re-read both when
+        // the window regains key, so the toggle and nudges reflect reality instead of a stale snapshot.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            refreshLoginItemState()
+            controller.refreshPermissionState()
+        }
         .task {
             if instanceText.isEmpty {
                 instanceText = authManager.instance?.absoluteString
@@ -168,6 +185,12 @@ struct SettingsView: View {
         }
     }
 
+    /// Inline copy for a failed login-item registration change, so the toggle snapping back is
+    /// explained instead of silent.
+    nonisolated static func loginItemErrorMessage(for error: Error) -> String {
+        "Couldn't update Login Item: \(error.localizedDescription)"
+    }
+
     private func setLaunchAtLogin(_ enabled: Bool) {
         do {
             if enabled {
@@ -175,8 +198,11 @@ struct SettingsView: View {
             } else {
                 try SMAppService.mainApp.unregister()
             }
+            loginItemError = nil
         } catch {
-            // Registration failed (e.g. sandbox/test rig): fall through to reflect reality.
+            // Surface the failure inline: without it the toggle silently snaps back to the real
+            // service state (via refreshLoginItemState) with no explanation.
+            loginItemError = Self.loginItemErrorMessage(for: error)
         }
         refreshLoginItemState()
     }

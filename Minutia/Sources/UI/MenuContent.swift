@@ -1,9 +1,18 @@
 import SwiftUI
 
+/// Opens the Microphone privacy pane in System Settings. Shared by the idle mic banner and the
+/// mic-denial ErrorView affordance so both use the identical deep link.
+private func openMicrophoneSettings() {
+    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+        NSWorkspace.shared.open(url)
+    }
+}
+
 /// The menu bar panel: one screen per AppPhase, plus a persistent Settings/Quit footer.
 /// Purely declarative; every decision is the controller's (and the reducer's).
 struct MenuContent: View {
     @ObservedObject var controller: AppController
+    @ObservedObject var updater: UpdaterController
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -44,7 +53,7 @@ struct MenuContent: View {
             .frame(maxWidth: .infinity, alignment: .leading)
 
             Divider()
-            Footer()
+            Footer(updater: updater)
         }
         .frame(width: 320)
     }
@@ -65,6 +74,10 @@ private struct IdleView: View {
                 DetectionBanner(via: detectedVia, controller: controller)
             } else if controller.softHint {
                 SoftHintRow()
+            }
+
+            if controller.recoveryActive {
+                RecoveryRow()
             }
 
             if controller.series.isEmpty {
@@ -124,13 +137,9 @@ private struct MicPermissionBanner: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Button("Open System Settings") {
-                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
-                    NSWorkspace.shared.open(url)
-                }
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
+            Button("Open System Settings", action: openMicrophoneSettings)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(10)
@@ -164,6 +173,21 @@ private struct SoftHintRow: View {
         HStack(spacing: 8) {
             Image(systemName: "mic")
             Text("In a meeting? Record picks it up from here.")
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .font(.callout)
+        .foregroundStyle(.secondary)
+    }
+}
+
+/// Quiet secondary row shown while the startup recovery sweep finalizes a prior recording's
+/// orphaned upload, so the work is visible instead of happening silently in the background.
+private struct RecoveryRow: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Finishing a previous recording upload…")
                 .fixedSize(horizontal: false, vertical: true)
         }
         .font(.callout)
@@ -260,6 +284,11 @@ private struct ErrorView: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.yellow)
             }
+            if AppController.isMicPermissionError(message: message) {
+                Button("Open System Settings", action: openMicrophoneSettings)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
             HStack {
                 Button("Retry") { controller.retry() }
                     .keyboardShortcut(.defaultAction)
@@ -272,6 +301,7 @@ private struct ErrorView: View {
 }
 
 private struct Footer: View {
+    @ObservedObject var updater: UpdaterController
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
@@ -285,6 +315,19 @@ private struct Footer: View {
             .buttonStyle(.borderless)
             .accessibilityLabel("Settings")
             Spacer()
+            // A scheduled update found in the background can't rely on Sparkle's own alert in an
+            // LSUIElement app (it opens behind other windows); this subtle affordance surfaces it and
+            // hands control back to Sparkle's standard UI when tapped.
+            if updater.updateAvailable {
+                Button {
+                    updater.checkForUpdates()
+                } label: {
+                    Label("Update available", systemImage: "sparkles")
+                        .font(.callout)
+                }
+                .buttonStyle(.borderless)
+                Spacer()
+            }
             Button("Quit") { NSApp.terminate(nil) }
                 .buttonStyle(.borderless)
                 .keyboardShortcut("q")
