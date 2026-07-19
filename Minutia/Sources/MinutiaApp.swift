@@ -400,10 +400,18 @@ final class AppController: NSObject, ObservableObject {
             runRecovery()
         } else {
             if Self.shouldStopCaptureOnSignOut(phase: phase) {
-                Task { _ = try? await captureSession.stop() }
+                // Keep the recording ids set until the finalize completes: a fast re-sign-in would
+                // otherwise let runRecovery see no active meeting and touch the still-finalizing
+                // capture dir concurrently with this stop. Clear them only once stop() returns.
+                Task {
+                    _ = try? await captureSession.stop()
+                    recordingMeetingId = nil
+                    recordingSeriesId = nil
+                }
+            } else {
+                recordingMeetingId = nil
+                recordingSeriesId = nil
             }
-            recordingMeetingId = nil
-            recordingSeriesId = nil
             lastFailedStart = nil
             pendingRecordConsent = nil
             apply(.signedOut)
