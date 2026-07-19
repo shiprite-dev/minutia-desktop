@@ -155,8 +155,11 @@ jobs:
           xcrun stapler staple "$APP"
           rm -f "$RUNNER_TEMP/asc.p8"
 
-      - name: Package DMG
+      - name: Package, notarize, and staple DMG
         env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
           SHORT_VERSION: ${{ steps.version.outputs.short }}
         run: |
           set -euo pipefail
@@ -172,7 +175,13 @@ jobs:
             --app-drop-link 450 190 \
             "$DMG" "$STAGE" || true
           test -f "$DMG"
-          xcrun stapler staple "$DMG" || true
+          # The DMG is the artifact users download, so it must be notarized and stapled itself
+          # (notarizing only the app zip leaves the DMG unstapled and Gatekeeper rejects it).
+          echo "$ASC_KEY_P8" | base64 --decode > "$RUNNER_TEMP/asc.p8"
+          xcrun notarytool submit "$DMG" --wait \
+            --key "$RUNNER_TEMP/asc.p8" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID"
+          xcrun stapler staple "$DMG"
+          rm -f "$RUNNER_TEMP/asc.p8"
 
       - name: Verify signature and notarization
         env:
@@ -215,11 +224,18 @@ jobs:
           </rss>
           EOF
 
-      - name: Upload DMG and appcast to release
+      - name: Publish release with DMG and appcast
         env:
           GH_TOKEN: ${{ github.token }}
           SHORT_VERSION: ${{ steps.version.outputs.short }}
         run: |
           set -euo pipefail
           DMG="build/Minutia-${SHORT_VERSION}.dmg"
-          gh release upload "${GITHUB_REF_NAME}" "$DMG" build/appcast.xml --clobber
+          # A tag push does not create a Release, so `gh release upload` alone has nothing to
+          # target. Create it (published, non-draft, non-prerelease so releases/latest resolves)
+          # with the assets attached; fall back to clobber-upload if a re-run finds it already made.
+          gh release create "${GITHUB_REF_NAME}" "$DMG" build/appcast.xml \
+            --title "${SHORT_VERSION}" \
+            --notes "Automated release ${GITHUB_REF_NAME}. See CHANGELOG.md." \
+            --verify-tag --latest \
+          || gh release upload "${GITHUB_REF_NAME}" "$DMG" build/appcast.xml --clobber
