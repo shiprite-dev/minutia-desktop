@@ -13,10 +13,13 @@ struct MinutiaApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            MenuContent(controller: controller)
+            MenuContent(controller: controller, updater: updater)
                 .task { await controller.restoreSession() }
         } label: {
-            MenuBarIcon(phase: controller.phase, softHint: controller.softHint)
+            MenuBarIcon(
+                phase: controller.phase,
+                softHint: controller.softHint,
+                pendingConsent: controller.pendingRecordConsent != nil)
         }
         .menuBarExtraStyle(.window)
 
@@ -30,12 +33,20 @@ struct MinutiaApp: App {
 /// AppController) so the updater is created only when the real app scene runs, never during the
 /// headless unit-test host, which has no bundle feed to check. `canCheckForUpdates` mirrors the
 /// updater's KVO state so the menu control can disable itself while a check is already running.
+///
+/// This is also Sparkle's `SPUStandardUserDriverDelegate` so scheduled update reminders are gentle:
+/// in an LSUIElement app the standard scheduled-update alert opens behind other windows and is
+/// effectively invisible, so a background-found update instead sets `updateAvailable`, which the menu
+/// footer and Settings surface. Acting on it calls `checkForUpdates()` to hand the update back to
+/// Sparkle's standard UI in focus.
 @MainActor
-final class UpdaterController: ObservableObject {
-    private let controller: SPUStandardUpdaterController
+final class UpdaterController: NSObject, ObservableObject {
+    private var controller: SPUStandardUpdaterController!
     @Published private(set) var canCheckForUpdates = false
+    @Published private(set) var updateAvailable = false
 
-    init() {
+    override init() {
+        super.init()
         // Start the updater only for the real app with a real Sparkle key. Under XCTest the app is
         // the test host, so its scene (and this holder) is constructed inside the runner; a started
         // updater with the placeholder SUPublicEDKey throws and pops a modal error alert that hangs
@@ -45,12 +56,43 @@ final class UpdaterController: ObservableObject {
         let hasRealKey = key?.isEmpty == false && key != "REPLACE_WITH_SPARKLE_PUBLIC_ED_KEY"
         let underTest = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
         controller = SPUStandardUpdaterController(
-            startingUpdater: hasRealKey && !underTest, updaterDelegate: nil, userDriverDelegate: nil)
+            startingUpdater: hasRealKey && !underTest, updaterDelegate: nil, userDriverDelegate: self)
         controller.updater.publisher(for: \.canCheckForUpdates).assign(to: &$canCheckForUpdates)
     }
 
     func checkForUpdates() {
         controller.checkForUpdates(nil)
+    }
+}
+
+extension UpdaterController: SPUStandardUserDriverDelegate {
+    nonisolated var supportsGentleScheduledUpdateReminders: Bool { true }
+
+    /// No side effects here (Sparkle calls this purely to decide who presents). Let the standard
+    /// driver present only when it already has immediate focus; a background scheduled reminder is
+    /// surfaced through `updateAvailable` instead so it is never buried behind other windows.
+    nonisolated func standardUserDriverShouldHandleShowingScheduledUpdate(
+        _ update: SUAppcastItem, andInImmediateFocus immediateFocus: Bool
+    ) -> Bool {
+        immediateFocus
+    }
+
+    /// Raise the in-app badge for any update the user did not initiate, whether or not the standard
+    /// driver also shows its window; the badge is the reliable signal in a menu-bar app.
+    nonisolated func standardUserDriverWillHandleShowingUpdate(
+        _ handleShowingUpdate: Bool, forUpdate update: SUAppcastItem, state: SPUUserUpdateState
+    ) {
+        MainActor.assumeIsolated {
+            if !state.userInitiated { self.updateAvailable = true }
+        }
+    }
+
+    nonisolated func standardUserDriverDidReceiveUserAttention(forUpdate update: SUAppcastItem) {
+        MainActor.assumeIsolated { self.updateAvailable = false }
+    }
+
+    nonisolated func standardUserDriverWillFinishUpdateSession() {
+        MainActor.assumeIsolated { self.updateAvailable = false }
     }
 }
 
@@ -87,18 +129,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Guard against quitting mid-recording. When capturing, prompt to finish the upload first;
-    /// "Finish & Quit" defers termination until stop+finalize completes. Even if the user quits
-    /// anyway (or finalize fails), the durable capture directory means next-launch recovery finishes
-    /// the job, so no path loses the recording.
+    /// Guard against quitting with unfinished durable work: a live/finalizing recording, or a startup
+    /// recovery sweep still rescuing a prior recording. "Finish & Quit" defers termination until the
+    /// stop+finalize (and any in-flight recovery) completes. Even if the user quits anyway (or
+    /// finalize fails), the durable capture directory means next-launch recovery finishes the job, so
+    /// no path loses the recording.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard AppController.shouldConfirmQuit(phase: AppController.shared.phase) else {
+        guard AppController.shouldConfirmQuit(
+            phase: AppController.shared.phase,
+            recoveryActive: AppController.shared.recoveryActive) else {
             return .terminateNow
         }
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "Recording in progress"
-        alert.informativeText = "Minutia is still finishing the upload for this recording. Finish and quit, or keep recording?"
+        alert.messageText = "Finishing upload"
+        alert.informativeText = "Minutia is still finishing a recording upload. Finish and quit, or keep it running?"
         alert.addButton(withTitle: "Finish & Quit")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else {
@@ -112,48 +157,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-/// Status item glyph per phase: waveform idle, exclamation on error, and a recording glyph
-/// that blinks between filled and hollow on a 1s timer while recording. Status items ignore
-/// `withAnimation`, so a real timer drives the affordance; it is invalidated the moment the
-/// icon leaves the recording phase, and stays a static filled glyph under Reduce Motion.
-/// Soft detection swaps the idle waveform for a static mic-badged waveform (no animation,
-/// no notification), reverting to the plain waveform the instant the hint clears.
+/// Status item glyph per phase: distinct attention glyphs for the states that otherwise render the
+/// same plain waveform as idle (detected, a pending web-record consent, and signed-out), plus a
+/// recording glyph that blinks between filled and hollow on a 1s timer while recording. Status items
+/// ignore `withAnimation`, so a real timer drives the affordance; it is invalidated the moment the
+/// icon leaves the recording phase, and stays a static filled glyph under Reduce Motion. The
+/// per-state glyph is a pure decision (`symbolName`) so the full matrix is tested.
 struct MenuBarIcon: View {
     let phase: AppPhase
     let softHint: Bool
+    let pendingConsent: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hollow = false
     @State private var timer: Timer?
 
     var body: some View {
-        glyph
-            .accessibilityLabel(Self.accessibilityLabel(phase: phase))
+        Image(systemName: currentSymbol)
+            .accessibilityLabel(Self.accessibilityLabel(phase: phase, pendingConsent: pendingConsent))
             .onAppear { syncPulse() }
             .onChange(of: phase) { _, _ in syncPulse() }
             .onDisappear { stopPulse() }
     }
 
-    /// VoiceOver text for the status item, since the glyph alone conveys the phase.
-    static func accessibilityLabel(phase: AppPhase) -> String {
+    /// The pure per-state glyph, overlaid only by the recording blink (a timer-driven view concern).
+    private var currentSymbol: String {
+        if case .recording = phase, hollow, !reduceMotion { return "record.circle" }
+        return Self.symbolName(phase: phase, softHint: softHint, pendingConsent: pendingConsent)
+    }
+
+    /// The status-item SF Symbol for a given state. Recording/finalizing/error take precedence over a
+    /// pending consent; in idle or detected a pending consent shows its own glyph over the soft hint.
+    /// All names are verified available on macOS 14.
+    static func symbolName(phase: AppPhase, softHint: Bool, pendingConsent: Bool) -> String {
         switch phase {
-        case .recording: return "Minutia, recording"
-        case .finalizing: return "Minutia, finishing recording"
-        case .detected: return "Minutia, meeting detected"
-        case .error: return "Minutia, error"
-        default: return "Minutia, idle"
+        case .recording: return "record.circle.fill"
+        case .finalizing: return "record.circle"
+        case .error: return "waveform.badge.exclamationmark"
+        case .detected: return pendingConsent ? "questionmark.circle.fill" : "waveform.badge.mic"
+        case .signedOut: return "waveform.slash"
+        case .idle:
+            if pendingConsent { return "questionmark.circle.fill" }
+            return softHint ? "waveform.badge.mic" : "waveform"
         }
     }
 
-    @ViewBuilder private var glyph: some View {
+    /// VoiceOver text for the status item, since the glyph alone conveys the phase. Mirrors the glyph
+    /// precedence: recording/finalizing/error win over a pending consent.
+    static func accessibilityLabel(phase: AppPhase, pendingConsent: Bool) -> String {
         switch phase {
-        case .recording:
-            Image(systemName: hollow && !reduceMotion ? "record.circle" : "record.circle.fill")
-        case .finalizing:
-            Image(systemName: "record.circle")
-        case .error:
-            Image(systemName: "waveform.badge.exclamationmark")
-        default:
-            Image(systemName: softHint ? "waveform.badge.mic" : "waveform")
+        case .recording: return "Minutia, recording"
+        case .finalizing: return "Minutia, finishing recording"
+        case .error: return "Minutia, error"
+        case .detected: return pendingConsent ? "Minutia, record request pending" : "Minutia, meeting detected"
+        case .signedOut: return "Minutia, signed out"
+        case .idle: return pendingConsent ? "Minutia, record request pending" : "Minutia, idle"
         }
     }
 
@@ -208,6 +265,9 @@ final class AppController: NSObject, ObservableObject {
     /// Transient in-menu feedback (e.g. a rejected web-record) so the message exists even when
     /// notifications are off. Cleared on the next phase change.
     @Published private(set) var recordFeedback: String?
+    /// True while the startup recovery sweep is finalizing a prior recording's orphaned upload.
+    /// Drives a quiet in-menu row and folds recovery into the quit guard.
+    @Published private(set) var recoveryActive: Bool = false
     @Published var selectedSeriesId: UUID? {
         didSet {
             UserDefaults.standard.set(selectedSeriesId?.uuidString, forKey: Self.lastSeriesKey)
@@ -356,13 +416,22 @@ final class AppController: NSObject, ObservableObject {
         }
     }
 
-    /// Quitting mid-capture must prompt: a recording is in flight (or finalizing its upload) and
-    /// leaving without finishing would lose the un-uploaded tail until the next-launch recovery.
-    nonisolated static func shouldConfirmQuit(phase: AppPhase) -> Bool {
+    /// Quitting must prompt when there is unfinished durable work: a recording in flight (or
+    /// finalizing its upload), or a startup recovery sweep still rescuing a prior recording. Leaving
+    /// without finishing would defer the upload to the next-launch recovery at best.
+    nonisolated static func shouldConfirmQuit(phase: AppPhase, recoveryActive: Bool) -> Bool {
+        if recoveryActive { return true }
         switch phase {
         case .recording, .finalizing: return true
         default: return false
         }
+    }
+
+    /// Whether an error message is the mic-permission failure, so the ErrorView can offer the same
+    /// System Settings deep link the idle banner does. Matches the exact constant produced by
+    /// `CaptureSession.failureMessage`, the single source of that copy.
+    nonisolated static func isMicPermissionError(message: String) -> Bool {
+        message == CaptureSession.failureMessage(for: MicCapture.CaptureError.permissionDenied)
     }
 
     /// The soft hint shows only when mic-only detection meets a resting idle app: quiet by
@@ -765,8 +834,11 @@ final class AppController: NSObject, ObservableObject {
             // wedged upload cannot block termination forever.
             await waitWhileFinalizing()
         case .none:
-            return
+            break
         }
+        // Drain an in-flight startup recovery sweep too, so Finish & Quit does not abandon a prior
+        // recording's rescue. No-op when nothing is recovering (the task is already nil).
+        await recoveryTask?.value
     }
 
     private func waitWhileFinalizing() async {
@@ -784,6 +856,7 @@ final class AppController: NSObject, ObservableObject {
     private func runRecovery() {
         guard recoveryTask == nil, let client = authManager.client(), let instance = authManager.instance else { return }
         let activeId = recordingMeetingId?.uuidString
+        recoveryActive = true
         recoveryTask = Task { [weak self] in
             let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
             let recovered = await Self.recoverAll(
@@ -793,6 +866,7 @@ final class AppController: NSObject, ObservableObject {
             for manifest in recovered {
                 await self?.postRecoveryNotification(manifest: manifest, client: client)
             }
+            self?.recoveryActive = false
             self?.recoveryTask = nil
         }
     }

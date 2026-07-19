@@ -52,6 +52,12 @@ jobs:
             echo "::error::Missing required release secrets: ${missing[*]}"
             exit 1
           fi
+          # A real release must not ship with the placeholder Sparkle public key: the built app would
+          # reject every (correctly signed) update, silently disabling auto-update for all users.
+          if grep -q "REPLACE_WITH_SPARKLE_PUBLIC_ED_KEY" project.yml; then
+            echo "::error::SUPublicEDKey in project.yml is still the placeholder; set the real Sparkle public key before releasing."
+            exit 1
+          fi
 
       - name: Install tools
         run: brew install xcodegen create-dmg
