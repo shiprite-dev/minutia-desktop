@@ -1,6 +1,7 @@
 import Foundation
 import CoreAudio
 import AudioToolbox
+import os
 
 /// Global system-audio tap that excludes our own process, feeding 48k mono Float32 into a ring
 /// buffer. Uses the C Core Audio HAL tapping API (macOS 14.4+); the typed AudioHardwareTap classes
@@ -34,6 +35,18 @@ final class SystemAudioTap {
     private var deviceListener: AudioObjectPropertyListenerBlock?
     private var defaultOutputListener: AudioObjectPropertyListenerBlock?
 
+    /// True between a successful public `start()` and `stop()`. Drives whether a device-change
+    /// rebuild (and its retries) should run; independent of `ioProcID`, which is briefly nil during a
+    /// rebuild and after a failed start attempt.
+    private var wantRunning = false
+    private var rebuildRetries = 0
+    /// Bumped by `stop()` so a retry timer scheduled before the stop cannot fire a rebuild against a
+    /// later run of the same instance.
+    private var rebuildEpoch = 0
+    private static let rebuildBackoffs: [TimeInterval] = [0.3, 0.6, 1.2]
+
+    private static let logger = Logger(subsystem: "app.minutia.desktop", category: "SystemAudioTap")
+
     /// The tap's stream format, read before any consumer is created. Nil until `start()` succeeds.
     private(set) var tapFormat: AudioStreamBasicDescription?
 
@@ -48,11 +61,33 @@ final class SystemAudioTap {
     private var monoScratch = [Float](repeating: 0, count: scratchFrames)
     private var resampleScratch = [Float](repeating: 0, count: scratchFrames)
 
+    /// Continuous resampler for the non-equal-rate path, reconfigured per source rate in `_start`.
+    private var resampler = LinearResampler(sourceRate: MixPlan.sampleRate, targetRate: MixPlan.sampleRate)
+
     init(into buffer: RingBuffer) {
         self.buffer = buffer
     }
 
+    /// Serializes with `stop()` and the device-change rebuild on `controlQueue` so a concurrent
+    /// teardown and rebuild can never double-destroy the aggregate or tap.
     func start() throws {
+        try controlQueue.sync {
+            try _start()
+            wantRunning = true
+        }
+    }
+
+    func stop() {
+        controlQueue.sync {
+            wantRunning = false
+            rebuildRetries = 0
+            isRebuilding = false
+            rebuildEpoch += 1
+            _stop()
+        }
+    }
+
+    private func _start() throws {
         guard ioProcID == nil && tapID == AudioObjectID(kAudioObjectUnknown) else { return }
         do {
             let ownProcess = try translateOwnProcessObject()
@@ -75,19 +110,20 @@ final class SystemAudioTap {
             let source = readAggregateInputFormat() ?? format
             sourceFormat = source
             resizeScratch(sourceRate: source.mSampleRate)
+            resampler = LinearResampler(sourceRate: source.mSampleRate, targetRate: MixPlan.sampleRate)
 
             try createIOProc()
 
             try check(AudioDeviceStart(aggregateID, ioProcID), "AudioDeviceStart")
             installDeviceListeners()
         } catch {
-            stop()
+            _stop()
             throw error
         }
     }
 
     /// Teardown in strict reverse order, tolerating a partially initialized state.
-    func stop() {
+    private func _stop() {
         removeDeviceListeners()
         if let procID = ioProcID {
             AudioDeviceStop(aggregateID, procID)
@@ -237,22 +273,35 @@ final class SystemAudioTap {
     /// mid-meeting device change (headphones or AirPods disconnect) rebuilds the aggregate against
     /// the new default output. Listeners fire on `controlQueue`.
     private func installDeviceListeners() {
-        let rebuild: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            // Defer the rebuild off the listener callback so teardown never removes a listener from
-            // inside its own invocation.
+        installAliveListener()
+        installDefaultOutputListener()
+    }
+
+    /// A listener block that defers the rebuild off its own callback so teardown never removes a
+    /// listener from inside its own invocation.
+    private func makeRebuildListener() -> AudioObjectPropertyListenerBlock {
+        { [weak self] _, _ in
             self?.controlQueue.async { self?.rebuildForDeviceChange() }
         }
+    }
 
-        if outputDeviceID != AudioObjectID(kAudioObjectUnknown) {
-            var aliveAddress = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyDeviceIsAlive,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain)
-            if AudioObjectAddPropertyListenerBlock(outputDeviceID, &aliveAddress, controlQueue, rebuild) == noErr {
-                deviceListener = rebuild
-            }
+    private func installAliveListener() {
+        guard deviceListener == nil, outputDeviceID != AudioObjectID(kAudioObjectUnknown) else { return }
+        let rebuild = makeRebuildListener()
+        var aliveAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsAlive,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        if AudioObjectAddPropertyListenerBlock(outputDeviceID, &aliveAddress, controlQueue, rebuild) == noErr {
+            deviceListener = rebuild
         }
+    }
 
+    /// Installs the system default-output listener. Kept separately installable so a rebuild that
+    /// exhausted its retry budget can re-arm just this listener and still recover on a later settle.
+    private func installDefaultOutputListener() {
+        guard defaultOutputListener == nil else { return }
+        let rebuild = makeRebuildListener()
         var defaultAddress = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultOutputDevice,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -284,17 +333,42 @@ final class SystemAudioTap {
     }
 
     /// Tears down and re-creates the aggregate against the current default output. Runs on
-    /// `controlQueue`; re-entrancy is blocked by `isRebuilding`.
+    /// `controlQueue`; re-entrancy is blocked by `isRebuilding`. Uses the internal `_stop`/`_start`
+    /// to avoid a re-entrant `controlQueue.sync` deadlock.
     private func rebuildForDeviceChange() {
-        guard !isRebuilding, ioProcID != nil else { return }
+        guard wantRunning, !isRebuilding else { return }
         isRebuilding = true
-        stop()
+        rebuildRetries = 0
+        attemptRebuild()
+    }
+
+    /// One rebuild attempt on `controlQueue`. A transient failure (the new default output is briefly
+    /// unavailable during an AirPods handoff) is retried with backoff; once the budget is exhausted
+    /// the default-output listener is re-armed so a later device settle can still recover.
+    private func attemptRebuild() {
+        _stop()
         do {
-            try start()
+            try _start()
+            rebuildRetries = 0
+            isRebuilding = false
         } catch {
-            onFailure?(error)
+            if rebuildRetries < Self.rebuildBackoffs.count {
+                let delay = Self.rebuildBackoffs[rebuildRetries]
+                rebuildRetries += 1
+                let epoch = rebuildEpoch
+                controlQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self else { return }
+                    guard self.wantRunning, self.rebuildEpoch == epoch else { return }
+                    self.attemptRebuild()
+                }
+            } else {
+                Self.logger.error("System-audio rebuild gave up after retries: \(String(describing: error), privacy: .public)")
+                rebuildRetries = 0
+                isRebuilding = false
+                installDefaultOutputListener()
+                onFailure?(error)
+            }
         }
-        isRebuilding = false
     }
 
     // MARK: - Hot path
@@ -360,26 +434,17 @@ final class SystemAudioTap {
             }
             return
         }
-        // Linear resample into the pre-allocated scratch. Good enough for speech transcription;
-        // the tap format is typically already 48k float so this path rarely runs.
-        let ratio = targetRate / sourceRate
-        let outCount = min(Int(Double(monoCount) * ratio), resampleScratch.count)
-        guard outCount > 0 else { return }
-        monoScratch.withUnsafeBufferPointer { mono in
-            resampleScratch.withUnsafeMutableBufferPointer { out in
-                let lastIndex = monoCount - 1
-                for j in 0..<outCount {
-                    let srcPos = Double(j) / ratio
-                    let i0 = Int(srcPos)
-                    if i0 >= lastIndex {
-                        out[j] = mono[lastIndex]
-                    } else {
-                        let frac = Float(srcPos - Double(i0))
-                        out[j] = mono[i0] * (1 - frac) + mono[i0 + 1] * frac
-                    }
-                }
-                buffer.push(out.baseAddress!, count: outCount)
-            }
+        // Continuous linear resample into the pre-allocated scratch: the resampler carries the
+        // fractional source position and last sample across callbacks so the stream is rate-exact
+        // over time with no per-callback seam. The tap format is typically already 48k float so this
+        // path rarely runs.
+        let produced = monoScratch.withUnsafeBufferPointer { mono -> Int in
+            let input = UnsafeBufferPointer(rebasing: mono[0..<monoCount])
+            return resampler.resample(input, into: &resampleScratch)
+        }
+        guard produced > 0 else { return }
+        resampleScratch.withUnsafeBufferPointer { out in
+            buffer.push(out.baseAddress!, count: produced)
         }
     }
 

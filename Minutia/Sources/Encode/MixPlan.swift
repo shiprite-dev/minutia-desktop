@@ -4,6 +4,9 @@ import Foundation
 enum MixPlan {
     static let sampleRate: Double = 48_000
     static let tickFrames = 12_000   // 250ms at 48k
+    /// Ceiling on extra catch-up chunks drained in a single tick so a backlog is worked down over a
+    /// tick or two without an unbounded burst.
+    static let maxCatchUpChunks = 8
 
     /// Frames to drain from each source this tick. The caller silence-pads any shortfall.
     struct Tick { let micFrames: Int; let sysFrames: Int }
@@ -11,6 +14,15 @@ enum MixPlan {
     static func plan(micAvailable: Int, sysAvailable: Int) -> Tick {
         Tick(micFrames: min(tickFrames, micAvailable),
              sysFrames: min(tickFrames, sysAvailable))
+    }
+
+    /// Extra `tickFrames`-sized chunks to drain this tick to recover from a scheduling slip. Zero
+    /// unless both sources still hold more than one tick after the normal drain; capped so recovery
+    /// is bounded.
+    static func catchUpChunks(micAvailable: Int, sysAvailable: Int) -> Int {
+        let common = min(micAvailable, sysAvailable)
+        guard common > tickFrames else { return 0 }
+        return min(common / tickFrames, maxCatchUpChunks)
     }
 
     /// Sums the two sources sample-by-sample over `count` frames, treating missing samples as zero,
