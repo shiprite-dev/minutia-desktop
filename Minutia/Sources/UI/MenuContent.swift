@@ -15,6 +15,14 @@ struct MenuContent: View {
                     .padding(12)
             }
 
+            // Transient feedback (e.g. a rejected web-record) surfaced in-menu, so it reaches the
+            // user even when notification permission is denied. Auto-clears on the next phase change.
+            if let feedback = controller.recordFeedback {
+                FeedbackBanner(message: feedback)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 12)
+            }
+
             Group {
                 switch controller.phase {
                 case .signedOut:
@@ -49,6 +57,10 @@ private struct IdleView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            if !controller.micAuthorized {
+                MicPermissionBanner()
+            }
+
             if let detectedVia {
                 DetectionBanner(via: detectedVia, controller: controller)
             } else if controller.softHint {
@@ -79,6 +91,57 @@ private struct IdleView: View {
             .disabled(controller.selectedSeriesId == nil)
         }
         .padding(12)
+        .onAppear { controller.refreshPermissionState() }
+    }
+}
+
+/// Shown when mic access is not granted: recording is impossible without it, so guide the user
+/// straight to the System Settings pane. System audio TCC cannot be queried, so it is only noted.
+private struct MicPermissionBanner: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "mic.slash")
+                    .foregroundStyle(.yellow)
+                Text("Microphone access needed to record")
+                    .font(.callout)
+                    .fontWeight(.medium)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text("System audio is requested the first time you record.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Open System Settings") {
+                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(.yellow.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+/// Small transient banner for controller feedback that must surface without notifications.
+private struct FeedbackBanner: View {
+    let message: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.circle")
+                .foregroundStyle(.secondary)
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
     }
 }
 

@@ -239,6 +239,9 @@ final class AuthManager: ObservableObject {
         guard let supabase else { return }
         try? await supabase.auth.signOut()
         userEmail = nil
+        // A single-use token hash is scoped to the prior session; clearing it lets a fresh
+        // sign-in reuse a hash value without being deduped as a stale delivery.
+        lastHandledTokenHash = nil
     }
 
     enum AuthError: Error {
