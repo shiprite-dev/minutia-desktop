@@ -17,7 +17,6 @@ Minutia Desktop records meeting audio directly on your Mac, microphone plus syst
 ## Requirements
 
 - macOS 14.4 or later
-- Xcode (to build; no signed release yet, see below)
 - A running Minutia instance to connect to
 
 ## Permissions
@@ -27,9 +26,13 @@ macOS prompts for two permissions the first time you record, never before:
 - **Microphone**: captures your side of the conversation.
 - **System audio recording** (via the CoreAudio process tap): captures everything else playing on your Mac so the other participants' audio makes it into the transcript.
 
-## Installing
+## Download
 
-There are no signed releases yet; build from source:
+Grab the latest `Minutia-<version>.dmg` from the [Releases](https://github.com/shiprite-dev/minutia-desktop/releases/latest) page, open it, and drag **Minutia** into **Applications**. Launch it from Applications; it lives in the menu bar (no Dock icon).
+
+The first time you record, macOS prompts once for **Microphone** and once for **System audio recording** (never before). Grant both so the other participants' audio makes it into the transcript. The app checks for and installs its own updates via Sparkle.
+
+## Building from source
 
 ```bash
 brew install xcodegen
@@ -41,7 +44,22 @@ This project uses [XcodeGen](https://github.com/yonaskolb/XcodeGen) to generate 
 
 ```bash
 make test   # generates the project and runs the test suite
+make dmg    # packages a runnable local DMG (unsigned fallback if no Developer ID cert)
 ```
+
+## Releasing (maintainers)
+
+Releases are cut by [`.github/workflows/release.yml`](.github/workflows/release.yml): push a `vX.Y.Z` tag and it produces a Developer ID signed, notarized, stapled DMG plus a Sparkle `appcast.xml`, and uploads both to the GitHub Release. The tag drives `MARKETING_VERSION`; the workflow run number drives the (strictly increasing) build number Sparkle needs to detect updates.
+
+One-time setup:
+
+1. **Developer ID Application certificate.** Export it (with its private key) as a `.p12`, then `base64` it into the `DEVELOPER_ID_CERT_P12` secret; put the export password in `DEVELOPER_ID_CERT_PASSWORD` and your 10-character Team ID in `DEVELOPMENT_TEAM`.
+2. **App Store Connect API key** (for notarization). Create a key in App Store Connect, `base64` the `.p8` into `ASC_KEY_P8`, and set `ASC_KEY_ID` and `ASC_ISSUER_ID`.
+3. **Sparkle EdDSA key pair.** Run `generate_keys` from the [Sparkle](https://github.com/sparkle-project/Sparkle/releases) distribution once. Put the **private** key in the `SPARKLE_PRIVATE_KEY` secret and the **public** key in `SUPublicEDKey` in `project.yml` (it currently holds the `REPLACE_WITH_SPARKLE_PUBLIC_ED_KEY` placeholder, which builds fine but must be swapped in before the first real release).
+
+Required GitHub secrets: `DEVELOPER_ID_CERT_P12`, `DEVELOPER_ID_CERT_PASSWORD`, `DEVELOPMENT_TEAM`, `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8`, `SPARKLE_PRIVATE_KEY`.
+
+Then: `git tag v0.2.0 && git push origin v0.2.0`.
 
 ## Configuration
 

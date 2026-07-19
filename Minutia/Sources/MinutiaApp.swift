@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import Sparkle
 import SwiftUI
 import UserNotifications
 
@@ -7,6 +8,7 @@ import UserNotifications
 struct MinutiaApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var controller = AppController.shared
+    @StateObject private var updater = UpdaterController()
 
     var body: some Scene {
         MenuBarExtra {
@@ -18,8 +20,36 @@ struct MinutiaApp: App {
         .menuBarExtraStyle(.window)
 
         Settings {
-            SettingsView(controller: controller)
+            SettingsView(controller: controller, updater: updater)
         }
+    }
+}
+
+/// Owns Sparkle's updater for the app's lifetime. Held as a scene `@StateObject` (not on
+/// AppController) so the updater is created only when the real app scene runs, never during the
+/// headless unit-test host, which has no bundle feed to check. `canCheckForUpdates` mirrors the
+/// updater's KVO state so the menu control can disable itself while a check is already running.
+@MainActor
+final class UpdaterController: ObservableObject {
+    private let controller: SPUStandardUpdaterController
+    @Published private(set) var canCheckForUpdates = false
+
+    init() {
+        // Start the updater only for the real app with a real Sparkle key. Under XCTest the app is
+        // the test host, so its scene (and this holder) is constructed inside the runner; a started
+        // updater with the placeholder SUPublicEDKey throws and pops a modal error alert that hangs
+        // the headless runner. Skipping the start keeps the suite green and avoids that alert on
+        // local runs until the public key is swapped in for the first release.
+        let key = Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String
+        let hasRealKey = key?.isEmpty == false && key != "REPLACE_WITH_SPARKLE_PUBLIC_ED_KEY"
+        let underTest = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+        controller = SPUStandardUpdaterController(
+            startingUpdater: hasRealKey && !underTest, updaterDelegate: nil, userDriverDelegate: nil)
+        controller.updater.publisher(for: \.canCheckForUpdates).assign(to: &$canCheckForUpdates)
+    }
+
+    func checkForUpdates() {
+        controller.checkForUpdates(nil)
     }
 }
 

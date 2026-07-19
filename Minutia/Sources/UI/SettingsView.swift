@@ -7,15 +7,17 @@ import SwiftUI
 struct SettingsView: View {
     @ObservedObject var controller: AppController
     @ObservedObject private var authManager: AuthManager
+    @ObservedObject private var updater: UpdaterController
 
     @State private var instanceText = ""
     @State private var busy = false
     @State private var statusMessage: String?
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
 
-    init(controller: AppController) {
+    init(controller: AppController, updater: UpdaterController) {
         _controller = ObservedObject(wrappedValue: controller)
         _authManager = ObservedObject(wrappedValue: controller.authManager)
+        _updater = ObservedObject(wrappedValue: updater)
     }
 
     var body: some View {
@@ -64,6 +66,8 @@ struct SettingsView: View {
 
             Section("About") {
                 LabeledContent("Version", value: Self.versionString)
+                Button("Check for Updates…") { updater.checkForUpdates() }
+                    .disabled(!updater.canCheckForUpdates)
             }
         }
         .formStyle(.grouped)
