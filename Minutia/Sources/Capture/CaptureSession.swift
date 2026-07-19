@@ -15,10 +15,15 @@ final class CaptureSession: ObservableObject {
     /// True while the upload queue is retrying through a network outage. Drives the "Reconnecting…"
     /// line in RecordingView; cleared the moment an upload lands or capture ends.
     @Published private(set) var reconnecting = false
+    /// True when the system-audio tap could not start (or a mid-recording rebuild permanently
+    /// failed), so only the microphone is being captured. Drives a persistent caption in
+    /// RecordingView. Reset false on every start.
+    @Published private(set) var systemAudioDegraded = false
 
     /// Fired when capture dies mid-flight (denied mic, disk-full write). Carries a user-facing
-    /// message; the controller flips the UI to `.error`. Invoked on the main actor.
-    var onFailure: (@MainActor (String) -> Void)?
+    /// message and whether the capture directory was preserved for startup recovery (a disk-full or
+    /// stall keeps the partial audio; a zero-frame mic denial does not). Invoked on the main actor.
+    var onFailure: (@MainActor (String, Bool) -> Void)?
 
     struct StopResult {
         let expectedSegments: Int?
@@ -53,7 +58,7 @@ final class CaptureSession: ObservableObject {
     /// up asynchronously inside the pipeline so a permission prompt never blocks the caller. The
     /// capture directory lives under Application Support (durable across quit/crash) with a manifest
     /// so an interrupted meeting can be recovered on the next launch.
-    func start(meetingId: String, seriesId: UUID?, client: MinutiaClient) throws {
+    func start(meetingId: String, seriesId: UUID?, userId: String?, client: MinutiaClient) throws {
         guard pipeline == nil else { return }
 
         // Canonicalize to the lowercase meeting id the DB row and the storage RLS policy use;
@@ -68,6 +73,7 @@ final class CaptureSession: ObservableObject {
             meetingId: meetingId,
             seriesId: seriesId?.uuidString,
             instanceURL: client.instance,
+            userId: userId,
             createdAt: Date())
         try JSONEncoder().encode(manifest).write(to: dir.appendingPathComponent(CaptureRecovery.manifestName))
 
@@ -103,6 +109,12 @@ final class CaptureSession: ObservableObject {
         pipeline.onFatal = { [weak self] error, preserve in
             Task { @MainActor in self?.handleFatal(error, preserveForRecovery: preserve) }
         }
+        // System audio is best-effort: a tap that never starts (no output device) or one whose
+        // mid-recording rebuild permanently fails degrades to mic-only. Surface it so the user is
+        // never silently recording only their own side.
+        pipeline.onSystemAudioUnavailable = { [weak self] in
+            Task { @MainActor in self?.systemAudioDegraded = true }
+        }
         try pipeline.start()
 
         self.pipeline = pipeline
@@ -117,6 +129,7 @@ final class CaptureSession: ObservableObject {
         segmentsUploaded = 0
         segmentsTotal = 0
         reconnecting = false
+        systemAudioDegraded = false
     }
 
     /// Stops capture, drains fast-lane uploads, uploads the full recording, and requests the final
@@ -229,7 +242,7 @@ final class CaptureSession: ObservableObject {
         segmentsUploaded = 0
         segmentsTotal = 0
         reconnecting = false
-        onFailure?(Self.failureMessage(for: error))
+        onFailure?(Self.failureMessage(for: error), preserveForRecovery)
     }
 
     /// Whether a mic-start failure should preserve the capture dir for recovery. The system-audio
@@ -264,6 +277,9 @@ private final class CapturePipeline {
     /// Fired when capture cannot continue: a mic-start failure (Bool == false, nothing worth
     /// keeping) or a segment-write failure such as disk-full (Bool == true, preserve for recovery).
     var onFatal: ((Error, Bool) -> Void)?
+    /// Fired when the system-audio tap cannot start, or a mid-recording rebuild permanently fails,
+    /// so capture continues mic-only. Non-fatal: the recording keeps going.
+    var onSystemAudioUnavailable: (() -> Void)?
 
     private let micBuffer: RingBuffer
     private let sysBuffer: RingBuffer
@@ -288,12 +304,22 @@ private final class CapturePipeline {
     }
 
     func start() throws {
+        // A permanent rebuild failure (device handoff that never recovers) also degrades to mic-only;
+        // surface it the same way as a failed initial start. Fires on controlQueue; the consumer hops
+        // to the main actor.
+        tap.onFailure = { [weak self] error in
+            Self.logger.error("System audio lost mid-recording: \(String(describing: error), privacy: .public)")
+            self?.onSystemAudioUnavailable?()
+        }
         // System audio is best-effort: if the tap can't start (no default output device, transient
         // HAL error), degrade to mic-only rather than failing the whole recording. The tick mixes
         // against an empty sys buffer, which the existing silence-pad already handles. Only a mic
         // failure (below) is fatal.
         do { try tap.start() }
-        catch { Self.logger.warning("System audio unavailable, recording mic-only: \(String(describing: error), privacy: .public)") }
+        catch {
+            Self.logger.warning("System audio unavailable, recording mic-only: \(String(describing: error), privacy: .public)")
+            onSystemAudioUnavailable?()
+        }
         // A denied mic must surface, not be swallowed: without this a permission-denied recording
         // looks healthy but captures only system audio. Preserve the dir when the tick has already
         // written system audio during the permission prompt; deleting it would lose that audio.

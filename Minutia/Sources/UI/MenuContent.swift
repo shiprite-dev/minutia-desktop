@@ -68,9 +68,18 @@ private struct IdleView: View {
             }
 
             if controller.series.isEmpty {
-                Text("No series yet. Create one in Minutia on the web.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("No series yet. Create one in Minutia on the web.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Open Minutia") {
+                        NSWorkspace.shared.open(controller.authManager.instance ?? InstanceConfig.resolvedInstance)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 Picker("Series", selection: $controller.selectedSeriesId) {
                     ForEach(controller.series) { series in
@@ -91,7 +100,10 @@ private struct IdleView: View {
             .disabled(controller.selectedSeriesId == nil)
         }
         .padding(12)
-        .onAppear { controller.refreshPermissionState() }
+        .onAppear {
+            controller.refreshPermissionState()
+            controller.reloadSeries()
+        }
     }
 }
 
