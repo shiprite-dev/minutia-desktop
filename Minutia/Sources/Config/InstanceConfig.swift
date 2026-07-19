@@ -54,6 +54,9 @@ enum InstanceConfig {
         var request = URLRequest(url: instance.appendingPathComponent("api/instance-meta"))
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        // Bound the discovery fetch so a black-holed or unreachable instance cannot spin the
+        // connect (and its dead spinner) forever.
+        request.timeoutInterval = 10
         return request
     }
 

@@ -15,6 +15,14 @@ struct SignInView: View {
     @State private var busy = false
     @State private var showEmailForm = false
     @State private var errorMessage: String?
+    /// The in-flight connect, held so Cancel can stop a dead spinner and drop to the failure UI.
+    @State private var connectTask: Task<Void, Never>?
+    /// True after the browser is opened for magic-link sign-in: shows a waiting state with a
+    /// "Start over" escape hatch, cleared when sign-in completes or a callback error arrives.
+    @State private var browserPending = false
+    /// False when the last connect failure was deterministic (untrusted or not a Minutia
+    /// instance), hiding the "Try again" affordance that could only loop the same verdict.
+    @State private var retryable = true
 
     /// Pure gate for the sign-in button: a plausible email and a non-empty password.
     static func canSubmit(email: String, password: String) -> Bool {
@@ -43,19 +51,34 @@ struct SignInView: View {
     private var form: some View {
         Form {
             if authManager.isConnected {
-                Section("Sign in") {
-                    Button("Sign in with browser", action: signInWithBrowser)
-                        .keyboardShortcut(.defaultAction)
-                        .disabled(busy)
-                    DisclosureGroup("Use email instead", isExpanded: $showEmailForm) {
-                        TextField("Email", text: $email)
-                            .textContentType(.username)
-                        SecureField("Password", text: $password)
-                            .textContentType(.password)
-                        Button("Sign in", action: signIn)
-                            .disabled(busy || !Self.canSubmit(email: email, password: password))
-                        Button("Sign in with Google", action: signInWithGoogle)
+                if browserPending {
+                    // The browser was opened for magic-link sign-in: wait for the callback, but
+                    // never trap the user here. "Start over" clears this and the pending flow.
+                    Section("Signing in") {
+                        HStack(spacing: 10) {
+                            ProgressView().controlSize(.small)
+                            Text("Check your browser to finish signing in.")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                        Button("Start over") { cancelBrowserSignIn() }
+                            .buttonStyle(.link)
+                    }
+                } else {
+                    Section("Sign in") {
+                        Button("Sign in with browser", action: signInWithBrowser)
+                            .keyboardShortcut(.defaultAction)
                             .disabled(busy)
+                        DisclosureGroup("Use email instead", isExpanded: $showEmailForm) {
+                            TextField("Email", text: $email)
+                                .textContentType(.username)
+                            SecureField("Password", text: $password)
+                                .textContentType(.password)
+                            Button("Sign in", action: signIn)
+                                .disabled(busy || !Self.canSubmit(email: email, password: password))
+                            Button("Sign in with Google", action: signInWithGoogle)
+                                .disabled(busy)
+                        }
                     }
                 }
             } else if connecting {
@@ -66,6 +89,10 @@ struct SignInView: View {
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }
+                    // Never a dead, uncancellable spinner: Cancel stops the connect and drops to
+                    // the failure/self-host UI immediately.
+                    Button("Cancel") { cancelConnect() }
+                        .buttonStyle(.link)
                 }
             }
 
@@ -79,9 +106,11 @@ struct SignInView: View {
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
-                        Button("Try again") { Task { await attemptConnect() } }
-                            .buttonStyle(.borderedProminent)
-                            .keyboardShortcut(.defaultAction)
+                        if retryable {
+                            Button("Try again") { startConnect() }
+                                .buttonStyle(.borderedProminent)
+                                .keyboardShortcut(.defaultAction)
+                        }
                         Button("Using a self-hosted server?") {
                             NSApp.activate(ignoringOtherApps: true)
                             openSettings()
@@ -102,13 +131,37 @@ struct SignInView: View {
         }
         .formStyle(.grouped)
         .task { await autoConnect() }
+        .onChange(of: authManager.userEmail) { _, email in
+            if email != nil { browserPending = false }
+        }
+        .onChange(of: authManager.callbackError) { _, error in
+            if error != nil { browserPending = false }
+        }
     }
 
     /// Connect to the resolved instance the moment the sign-in screen appears. Idempotent with
     /// restoreSession(): a client already built by session restore short-circuits here.
     private func autoConnect() async {
         guard authManager.supabase == nil else { connecting = false; return }
-        await attemptConnect()
+        startConnect()
+        await connectTask?.value
+    }
+
+    /// Kick off (or restart) the connect as a cancellable task so Cancel/Try again can drive it.
+    private func startConnect() {
+        connectTask?.cancel()
+        connectTask = Task { await attemptConnect() }
+    }
+
+    /// Cancel an in-flight connect and drop to the failure/self-host UI, so the spinner is never a
+    /// dead end the user cannot escape.
+    private func cancelConnect() {
+        connectTask?.cancel()
+        connectTask = nil
+        connecting = false
+        if errorMessage == nil {
+            errorMessage = "Connecting was cancelled. Try again when you're ready."
+        }
     }
 
     /// Connect with a short backoff so a transient failure at launch (network not ready yet)
@@ -116,30 +169,48 @@ struct SignInView: View {
     private func attemptConnect() async {
         connecting = true
         errorMessage = nil
+        retryable = true
         let backoffs: [Double] = [0, 1, 2, 4]
         for (index, delay) in backoffs.enumerated() {
+            if Task.isCancelled { return }
             if delay > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             }
+            if Task.isCancelled { return }
             if authManager.supabase != nil { break }
             do {
                 try await authManager.ensureConnected()
                 errorMessage = nil
                 break
             } catch {
+                // A deterministic verdict (untrusted, not a Minutia instance) cannot change on
+                // retry: stop the backoff loop immediately and drop the retry affordance.
+                if !AuthManager.isRetryableConnectFailure(error) {
+                    errorMessage = AuthManager.connectFailureMessage(for: error)
+                    retryable = false
+                    break
+                }
                 if index == backoffs.count - 1 {
-                    errorMessage = "Couldn't reach Minutia. Check your internet connection, then try again."
+                    errorMessage = AuthManager.connectFailureMessage(for: error)
                 }
             }
         }
-        connecting = false
+        if !Task.isCancelled { connecting = false }
     }
 
     private func signInWithBrowser() {
         errorMessage = nil
         authManager.callbackError = nil
+        browserPending = true
         let device = Host.current().localizedName ?? "Mac"
         NSWorkspace.shared.open(authManager.beginBrowserSignIn(device: device))
+    }
+
+    /// Abandon the browser sign-in the user started: clear the waiting state and drop the pending
+    /// flow so a late callback for this attempt no longer binds.
+    private func cancelBrowserSignIn() {
+        browserPending = false
+        authManager.cancelBrowserSignIn()
     }
 
     private func signIn() {

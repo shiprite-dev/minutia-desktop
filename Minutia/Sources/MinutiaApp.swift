@@ -313,6 +313,11 @@ final class AppController: NSObject, ObservableObject {
     private var recordingMeetingId: UUID?
     private var recordingSeriesId: UUID?
     private var lastFailedStart: FailedStart?
+    /// The instance the detector's agenda provider is currently bound to. When it changes (an
+    /// instance switch), the detector must be torn down and restarted so it stops polling the old
+    /// instance's client; within one instance, repeated syncs keep the running session (and its
+    /// notify debounce) intact.
+    private var detectorBoundInstance: URL?
     /// Single-flight guard for the startup recovery sweep.
     private var recoveryTask: Task<Void, Never>?
 
@@ -324,9 +329,9 @@ final class AppController: NSObject, ObservableObject {
         // A mid-capture fatal (denied mic, disk-full) flips the UI to .error with a user message.
         captureSession.onFailure = { [weak self] message in self?.apply(.failed(message)) }
 
-        authManager.$userEmail
+        authManager.$sessionIdentity
             .removeDuplicates()
-            .sink { [weak self] email in self?.handleAuthChange(signedIn: email != nil) }
+            .sink { [weak self] identity in self?.handleAuthChange(signedIn: identity.email != nil) }
             .store(in: &cancellables)
 
         detector.$confidence
@@ -385,16 +390,33 @@ final class AppController: NSObject, ObservableObject {
     private func syncDetector() {
         switch phase {
         case .idle, .detected:
-            guard let client = authManager.client() else { return }
+            guard let client = authManager.client() else {
+                detector.stop()
+                detectorBoundInstance = nil
+                return
+            }
+            // On an instance switch, tear the detector down first so start() binds the NEW agenda
+            // provider (start() keeps the old provider while running); on the same instance this is
+            // a cheap no-op that preserves the running session's notify debounce.
+            let instance = authManager.instance
+            if detectorBoundInstance != instance {
+                detector.stop()
+                detectorBoundInstance = instance
+            }
             detector.start(agendaProvider: { (try? await client.agenda()) ?? [] })
         default:
             detector.stop()
+            detectorBoundInstance = nil
         }
     }
 
     private func handleAuthChange(signedIn: Bool) {
         if signedIn {
             apply(.signedIn)
+            // apply() no-ops when an instance switch under the same email keeps the phase at .idle,
+            // so rebind the detector explicitly: syncDetector re-points its agenda provider at the
+            // new instance's client. loadSeries and runRecovery likewise re-run for the new instance.
+            syncDetector()
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
             Task { await loadSeries() }
             runRecovery()
@@ -682,7 +704,16 @@ final class AppController: NSObject, ObservableObject {
             handleRecordCommand(meetingId: meetingId)
             return
         }
-        await authManager.handleCallback(url)
+        // Surface the cold-launch result: a URL can launch the app with no window in front, so a
+        // silent sign-in or failure would leave the user with no signal it happened.
+        switch await authManager.handleCallback(url) {
+        case .signedIn:
+            Self.postNotification(title: "Signed in to Minutia", body: "You're ready to record meetings.")
+        case .failed(let message):
+            Self.postNotification(title: "Sign-in failed", body: message)
+        case .rejected, .ignored:
+            break
+        }
     }
 }
 

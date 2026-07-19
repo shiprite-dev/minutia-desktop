@@ -37,7 +37,12 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
                 Button("Reconnect", action: reconnect)
-                    .disabled(busy || InstanceConfig.normalize(instanceText) == nil)
+                    .disabled(busy || InstanceConfig.normalize(instanceText) == nil || captureInFlight)
+                if captureInFlight {
+                    Text("Finish the recording before switching servers.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
                 if let statusMessage {
                     Text(statusMessage)
                         .font(.callout)
@@ -51,7 +56,12 @@ struct SettingsView: View {
                     Button("Sign out") {
                         Task { await authManager.signOut() }
                     }
-                    .disabled(AppController.shouldStopCaptureOnSignOut(phase: controller.phase))
+                    .disabled(captureInFlight)
+                    if captureInFlight {
+                        Text("Stop the recording to sign out.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
                 } else {
                     Text("Not signed in")
                         .foregroundStyle(.secondary)
@@ -97,10 +107,19 @@ struct SettingsView: View {
                     ?? InstanceConfig.defaultInstance.absoluteString
             }
         }
+        // Re-verify the live connection whenever Settings appears, so the dot reflects reality
+        // (e.g. the instance went down since launch) instead of a stale one-time snapshot.
+        .task { await authManager.verifyConnection() }
     }
 
     private var connectedHost: String {
         authManager.instance?.host ?? authManager.instance?.absoluteString ?? ""
+    }
+
+    /// True while a recording is live or finalizing. Reused to block both Reconnect and Sign out:
+    /// switching servers or dropping the session mid-capture would strand the in-flight upload.
+    private var captureInFlight: Bool {
+        AppController.shouldStopCaptureOnSignOut(phase: controller.phase)
     }
 
     /// Login-item registration state distilled from `SMAppService.Status`. `.requiresApproval`
@@ -143,7 +162,7 @@ struct SettingsView: View {
                 try await authManager.connect(instance: url)
                 statusMessage = "Connected to \(url.host ?? url.absoluteString)."
             } catch {
-                statusMessage = "Could not connect: \(error.localizedDescription)"
+                statusMessage = AuthManager.connectFailureMessage(for: error)
             }
             busy = false
         }
