@@ -19,6 +19,11 @@ final class MicCapture {
     private var running = false
     private var configObserver: NSObjectProtocol?
 
+    // AVAudioEngine is not thread-safe for concurrent start/stop/tap mutation. The engine, its tap,
+    // and `running` are only ever touched inside `controlQueue`, so a device-change rebuild (posted
+    // on an arbitrary thread) can never race stop() or a second config change.
+    private let controlQueue = DispatchQueue(label: "app.minutia.mic.control")
+
     // The converter is swapped on the config-change thread (device handoff) while the realtime tap
     // block reads it, so a lock guards the reference: the render thread snapshots (retains) it under
     // the lock and runs the conversion on the snapshot outside it.
@@ -49,7 +54,12 @@ final class MicCapture {
         guard await AVCaptureDevice.requestAccess(for: .audio) else {
             throw CaptureError.permissionDenied
         }
+        try controlQueue.sync { try startEngine() }
+    }
 
+    /// Builds the engine, tap, converter, and device-change observer. Runs on `controlQueue`.
+    private func startEngine() throws {
+        guard !running else { return }
         let input = engine.inputNode
         try input.setVoiceProcessingEnabled(true)
         input.voiceProcessingOtherAudioDuckingConfiguration =
@@ -71,16 +81,21 @@ final class MicCapture {
         running = true
 
         // Rebuild the tap + converter when the input device changes mid-recording (an AirPods mic
-        // handoff), otherwise the stale tap drains silence against the old format.
+        // handoff), otherwise the stale tap drains silence against the old format. The rebuild hops
+        // onto controlQueue so it can never race stop() or another config change.
         configObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil) { [weak self] _ in
-            self?.handleConfigurationChange()
+            self?.controlQueue.async { self?.handleConfigurationChange() }
         }
     }
 
     /// Disables voice processing before stopping the engine; the reverse order crashes on recent
     /// macOS.
     func stop() {
+        controlQueue.sync { stopEngine() }
+    }
+
+    private func stopEngine() {
         guard running else { return }
         if let configObserver {
             NotificationCenter.default.removeObserver(configObserver)
@@ -95,6 +110,8 @@ final class MicCapture {
 
     deinit { stop() }
 
+    /// Rebuilds the tap + converter against the new input device. Runs on `controlQueue`, so
+    /// `running` and the engine/tap are read and mutated under the same serialization as start/stop.
     private func handleConfigurationChange() {
         guard running else { return }
         let input = engine.inputNode
