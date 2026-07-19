@@ -37,6 +37,12 @@ struct RecordingView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
+            if session.reconnecting {
+                Text("Reconnecting…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Button {
                 onStop()
             } label: {

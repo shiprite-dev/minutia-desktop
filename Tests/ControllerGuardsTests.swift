@@ -84,6 +84,20 @@ final class ControllerGuardsTests: XCTestCase {
         }
     }
 
+    // MARK: - Quit-while-recording guard
+
+    func test_shouldConfirmQuit_trueWhileCapturing() {
+        XCTAssertTrue(AppController.shouldConfirmQuit(phase: .recording))
+        XCTAssertTrue(AppController.shouldConfirmQuit(phase: .finalizing))
+    }
+
+    func test_shouldConfirmQuit_falseOtherwise() {
+        let restingPhases: [AppPhase] = [.signedOut, .idle, .detected(app: "Zoom"), .detected(app: nil), .error("boom")]
+        for phase in restingPhases {
+            XCTAssertFalse(AppController.shouldConfirmQuit(phase: phase), "must not confirm quit from \(phase)")
+        }
+    }
+
     // MARK: - Soft-detection hint
 
     /// Soft confidence (mic active, no corroborating app/calendar signal) surfaces the quiet

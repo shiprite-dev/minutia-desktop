@@ -55,6 +55,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor in await AppController.shared.handleURL(url) }
         }
     }
+
+    /// Guard against quitting mid-recording. When capturing, prompt to finish the upload first;
+    /// "Finish & Quit" defers termination until stop+finalize completes. Even if the user quits
+    /// anyway (or finalize fails), the durable capture directory means next-launch recovery finishes
+    /// the job, so no path loses the recording.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard AppController.shouldConfirmQuit(phase: AppController.shared.phase) else {
+            return .terminateNow
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Recording in progress"
+        alert.informativeText = "Minutia is still finishing the upload for this recording. Finish and quit, or keep recording?"
+        alert.addButton(withTitle: "Finish & Quit")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            return .terminateCancel
+        }
+        Task { @MainActor in
+            await AppController.shared.finishForQuit()
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
 }
 
 /// Status item glyph per phase: waveform idle, exclamation on error, and a recording glyph
@@ -202,6 +226,15 @@ final class AppController: NSObject, ObservableObject {
         }
     }
 
+    /// Quitting mid-capture must prompt: a recording is in flight (or finalizing its upload) and
+    /// leaving without finishing would lose the un-uploaded tail until the next-launch recovery.
+    nonisolated static func shouldConfirmQuit(phase: AppPhase) -> Bool {
+        switch phase {
+        case .recording, .finalizing: return true
+        default: return false
+        }
+    }
+
     /// The soft hint shows only when mic-only detection meets a resting idle app: quiet by
     /// design (no notification). Any capture, finalize, error, or the .high banner suppresses
     /// it so it never competes for attention or lingers over a live recording.
@@ -214,11 +247,16 @@ final class AppController: NSObject, ObservableObject {
     private var lastConfidence: DetectionConfidence = .none
     private var recordingMeetingId: UUID?
     private var recordingSeriesId: UUID?
+    /// Single-flight guard for the startup recovery sweep.
+    private var recoveryTask: Task<Void, Never>?
 
     private override init() {
         super.init()
         Self.registerNotificationCategories()
         UNUserNotificationCenter.current().delegate = self
+
+        // A mid-capture fatal (denied mic, disk-full) flips the UI to .error with a user message.
+        captureSession.onFailure = { [weak self] message in self?.apply(.failed(message)) }
 
         authManager.$userEmail
             .removeDuplicates()
@@ -275,6 +313,7 @@ final class AppController: NSObject, ObservableObject {
             apply(.signedIn)
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
             Task { await loadSeries() }
+            runRecovery()
         } else {
             if Self.shouldStopCaptureOnSignOut(phase: phase) {
                 Task { _ = try? await captureSession.stop() }
@@ -332,7 +371,7 @@ final class AppController: NSObject, ObservableObject {
         Task {
             do {
                 let meeting = try await client.startOrJoinMeeting(seriesId: seriesId)
-                try captureSession.start(meetingId: meeting.id.uuidString, client: client)
+                try captureSession.start(meetingId: meeting.id.uuidString, seriesId: seriesId, client: client)
                 recordingMeetingId = meeting.id
                 recordingSeriesId = seriesId
                 apply(.recordStarted)
@@ -348,7 +387,7 @@ final class AppController: NSObject, ObservableObject {
     func startRecording(meetingId: String) {
         guard Self.canStartRecording(from: phase), let client = authManager.client() else { return }
         do {
-            try captureSession.start(meetingId: meetingId, client: client)
+            try captureSession.start(meetingId: meetingId, seriesId: nil, client: client)
             recordingMeetingId = UUID(uuidString: meetingId)
             recordingSeriesId = nil
             apply(.recordStarted)
@@ -448,6 +487,50 @@ final class AppController: NSObject, ObservableObject {
                 openRecap()
             } catch {
                 apply(.failed("Could not finish recording: \(error.localizedDescription)"))
+            }
+        }
+    }
+
+    /// Awaited stop+finalize for app termination. Runs the same sequence as `stopRecording` but the
+    /// caller (applicationShouldTerminate) can await it before the process exits. Errors are
+    /// tolerated: even on throw/timeout the durable capture directory remains, so next-launch
+    /// recovery finalizes it. No recap is opened; the app is quitting.
+    func finishForQuit() async {
+        apply(.recordStopped)
+        do {
+            _ = try await captureSession.stop()
+            apply(.finalized)
+        } catch {
+            apply(.failed("Could not finish recording: \(error.localizedDescription)"))
+        }
+    }
+
+    // MARK: - Startup recovery
+
+    /// After sign-in, sweep any capture directories orphaned by a prior quit/crash/fatal and
+    /// finalize each. Single-flight and best-effort: a failure leaves the directory for a later
+    /// launch. The live recording's directory (if any) is never swept.
+    private func runRecovery() {
+        guard recoveryTask == nil, let client = authManager.client(), let instance = authManager.instance else { return }
+        let activeId = recordingMeetingId?.uuidString
+        recoveryTask = Task { [weak self] in
+            await Self.recoverAll(client: client, instance: instance, excluding: activeId)
+            self?.recoveryTask = nil
+        }
+    }
+
+    nonisolated static func recoverAll(client: MinutiaClient, instance: URL, excluding activeMeetingId: String?) async {
+        guard let root = try? CaptureStore.capturesRoot() else { return }
+        for dir in CaptureRecovery.recoverableDirectories(in: root, excluding: activeMeetingId) {
+            guard let manifest = CaptureRecovery.loadManifest(from: dir) else { continue }
+            // Skip dirs captured against a different instance: the current client cannot finalize a
+            // meeting that does not exist on the connected instance, and retrying orphans it forever.
+            guard CaptureRecovery.shouldRecover(manifest: manifest, connectedInstance: instance) else { continue }
+            do {
+                try await CaptureRecovery.recover(directory: dir, manifest: manifest, client: client)
+                try? FileManager.default.removeItem(at: dir)
+            } catch {
+                // Best-effort: leave the directory for the next launch to retry.
             }
         }
     }
