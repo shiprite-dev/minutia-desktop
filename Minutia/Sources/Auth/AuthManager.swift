@@ -106,6 +106,18 @@ final class AuthManager: ObservableObject {
         }
     }
 
+    /// Whether retrying the same connect can ever succeed. A trust or not-an-instance failure is
+    /// deterministic (same URL, same verdict), so the retry affordance would just loop; only
+    /// transport failures deserve one.
+    nonisolated static func isRetryableConnectFailure(_ error: Error) -> Bool {
+        switch error {
+        case AuthError.notAMinutiaInstance, AuthError.untrustedInstance:
+            return false
+        default:
+            return true
+        }
+    }
+
     /// Whether an inbound token hash is a fresh sign-in or a duplicate delivery (the URL arrives
     /// through both onOpenURL and kAEGetURL, and the hash is single-use).
     enum TokenHashAction: Equatable {
@@ -301,6 +313,10 @@ final class AuthManager: ObservableObject {
         } catch {
             isConnected = false
         }
+        // Also touch the session: a server-revoked session only surfaces once a token refresh is
+        // attempted, and a menu-bar app may go hours without one. Failing here emits .signedOut
+        // through observeAuthState, dropping the app to sign-in while the user is looking.
+        if let supabase { _ = try? await supabase.auth.session }
     }
 
     func signIn(email: String, password: String) async throws {

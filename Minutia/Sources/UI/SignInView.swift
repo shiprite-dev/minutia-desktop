@@ -20,6 +20,9 @@ struct SignInView: View {
     /// True after the browser is opened for magic-link sign-in: shows a waiting state with a
     /// "Start over" escape hatch, cleared when sign-in completes or a callback error arrives.
     @State private var browserPending = false
+    /// False when the last connect failure was deterministic (untrusted or not a Minutia
+    /// instance), hiding the "Try again" affordance that could only loop the same verdict.
+    @State private var retryable = true
 
     /// Pure gate for the sign-in button: a plausible email and a non-empty password.
     static func canSubmit(email: String, password: String) -> Bool {
@@ -103,9 +106,11 @@ struct SignInView: View {
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
-                        Button("Try again") { startConnect() }
-                            .buttonStyle(.borderedProminent)
-                            .keyboardShortcut(.defaultAction)
+                        if retryable {
+                            Button("Try again") { startConnect() }
+                                .buttonStyle(.borderedProminent)
+                                .keyboardShortcut(.defaultAction)
+                        }
                         Button("Using a self-hosted server?") {
                             NSApp.activate(ignoringOtherApps: true)
                             openSettings()
@@ -164,6 +169,7 @@ struct SignInView: View {
     private func attemptConnect() async {
         connecting = true
         errorMessage = nil
+        retryable = true
         let backoffs: [Double] = [0, 1, 2, 4]
         for (index, delay) in backoffs.enumerated() {
             if Task.isCancelled { return }
@@ -177,6 +183,13 @@ struct SignInView: View {
                 errorMessage = nil
                 break
             } catch {
+                // A deterministic verdict (untrusted, not a Minutia instance) cannot change on
+                // retry: stop the backoff loop immediately and drop the retry affordance.
+                if !AuthManager.isRetryableConnectFailure(error) {
+                    errorMessage = AuthManager.connectFailureMessage(for: error)
+                    retryable = false
+                    break
+                }
                 if index == backoffs.count - 1 {
                     errorMessage = AuthManager.connectFailureMessage(for: error)
                 }

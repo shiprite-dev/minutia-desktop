@@ -102,6 +102,18 @@ final class AuthInstanceIdentityTests: XCTestCase {
             "Couldn't reach the server. Check your internet connection and try again.")
     }
 
+    func test_isRetryableConnectFailure_deterministicVerdictsAreNot() {
+        // Untrusted config and not-an-instance cannot change on retry; offering "Try again"
+        // would loop the same verdict forever.
+        XCTAssertFalse(AuthManager.isRetryableConnectFailure(AuthManager.AuthError.untrustedInstance))
+        XCTAssertFalse(AuthManager.isRetryableConnectFailure(AuthManager.AuthError.notAMinutiaInstance))
+    }
+
+    func test_isRetryableConnectFailure_transportFailuresAre() {
+        XCTAssertTrue(AuthManager.isRetryableConnectFailure(URLError(.notConnectedToInternet)))
+        XCTAssertTrue(AuthManager.isRetryableConnectFailure(NSError(domain: "x", code: 1)))
+    }
+
     // MARK: - A7: token-hash dedupe + record-on-success
 
     func test_tokenHashAction_processesFreshHash() {
