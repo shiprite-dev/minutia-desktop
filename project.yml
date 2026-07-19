@@ -22,6 +22,7 @@ targets:
       path: Minutia/Minutia.entitlements
       properties:
         com.apple.security.app-sandbox: false
+        com.apple.security.device.audio-input: true
     settings:
       base:
         SWIFT_VERSION: "5.0"
@@ -39,6 +40,9 @@ targets:
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSUIElement: true
         LSMinimumSystemVersion: "14.4"
+        SUFeedURL: https://github.com/shiprite-dev/minutia-desktop/releases/latest/download/appcast.xml
+        SUPublicEDKey: REPLACE_WITH_SPARKLE_PUBLIC_ED_KEY
+        SUEnableAutomaticChecks: true
         NSMicrophoneUsageDescription: Minutia records your side of the meeting through the microphone.
         NSAudioCaptureUsageDescription: Minutia records meeting audio playing on your Mac (Zoom, Teams, Meet) so it can transcribe the meeting.
         NSAppTransportSecurity:
