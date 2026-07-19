@@ -51,4 +51,32 @@ final class MixPlanTests: XCTestCase {
         XCTAssertEqual(out[1], 0.0, accuracy: 1e-6)
         XCTAssertEqual(out[2], 0.0, accuracy: 1e-6)
     }
+
+    func test_catchUp_backlogUnderTick_returnsZero() {
+        XCTAssertEqual(MixPlan.catchUpChunks(micAvailable: MixPlan.tickFrames, sysAvailable: MixPlan.tickFrames), 0)
+        XCTAssertEqual(MixPlan.catchUpChunks(micAvailable: 0, sysAvailable: 0), 0)
+        XCTAssertEqual(MixPlan.catchUpChunks(micAvailable: 100, sysAvailable: 100), 0)
+    }
+
+    func test_catchUp_gatedByStarvedSource() {
+        // One source barely above a tick, the other huge: catch-up is limited by the smaller.
+        XCTAssertEqual(
+            MixPlan.catchUpChunks(micAvailable: MixPlan.tickFrames + 1, sysAvailable: 10 * MixPlan.tickFrames),
+            1)
+        XCTAssertEqual(
+            MixPlan.catchUpChunks(micAvailable: 5, sysAvailable: 10 * MixPlan.tickFrames),
+            0)
+    }
+
+    func test_catchUp_moderateBacklog_returnsFullChunkCount() {
+        XCTAssertEqual(
+            MixPlan.catchUpChunks(micAvailable: 3 * MixPlan.tickFrames + 500, sysAvailable: 4 * MixPlan.tickFrames),
+            3)
+    }
+
+    func test_catchUp_hugeBacklog_capsAtMax() {
+        XCTAssertEqual(
+            MixPlan.catchUpChunks(micAvailable: 100 * MixPlan.tickFrames, sysAvailable: 100 * MixPlan.tickFrames),
+            MixPlan.maxCatchUpChunks)
+    }
 }

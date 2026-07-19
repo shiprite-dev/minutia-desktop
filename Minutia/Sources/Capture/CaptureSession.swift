@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import os
 
 /// Drives one meeting recording end to end: two ring buffers fed by the system-audio tap and the
 /// mic, a 250ms mix/write tick, fast-lane segment uploads, and the stop-time finalize sequence.
@@ -24,10 +25,15 @@ final class CaptureSession: ObservableObject {
         let transcriptRequested: Bool
     }
 
-    enum CaptureError: Error { case notRunning }
+    enum CaptureError: Error { case notRunning, stalled }
 
     /// Ceiling for the stop-time network finalize (drain + upload + finalize + transcribe request).
     static let finalizeTimeout: TimeInterval = 30
+
+    /// If no audio frames drain for this long while recording, the tap and mic have both stalled and
+    /// the recording is silently frozen; the session flips to a fatal error rather than pinning a
+    /// dead clock. A quiet meeting still drains silent samples, so this only fires on a true stall.
+    static let watchdogTimeout: TimeInterval = 15
 
     private var pipeline: CapturePipeline?
     private var queue: UploadQueue?
@@ -35,6 +41,9 @@ final class CaptureSession: ObservableObject {
     private var meetingId: String?
     private var directory: URL?
     private var startedAt: Date?
+    /// Last wall-clock time audio frames were actually drained from the ring buffers. Seeded at
+    /// start so the watchdog has a grace period before audio flows.
+    private var lastFramesAt: Date?
     /// Bumped on every `start`. The upload queue's progress/reconnecting callbacks capture the
     /// generation live at their creation; a callback from a superseded capture (a stale retry loop
     /// from a prior meeting) is gated out so it can never write onto the current meeting's UI.
@@ -86,8 +95,8 @@ final class CaptureSession: ObservableObject {
         // tick-queue barrier guarantees every enqueue lands before `stop` drains. The main-actor
         // tick only drives UI (elapsed, level, live segment count).
         pipeline.onSegment = { segment in queue.enqueue(segment) }
-        pipeline.onTick = { [weak self] peak, closedCount in
-            Task { @MainActor in self?.handleTick(peak: peak, closedCount: closedCount) }
+        pipeline.onTick = { [weak self] peak, closedCount, framesDrained in
+            Task { @MainActor in self?.handleTick(peak: peak, closedCount: closedCount, framesDrained: framesDrained) }
         }
         // A mic-denial (preserve == false: no useful audio yet) or a write failure such as disk-full
         // (preserve == true: keep the partial recording for startup recovery) both land here.
@@ -102,6 +111,7 @@ final class CaptureSession: ObservableObject {
         self.meetingId = meetingId
         self.directory = dir
         self.startedAt = Date()
+        self.lastFramesAt = self.startedAt
         elapsed = 0
         level = 0
         segmentsUploaded = 0
@@ -127,6 +137,7 @@ final class CaptureSession: ObservableObject {
             self.meetingId = nil
             self.directory = nil
             self.startedAt = nil
+            self.lastFramesAt = nil
             self.reconnecting = false
         }
 
@@ -174,11 +185,25 @@ final class CaptureSession: ObservableObject {
         return StopResult(expectedSegments: outcome.expected, transcriptRequested: outcome.transcriptRequested)
     }
 
-    private func handleTick(peak: Float, closedCount: Int) {
-        if let startedAt { elapsed = Date().timeIntervalSince(startedAt) }
+    private func handleTick(peak: Float, closedCount: Int, framesDrained: Int) {
+        let now = Date()
+        if let startedAt { elapsed = now.timeIntervalSince(startedAt) }
         // Peak-hold with decay: snappy attack, gentle release for a readable meter.
         level = max(peak, level * 0.85)
         segmentsTotal += closedCount
+
+        if framesDrained > 0 {
+            lastFramesAt = now
+        } else if let lastFramesAt,
+                  Self.shouldWatchdogFire(
+                    secondsSinceFrames: now.timeIntervalSince(lastFramesAt),
+                    threshold: Self.watchdogTimeout) {
+            handleFatal(CaptureError.stalled, preserveForRecovery: true)
+        }
+    }
+
+    nonisolated static func shouldWatchdogFire(secondsSinceFrames: TimeInterval, threshold: TimeInterval) -> Bool {
+        secondsSinceFrames >= threshold
     }
 
     /// Tears the pipeline down on a mid-capture fatal WITHOUT running the network finalize, resets
@@ -198,6 +223,7 @@ final class CaptureSession: ObservableObject {
         self.meetingId = nil
         self.directory = nil
         self.startedAt = nil
+        self.lastFramesAt = nil
         elapsed = 0
         level = 0
         segmentsUploaded = 0
@@ -218,6 +244,9 @@ final class CaptureSession: ObservableObject {
         if let micError = error as? MicCapture.CaptureError, case .permissionDenied = micError {
             return "Grant microphone access in System Settings to record."
         }
+        if let captureError = error as? CaptureError, case .stalled = captureError {
+            return "Recording stopped: audio capture stalled."
+        }
         return "Recording stopped: \(error.localizedDescription)"
     }
 }
@@ -226,8 +255,10 @@ final class CaptureSession: ObservableObject {
 /// and the 250ms mix/write tick. Reports the tick's peak level and any freshly closed segments
 /// through `onTick`.
 private final class CapturePipeline {
-    /// Reports the tick's peak level and the number of segments closed this tick (for UI).
-    var onTick: ((Float, Int) -> Void)?
+    /// Reports the tick's peak level, the number of segments closed this tick (for UI), and the
+    /// total audio frames drained this tick (mic + sys, including catch-up chunks) so the session's
+    /// watchdog can detect a true capture stall.
+    var onTick: ((Float, Int, Int) -> Void)?
     /// Hands each freshly closed segment off synchronously on `tickQueue` for immediate upload.
     var onSegment: ((SegmentWriter.ClosedSegment) -> Void)?
     /// Fired when capture cannot continue: a mic-start failure (Bool == false, nothing worth
@@ -243,6 +274,7 @@ private final class CapturePipeline {
     private var timer: DispatchSourceTimer?
     private var micScratch: [Float]
     private var sysScratch: [Float]
+    private static let logger = Logger(subsystem: "app.minutia.desktop", category: "CapturePipeline")
 
     init(directory: URL) throws {
         let capacity = Int(MixPlan.sampleRate) * 5   // 5s of headroom per source
@@ -256,7 +288,12 @@ private final class CapturePipeline {
     }
 
     func start() throws {
-        try tap.start()
+        // System audio is best-effort: if the tap can't start (no default output device, transient
+        // HAL error), degrade to mic-only rather than failing the whole recording. The tick mixes
+        // against an empty sys buffer, which the existing silence-pad already handles. Only a mic
+        // failure (below) is fatal.
+        do { try tap.start() }
+        catch { Self.logger.warning("System audio unavailable, recording mic-only: \(String(describing: error), privacy: .public)") }
         // A denied mic must surface, not be swallowed: without this a permission-denied recording
         // looks healthy but captures only system audio. Preserve the dir when the tick has already
         // written system audio during the permission prompt; deleting it would lose that audio.
@@ -304,27 +341,51 @@ private final class CapturePipeline {
         let sysGot = sysBuffer.pop(into: &sysScratch, count: plan.sysFrames)
         let count = max(micGot, sysGot)
         guard count > 0 else {
-            onTick?(0, 0)
+            onTick?(0, 0, 0)
             return
         }
 
-        let mixed = MixPlan.mix(
-            mic: Array(micScratch[0..<micGot]),
-            sys: Array(sysScratch[0..<sysGot]),
-            count: count
-        )
-        let closed: [SegmentWriter.ClosedSegment]
+        var peak: Float = 0
+        var closedCount = 0
+        var framesDrained = micGot + sysGot
         do {
-            closed = try writer.append(mixed)
+            peak = try mixAndWrite(micGot: micGot, sysGot: sysGot, count: count, closedCount: &closedCount)
+
+            // Bounded catch-up: after a scheduling slip the backlog can exceed one tick; drain a
+            // capped number of extra chunks so latency is recovered over a tick or two instead of
+            // growing until the ring overflows.
+            let extra = MixPlan.catchUpChunks(
+                micAvailable: micBuffer.availableFrames, sysAvailable: sysBuffer.availableFrames)
+            for _ in 0..<extra {
+                let mg = micBuffer.pop(into: &micScratch, count: MixPlan.tickFrames)
+                let sg = sysBuffer.pop(into: &sysScratch, count: MixPlan.tickFrames)
+                let c = max(mg, sg)
+                guard c > 0 else { break }
+                framesDrained += mg + sg
+                peak = try mixAndWrite(micGot: mg, sysGot: sg, count: c, closedCount: &closedCount)
+            }
         } catch {
             // Disk-full or any write failure: the audio already on disk is real, so preserve the
             // directory for startup recovery rather than silently dropping this and every later tick.
             onFatal?(error, true)
             return
         }
+        onTick?(peak, closedCount, framesDrained)
+    }
+
+    /// Mixes one drained chunk, appends it to the writer, hands off any closed segments, and returns
+    /// the chunk's peak. Accumulates the closed-segment count across the tick's chunks.
+    private func mixAndWrite(micGot: Int, sysGot: Int, count: Int, closedCount: inout Int) throws -> Float {
+        let mixed = MixPlan.mix(
+            mic: Array(micScratch[0..<micGot]),
+            sys: Array(sysScratch[0..<sysGot]),
+            count: count
+        )
+        let closed = try writer.append(mixed)
         for segment in closed { onSegment?(segment) }
+        closedCount += closed.count
         var peak: Float = 0
         for sample in mixed { peak = max(peak, abs(sample)) }
-        onTick?(peak, closed.count)
+        return peak
     }
 }
