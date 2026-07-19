@@ -11,6 +11,13 @@ final class CaptureSession: ObservableObject {
     @Published private(set) var level: Float = 0
     @Published private(set) var segmentsUploaded = 0
     @Published private(set) var segmentsTotal = 0
+    /// True while the upload queue is retrying through a network outage. Drives the "Reconnecting…"
+    /// line in RecordingView; cleared the moment an upload lands or capture ends.
+    @Published private(set) var reconnecting = false
+
+    /// Fired when capture dies mid-flight (denied mic, disk-full write). Carries a user-facing
+    /// message; the controller flips the UI to `.error`. Invoked on the main actor.
+    var onFailure: (@MainActor (String) -> Void)?
 
     struct StopResult {
         let expectedSegments: Int?
@@ -30,17 +37,26 @@ final class CaptureSession: ObservableObject {
     private var startedAt: Date?
 
     /// Wires the capture graph and starts recording. Synchronous by contract; the mic engine spins
-    /// up asynchronously inside the pipeline so a permission prompt never blocks the caller.
-    func start(meetingId: String, client: MinutiaClient) throws {
+    /// up asynchronously inside the pipeline so a permission prompt never blocks the caller. The
+    /// capture directory lives under Application Support (durable across quit/crash) with a manifest
+    /// so an interrupted meeting can be recovered on the next launch.
+    func start(meetingId: String, seriesId: UUID?, client: MinutiaClient) throws {
         guard pipeline == nil else { return }
 
         // Canonicalize to the lowercase meeting id the DB row and the storage RLS policy use;
         // Swift's UUID.uuidString is uppercase, which the case-sensitive path check would deny.
         let meetingId = meetingId.lowercased()
 
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("minutia-capture-\(meetingId)", isDirectory: true)
+        let dir = try CaptureStore.capturesRoot()
+            .appendingPathComponent(meetingId, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        let manifest = CaptureManifest(
+            meetingId: meetingId,
+            seriesId: seriesId?.uuidString,
+            instanceURL: client.instance,
+            createdAt: Date())
+        try JSONEncoder().encode(manifest).write(to: dir.appendingPathComponent(CaptureRecovery.manifestName))
 
         let pipeline = try CapturePipeline(directory: dir)
         let queue = UploadQueue(
@@ -48,6 +64,9 @@ final class CaptureSession: ObservableObject {
             meetingId: meetingId,
             onProgress: { [weak self] uploaded in
                 await MainActor.run { self?.segmentsUploaded = uploaded }
+            },
+            onReconnecting: { [weak self] value in
+                await MainActor.run { self?.reconnecting = value }
             }
         )
         // Segments are handed to the queue synchronously on the tick queue, so `finishCapture`'s
@@ -56,6 +75,11 @@ final class CaptureSession: ObservableObject {
         pipeline.onSegment = { segment in queue.enqueue(segment) }
         pipeline.onTick = { [weak self] peak, closedCount in
             Task { @MainActor in self?.handleTick(peak: peak, closedCount: closedCount) }
+        }
+        // A mic-denial (preserve == false: no useful audio yet) or a write failure such as disk-full
+        // (preserve == true: keep the partial recording for startup recovery) both land here.
+        pipeline.onFatal = { [weak self] error, preserve in
+            Task { @MainActor in self?.handleFatal(error, preserveForRecovery: preserve) }
         }
         try pipeline.start()
 
@@ -69,6 +93,7 @@ final class CaptureSession: ObservableObject {
         level = 0
         segmentsUploaded = 0
         segmentsTotal = 0
+        reconnecting = false
     }
 
     /// Stops capture, drains fast-lane uploads, uploads the full recording, and requests the final
@@ -86,6 +111,7 @@ final class CaptureSession: ObservableObject {
             self.meetingId = nil
             self.directory = nil
             self.startedAt = nil
+            self.reconnecting = false
         }
 
         let finished = pipeline.finishCapture()
@@ -138,6 +164,37 @@ final class CaptureSession: ObservableObject {
         level = max(peak, level * 0.85)
         segmentsTotal += closedCount
     }
+
+    /// Tears the pipeline down on a mid-capture fatal WITHOUT running the network finalize, resets
+    /// published state, and surfaces a user message. `preserveForRecovery` keeps the capture dir on
+    /// disk (real audio was written; startup recovery salvages it); otherwise the dir is deleted
+    /// (mic denied at start left nothing worth keeping). Guarded so a double-fire is a no-op.
+    private func handleFatal(_ error: Error, preserveForRecovery: Bool) {
+        guard let pipeline else { return }
+        pipeline.teardown()
+        if !preserveForRecovery, let directory {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        self.pipeline = nil
+        self.queue = nil
+        self.client = nil
+        self.meetingId = nil
+        self.directory = nil
+        self.startedAt = nil
+        elapsed = 0
+        level = 0
+        segmentsUploaded = 0
+        segmentsTotal = 0
+        reconnecting = false
+        onFailure?(Self.failureMessage(for: error))
+    }
+
+    nonisolated static func failureMessage(for error: Error) -> String {
+        if let micError = error as? MicCapture.CaptureError, case .permissionDenied = micError {
+            return "Grant microphone access in System Settings to record."
+        }
+        return "Recording stopped: \(error.localizedDescription)"
+    }
 }
 
 /// Owns the audio hot path off the main actor: ring buffers, the tap and mic, the segment writer,
@@ -148,6 +205,9 @@ private final class CapturePipeline {
     var onTick: ((Float, Int) -> Void)?
     /// Hands each freshly closed segment off synchronously on `tickQueue` for immediate upload.
     var onSegment: ((SegmentWriter.ClosedSegment) -> Void)?
+    /// Fired when capture cannot continue: a mic-start failure (Bool == false, nothing worth
+    /// keeping) or a segment-write failure such as disk-full (Bool == true, preserve for recovery).
+    var onFatal: ((Error, Bool) -> Void)?
 
     private let micBuffer: RingBuffer
     private let sysBuffer: RingBuffer
@@ -172,7 +232,9 @@ private final class CapturePipeline {
 
     func start() throws {
         try tap.start()
-        Task { try? await mic.start() }
+        // A denied mic must surface, not be swallowed: without this a permission-denied recording
+        // looks healthy but captures only system audio.
+        Task { do { try await mic.start() } catch { self.onFatal?(error, false) } }
 
         let timer = DispatchSource.makeTimerSource(queue: tickQueue)
         timer.schedule(deadline: .now() + 0.25, repeating: 0.25)
@@ -195,6 +257,18 @@ private final class CapturePipeline {
         return try? writer.finish()
     }
 
+    /// Lightweight stop for the fatal path: halts the timer, tap, and mic, then flushes the writer's
+    /// files (best-effort, so a preserved recording is as playable as possible) WITHOUT the network
+    /// finalize. Shares finishCapture's tick-queue barrier discipline.
+    func teardown() {
+        timer?.cancel()
+        timer = nil
+        tickQueue.sync {}
+        tap.stop()
+        mic.stop()
+        _ = try? writer.finish()
+    }
+
     private func tick() {
         let plan = MixPlan.plan(micAvailable: micBuffer.availableFrames, sysAvailable: sysBuffer.availableFrames)
         let micGot = micBuffer.pop(into: &micScratch, count: plan.micFrames)
@@ -210,7 +284,15 @@ private final class CapturePipeline {
             sys: Array(sysScratch[0..<sysGot]),
             count: count
         )
-        let closed = (try? writer.append(mixed)) ?? []
+        let closed: [SegmentWriter.ClosedSegment]
+        do {
+            closed = try writer.append(mixed)
+        } catch {
+            // Disk-full or any write failure: the audio already on disk is real, so preserve the
+            // directory for startup recovery rather than silently dropping this and every later tick.
+            onFatal?(error, true)
+            return
+        }
         for segment in closed { onSegment?(segment) }
         var peak: Float = 0
         for sample in mixed { peak = max(peak, abs(sample)) }

@@ -46,6 +46,12 @@ private final class StubTransport: SegmentTransport, @unchecked Sendable {
     }
 }
 
+/// Collects the reconnecting toggles the queue emits, in order, for assertion.
+private actor ReconnectRecorder {
+    private(set) var events: [Bool] = []
+    func record(_ value: Bool) { events.append(value) }
+}
+
 final class UploadQueueBackoffTests: XCTestCase {
     func test_backoffSchedule_doublesThenCapsAt60() {
         XCTAssertEqual(UploadQueue.backoffSchedule(attempt: 1), 1)
@@ -160,6 +166,48 @@ final class UploadQueueBehaviorTests: XCTestCase {
         XCTAssertEqual(counts.failed, 0)
         XCTAssertEqual(transport.uploadedCount, n)
         XCTAssertEqual(transport.registeredCount, n)
+    }
+
+    func test_segmentRetriesPastOldCapOfSix_thenRecovers() async {
+        // Old behavior parked a segment permanently after 6 attempts. A normal outage that clears
+        // on the 11th try must now upload successfully rather than silently lose the segment.
+        let transport = StubTransport(behavior: .init(uploadFailures: 10))
+        let queue = makeQueue(transport)
+        queue.enqueue(segment(0))
+        let counts = await queue.drainAndWait()
+
+        XCTAssertEqual(counts.failed, 0)
+        XCTAssertEqual(counts.uploaded, 1)
+        XCTAssertEqual(transport.uploadAttempts, 11)
+        XCTAssertGreaterThan(transport.uploadAttempts, 6, "retries continue past the old 6-attempt cap")
+    }
+
+    func test_reconnecting_staysSilentOnHappyPath() async {
+        let transport = StubTransport()
+        let recorder = ReconnectRecorder()
+        let queue = UploadQueue(
+            transport: transport, meetingId: "m1",
+            sleep: { _ in }, onReconnecting: { await recorder.record($0) })
+        queue.enqueue(segment(0))
+        _ = await queue.drainAndWait()
+
+        let events = await recorder.events
+        XCTAssertEqual(events, [], "no failures means no reconnecting signal")
+    }
+
+    func test_reconnecting_trueAfterThresholdFailuresThenFalseOnSuccess() async {
+        let transport = StubTransport(behavior: .init(uploadFailures: 3))
+        let recorder = ReconnectRecorder()
+        let queue = UploadQueue(
+            transport: transport, meetingId: "m1",
+            sleep: { _ in }, onReconnecting: { await recorder.record($0) })
+        queue.enqueue(segment(0))
+        let counts = await queue.drainAndWait()
+
+        XCTAssertEqual(counts.uploaded, 1)
+        XCTAssertEqual(counts.failed, 0)
+        let events = await recorder.events
+        XCTAssertEqual(events, [true, false], "true after the 3rd failed attempt, false once upload succeeds")
     }
 
     func test_drainAndWait_returnsOnlyAfterInFlightRetriesSettle() async {
