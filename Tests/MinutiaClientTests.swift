@@ -144,6 +144,18 @@ final class MinutiaClientBuilderTests: XCTestCase {
         XCTAssertEqual(MinutiaClient.meetingLookupId(lowerUUID), lowerUUID)
     }
 
+    // Pins the web app's recap route (src/app/(app)/series/[id]/meetings/[meetingId]) and the
+    // lowercase-id rule for the one URL every stop/refinalize/recovery flow opens.
+    func test_recapURL_matchesWebRouteAndLowercasesIds() {
+        let url = MinutiaClient.recapURL(
+            instance: URL(string: "https://minutia.example.com")!,
+            seriesId: UUID(uuidString: "11111111-2222-3333-4444-555555555555")!,
+            meetingId: UUID(uuidString: lowerUUID)!)
+        XCTAssertEqual(
+            url.absoluteString,
+            "https://minutia.example.com/series/11111111-2222-3333-4444-555555555555/meetings/\(lowerUUID)")
+    }
+
     func test_registerSegmentRequest_lowercasesRouteAndBodyPath() {
         let request = MinutiaClient.registerSegmentRequest(instance: instance, meetingId: upperUUID, seq: 0, token: token)
 

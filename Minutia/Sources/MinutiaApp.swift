@@ -834,9 +834,9 @@ final class AppController: NSObject, ObservableObject {
         let content = UNMutableNotificationContent()
         content.title = "Recovered your recording"
         content.body = "A meeting that didn't finish uploading has been recovered. The recap is being prepared."
-        if let seriesId {
-            let url = manifest.instanceURL.appendingPathComponent(
-                "series/\(seriesId.uuidString.lowercased())/meetings/\(manifest.meetingId.lowercased())")
+        if let seriesId, let meetingId = UUID(uuidString: manifest.meetingId) {
+            let url = MinutiaClient.recapURL(
+                instance: manifest.instanceURL, seriesId: seriesId, meetingId: meetingId)
             content.userInfo = [Self.recapURLUserInfoKey: url.absoluteString]
         }
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
@@ -907,9 +907,8 @@ final class AppController: NSObject, ObservableObject {
                 body: "Open Minutia on the web to see the recap.")
             return
         }
-        let url = instance.appendingPathComponent(
-            "series/\(resolvedSeries.uuidString.lowercased())/meetings/\(meetingId.uuidString.lowercased())")
-        NSWorkspace.shared.open(url)
+        NSWorkspace.shared.open(
+            MinutiaClient.recapURL(instance: instance, seriesId: resolvedSeries, meetingId: meetingId))
     }
 
     // MARK: - URL callback
@@ -969,9 +968,12 @@ extension AppController: UNUserNotificationCenterDelegate {
             case Self.dismissWebRecordActionId:
                 self.dismissPendingRecord()
             case UNNotificationDefaultActionIdentifier:
-                // Tapping the recovered-recording notification opens its recap.
+                // Tapping the recovered-recording notification opens its recap. The URL round-trips
+                // through userInfo, so re-check the scheme: a corrupt manifest must never make a
+                // notification tap open an arbitrary non-web scheme.
                 if let urlString = userInfo[Self.recapURLUserInfoKey] as? String,
-                   let url = URL(string: urlString) {
+                   let url = URL(string: urlString),
+                   url.scheme == "https" || url.scheme == "http" {
                     NSWorkspace.shared.open(url)
                 }
             default:

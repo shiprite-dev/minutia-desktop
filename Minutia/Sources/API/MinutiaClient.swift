@@ -251,6 +251,14 @@ struct MinutiaClient {
     /// is uppercase). The shared seam so a recap-resolution query is never issued with an uppercase id.
     static func meetingLookupId(_ meetingId: String) -> String { meetingId.lowercased() }
 
+    /// The web app's recap route for a meeting (src/app/(app)/series/[id]/meetings/[meetingId] on
+    /// the server). The single builder for every place that opens a recap, so the shape and the
+    /// lowercase-id rule cannot drift between call sites.
+    static func recapURL(instance: URL, seriesId: UUID, meetingId: UUID) -> URL {
+        instance.appendingPathComponent(
+            "series/\(seriesId.uuidString.lowercased())/meetings/\(meetingId.uuidString.lowercased())")
+    }
+
     /// Announces this companion instance to the web app. Fire-and-forget: failures are ignored so a
     /// flaky network or a not-yet-deployed route never blocks sign-in or launch.
     func heartbeat() async {
