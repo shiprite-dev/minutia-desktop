@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import Combine
+import OSLog
 import Sparkle
 import SwiftUI
 import UserNotifications
@@ -287,6 +288,8 @@ final class AppController: NSObject, ObservableObject {
 
     static let lastSeriesKey = "app.minutia.lastSeries"
 
+    private static let logger = Logger(subsystem: "app.minutia.desktop", category: "Recovery")
+
     static let webRecordCategoryId = "app.minutia.webRecord"
     static let confirmWebRecordActionId = "app.minutia.webRecord.confirm"
     static let dismissWebRecordActionId = "app.minutia.webRecord.dismiss"
@@ -405,9 +408,14 @@ final class AppController: NSObject, ObservableObject {
         return .proceed
     }
 
-    /// User-facing copy for a failed finalize. A timeout is honest that the audio is safe locally and
-    /// recoverable via Retry, since the durable directory outlives the timed-out network step.
-    nonisolated static func finalizeFailureMessage(for error: Error) -> String {
+    /// User-facing copy for a failed finalize. featureUnavailable names the host and reassures the
+    /// audio is saved (the entitlement is an account setting, not a recording fault); a timeout is
+    /// honest that the audio is safe locally and recoverable via Retry, since the durable directory
+    /// outlives the timed-out network step.
+    nonisolated static func finalizeFailureMessage(for error: Error, host: String?) -> String {
+        if case MinutiaClientError.featureUnavailable = error {
+            return "Transcription is not enabled for this account on \(host ?? "the server"). Your audio is saved. Ask your workspace admin to enable AI features."
+        }
         if error is TimeoutError {
             return "Finishing the recording timed out. Your audio is saved locally; Retry to finish uploading."
         }
@@ -491,6 +499,13 @@ final class AppController: NSObject, ObservableObject {
             self.apply(.failed(message))
         }
 
+        // A fast-lane segment register hit the account-lacks-AI terminal 403 mid-recording. Recording
+        // and uploads keep going; surface it once through the existing in-menu feedback banner, which
+        // persists through the .recording phase and clears on the next transition.
+        captureSession.onTranscriptionUnavailable = { [weak self] in
+            self?.recordFeedback = "Transcription is not enabled for this account. Audio keeps recording and will be saved."
+        }
+
         authManager.$sessionIdentity
             .removeDuplicates()
             .sink { [weak self] identity in self?.handleAuthChange(signedIn: identity.email != nil) }
@@ -507,6 +522,11 @@ final class AppController: NSObject, ObservableObject {
     /// Connect step. Idempotent with SignInView's on-appear auto-connect.
     func restoreSession() async {
         try? await authManager.ensureConnected()
+        // Recover orphaned captures on every launch, not only on a sign-in transition: a warm launch
+        // restoring a Keychain session emits no signedIn transition, so a recording orphaned by a
+        // prior crash would otherwise sit unrescued across relaunches. Single-flight and self-guarded
+        // (no client, or a sweep already running, makes this a no-op).
+        runRecovery()
     }
 
     // MARK: - Phase transitions
@@ -872,7 +892,7 @@ final class AppController: NSObject, ObservableObject {
                 // The durable directory survives a timed-out finalize, so Retry finishes the upload
                 // rather than starting a new recording.
                 lastFailedStart = meetingId.map { .finalize(meetingId: $0.uuidString) } ?? .series
-                apply(.failed(Self.finalizeFailureMessage(for: error)))
+                apply(.failed(Self.finalizeFailureMessage(for: error, host: instance?.host)))
             }
         }
     }
@@ -892,7 +912,8 @@ final class AppController: NSObject, ObservableObject {
                 recordingInstance = nil
                 apply(.finalized)
             } catch {
-                apply(.failed(Self.finalizeFailureMessage(for: error)))
+                // stop() threw, so recordingInstance was not cleared: it still names the host.
+                apply(.failed(Self.finalizeFailureMessage(for: error, host: recordingInstance?.host)))
             }
         case .awaitFinalizing:
             // A stop is already in flight (the user pressed Stop, then quit). Calling stop() again
@@ -925,16 +946,71 @@ final class AppController: NSObject, ObservableObject {
         recoveryActive = true
         recoveryTask = Task { [weak self] in
             let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
-            let recovered = await Self.recoverAll(
+            let result = await Self.recoverAll(
                 client: client, instance: instance, connectedUserId: userId, excluding: activeId)
             // Recovery is otherwise silent; tell the user each rescued meeting is being finished, and
             // make tapping the notification open its recap.
-            for manifest in recovered {
+            for manifest in result.recovered {
                 await self?.postRecoveryNotification(manifest: manifest, client: client)
+            }
+            // A recovered recording whose account lacks the AI entitlement keeps its audio but cannot
+            // be transcribed; tell the user once (per directory) rather than swallowing it silently.
+            if !result.transcriptionUnavailable.isEmpty {
+                Self.postNotification(
+                    title: "Transcription unavailable",
+                    body: "Transcription is not enabled for this account on \(instance.host ?? "the server"). The recording is saved.")
+            }
+            // A recording that has failed to finalize past the attempt ceiling is treated as
+            // deterministically dead: tell the user once, keep the audio, stop retrying it.
+            if !result.exhausted.isEmpty {
+                Self.postNotification(
+                    title: "Recording could not be finished",
+                    body: "A saved recording could not be finished after several attempts. The audio is kept in Application Support.")
             }
             self?.recoveryActive = false
             self?.recoveryTask = nil
         }
+    }
+
+    /// How the startup recovery sweep should treat a per-directory finalize result. A
+    /// featureUnavailable is terminal-but-not-lost (keep the audio, tell the user); any other error is
+    /// retried on the next launch. Pure so the branch matrix is tested without a live client.
+    enum RecoveryOutcome: Equatable {
+        case recovered
+        case transcriptionUnavailable
+        case retryLater
+    }
+
+    nonisolated static func recoveryOutcome(for error: Error?) -> RecoveryOutcome {
+        guard let error else { return .recovered }
+        if case MinutiaClientError.featureUnavailable = error { return .transcriptionUnavailable }
+        return .retryLater
+    }
+
+    /// After this many consecutive failed finalizes a capture is treated as deterministically dead:
+    /// the sweep stops attempting it (the audio is kept) so a launch loop never retries it forever.
+    static let maxRecoveryAttempts = 5
+
+    /// The sweep's decision for one orphaned directory, given how many times its recovery has already
+    /// failed (the manifest's persisted count before this launch). Pure so the bound is tested without
+    /// a live client.
+    struct RecoverySweep: Equatable {
+        /// Skip the directory entirely: the attempt ceiling is reached, so leave it alone (audio kept,
+        /// no work, no repeat notification).
+        let skip: Bool
+        /// The count to persist if this launch's recovery also fails (prior + 1, held at the ceiling).
+        let nextAttempts: Int
+        /// Post the one-time "could not be finished" notification: true only on the attempt that
+        /// reaches the ceiling, so it fires exactly once across all launches.
+        let notifyOnExhaustion: Bool
+    }
+
+    nonisolated static func recoverySweep(priorAttempts: Int) -> RecoverySweep {
+        if priorAttempts >= maxRecoveryAttempts {
+            return RecoverySweep(skip: true, nextAttempts: priorAttempts, notifyOnExhaustion: false)
+        }
+        let next = priorAttempts + 1
+        return RecoverySweep(skip: false, nextAttempts: next, notifyOnExhaustion: next >= maxRecoveryAttempts)
     }
 
     /// Sweeps orphaned capture directories, finalizing each recoverable one, and returns the
@@ -942,25 +1018,57 @@ final class AppController: NSObject, ObservableObject {
     /// static so it stays testable and off the main actor.
     nonisolated static func recoverAll(
         client: MinutiaClient, instance: URL, connectedUserId: String?, excluding activeMeetingId: String?
-    ) async -> [CaptureManifest] {
+    ) async -> (recovered: [CaptureManifest], transcriptionUnavailable: [CaptureManifest], exhausted: [CaptureManifest]) {
         var recovered: [CaptureManifest] = []
-        guard let root = try? CaptureStore.capturesRoot() else { return recovered }
+        var transcriptionUnavailable: [CaptureManifest] = []
+        var exhausted: [CaptureManifest] = []
+        guard let root = try? CaptureStore.capturesRoot() else { return (recovered, transcriptionUnavailable, exhausted) }
         for dir in CaptureRecovery.recoverableDirectories(in: root, excluding: activeMeetingId) {
-            guard let manifest = CaptureRecovery.loadManifest(from: dir) else { continue }
+            guard let manifest = CaptureRecovery.loadManifest(from: dir) else {
+                logger.error("Recovery: unreadable manifest at \(dir.lastPathComponent, privacy: .public)")
+                continue
+            }
             // Skip dirs captured against a different instance or a different user: the current client
             // cannot finalize a meeting that does not exist for this session, and retrying orphans it
             // forever.
             guard CaptureRecovery.shouldRecover(
                 manifest: manifest, connectedInstance: instance, connectedUserId: connectedUserId) else { continue }
+            // A capture that has failed too many times is deterministically dead: leave it (audio kept)
+            // rather than retrying it on every launch. The exhaustion notification already fired once.
+            let sweep = recoverySweep(priorAttempts: manifest.recoveryAttempts)
+            if sweep.skip { continue }
+            var caught: Error?
             do {
                 try await CaptureRecovery.recover(directory: dir, manifest: manifest, client: client)
+            } catch {
+                caught = error
+            }
+            switch recoveryOutcome(for: caught) {
+            case .recovered:
                 try? FileManager.default.removeItem(at: dir)
                 recovered.append(manifest)
-            } catch {
-                // Best-effort: leave the directory for the next launch to retry.
+            case .transcriptionUnavailable:
+                // Keep the directory: the audio is safe (uploaded + finalized) and the entitlement may
+                // be granted later. Never delete on featureUnavailable. Logged every sweep, but the
+                // user-facing notification fires once per directory (persisted `notified` flag).
+                logger.error("Recovery: transcription not enabled for meeting \(manifest.meetingId, privacy: .public)")
+                if !manifest.notified {
+                    var updated = manifest
+                    updated.notified = true
+                    CaptureRecovery.saveManifest(updated, to: dir)
+                    transcriptionUnavailable.append(manifest)
+                }
+            case .retryLater:
+                // Persist the incremented attempt count so the bound survives relaunches. Keep the
+                // audio; when the count reaches the ceiling, notify the user exactly once.
+                var updated = manifest
+                updated.recoveryAttempts = sweep.nextAttempts
+                CaptureRecovery.saveManifest(updated, to: dir)
+                logger.error("Recovery deferred for meeting \(manifest.meetingId, privacy: .public) attempt \(sweep.nextAttempts, privacy: .public): \(String(describing: caught), privacy: .public)")
+                if sweep.notifyOnExhaustion { exhausted.append(manifest) }
             }
         }
-        return recovered
+        return (recovered, transcriptionUnavailable, exhausted)
     }
 
     /// Posts the "Recovered your recording" notification, carrying the recap URL in userInfo so the
@@ -1023,7 +1131,7 @@ final class AppController: NSObject, ObservableObject {
                 // Re-arm the finalize target: apply(.refinalizeStarted) moved through .finalizing,
                 // which retires lastFailedStart, so set it again before parking back in .error.
                 lastFailedStart = .finalize(meetingId: meetingId)
-                apply(.failed(Self.finalizeFailureMessage(for: error)))
+                apply(.failed(Self.finalizeFailureMessage(for: error, host: authManager.instance?.host)))
             }
         }
     }

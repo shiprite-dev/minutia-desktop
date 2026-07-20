@@ -29,11 +29,15 @@ actor UploadQueue {
     private let sleep: @Sendable (TimeInterval) async -> Void
     private let onProgress: @Sendable (Int) async -> Void
     private let onReconnecting: @Sendable (Bool) async -> Void
+    private let onFeatureUnavailable: @Sendable () async -> Void
 
     private var uploaded = 0
     private var registered = 0
     private var failed = 0
     private var reconnecting = false
+    /// Fired at most once per queue (one recording session): the account lacks the AI entitlement,
+    /// so every remaining segment would hit the same terminal 403. One signal, no banner spam.
+    private var featureUnavailableSignaled = false
 
     // Nonisolated intake so a synchronous caller (the audio tick) hands a segment over without a
     // detached Task or an actor hop. drainAndWait snapshots under the same lock, so every segment
@@ -50,13 +54,15 @@ actor UploadQueue {
         meetingId: String,
         sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
         onProgress: @escaping @Sendable (Int) async -> Void = { _ in },
-        onReconnecting: @escaping @Sendable (Bool) async -> Void = { _ in }
+        onReconnecting: @escaping @Sendable (Bool) async -> Void = { _ in },
+        onFeatureUnavailable: @escaping @Sendable () async -> Void = {}
     ) {
         self.transport = transport
         self.meetingId = meetingId
         self.sleep = sleep
         self.onProgress = onProgress
         self.onReconnecting = onReconnecting
+        self.onFeatureUnavailable = onFeatureUnavailable
     }
 
     /// Backoff table between attempts: 1, 2, 4, 8, 16, 32, then 60 capped, in seconds.
@@ -123,6 +129,11 @@ actor UploadQueue {
                     registered += 1
                 }
                 return
+            } catch MinutiaClientError.featureUnavailable {
+                // Terminal entitlement failure: retrying is futile. The upload already landed, so the
+                // segment stays uploaded-but-not-registered (never counted failed); signal once.
+                await signalFeatureUnavailable()
+                return
             } catch {
                 if attempt >= Self.maxAttempts {
                     failed += 1
@@ -143,5 +154,12 @@ actor UploadQueue {
         guard reconnecting != value else { return }
         reconnecting = value
         await onReconnecting(value)
+    }
+
+    /// Fires the entitlement-missing signal at most once for the queue's lifetime.
+    private func signalFeatureUnavailable() async {
+        guard !featureUnavailableSignaled else { return }
+        featureUnavailableSignaled = true
+        await onFeatureUnavailable()
     }
 }

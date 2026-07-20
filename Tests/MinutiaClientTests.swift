@@ -357,14 +357,15 @@ final class RegisterSegmentStatusMappingTests: XCTestCase {
         }
     }
 
-    /// 2xx/409 succeed; 401/403 throw so the backoff retries with a refreshed token (supabase-swift
-    /// refreshes transparently, so an auth failure here is transient far more often than terminal);
-    /// 503 and the other 4xx give up (false, terminal); 5xx other than 503 retry (throw).
+    /// 2xx/409 succeed; a bare 401 throws so the backoff retries with a refreshed token (supabase-swift
+    /// refreshes transparently); a 403 without the entitlement code, 503, and the other 4xx give up
+    /// (false, terminal), so a proxy-mangled 403 never degrades into a silent retry storm; 5xx other
+    /// than 503 retry (throw).
     func test_registerSegment_mapsEachStatusToContractResult() async {
         let expected: [Int: Bool?] = [
             200: true, 409: true,
-            400: false, 402: false, 404: false, 415: false, 503: false,
-            401: nil, 403: nil, 500: nil, 502: nil,
+            400: false, 402: false, 403: false, 404: false, 415: false, 503: false,
+            401: nil, 500: nil, 502: nil,
         ]
 
         for (status, outcome) in expected {
@@ -426,7 +427,7 @@ final class RequestTranscriptionStatusTests: XCTestCase {
         }
     }
 
-    /// A 401/403 (auth) or any other 4xx, and every non-503 5xx, throws serverError so the caller
+    /// A 401 (auth), a bare 403, any other 4xx, and every non-503 5xx throws serverError so the caller
     /// keeps the local audio instead of deleting it with no server transcript.
     func test_requestTranscription_throwsOnAnyStatusOutside2xxAnd503() async {
         for status in [400, 401, 403, 404, 500, 502] {
@@ -442,6 +443,112 @@ final class RequestTranscriptionStatusTests: XCTestCase {
             } catch {
                 XCTFail("status \(status) threw unexpected error \(error)")
             }
+        }
+    }
+}
+
+/// The single tested seam that turns a transcribe-route (status, body) into a retry/terminal
+/// decision. Pins the entitlement-failure case (403 + FEATURE_UNAVAILABLE) apart from a bare or
+/// proxy-mangled 403 (terminal, never a silent retry storm), and every other branch
+/// registerSegment/requestTranscription rely on.
+final class TranscribeResponseClassifyTests: XCTestCase {
+    private func body(_ json: String) -> Data { Data(json.utf8) }
+
+    func test_classify_2xxIsOk() {
+        XCTAssertEqual(MinutiaClient.classify(status: 200, body: nil), .ok)
+        XCTAssertEqual(MinutiaClient.classify(status: 204, body: Data()), .ok)
+    }
+
+    func test_classify_403WithFeatureUnavailableCodeIsFeatureUnavailable() {
+        XCTAssertEqual(
+            MinutiaClient.classify(status: 403, body: body(#"{"code":"FEATURE_UNAVAILABLE"}"#)),
+            .featureUnavailable)
+    }
+
+    func test_classify_403WithOtherOrMissingCodeIsTerminalOther() {
+        XCTAssertEqual(MinutiaClient.classify(status: 403, body: body(#"{"code":"FORBIDDEN"}"#)), .terminalOther)
+        XCTAssertEqual(MinutiaClient.classify(status: 403, body: body("{}")), .terminalOther)
+    }
+
+    func test_classify_403WithNoOrHtmlBodyIsTerminalOther() {
+        XCTAssertEqual(MinutiaClient.classify(status: 403, body: nil), .terminalOther)
+        XCTAssertEqual(MinutiaClient.classify(status: 403, body: Data()), .terminalOther)
+        XCTAssertEqual(
+            MinutiaClient.classify(status: 403, body: body("<html><body>403 Forbidden</body></html>")),
+            .terminalOther)
+    }
+
+    func test_classify_401IsAuthExpired() {
+        XCTAssertEqual(MinutiaClient.classify(status: 401, body: nil), .authExpired)
+    }
+
+    func test_classify_5xxIsTransientRetryable() {
+        XCTAssertEqual(MinutiaClient.classify(status: 500, body: nil), .transientRetryable)
+        XCTAssertEqual(MinutiaClient.classify(status: 502, body: nil), .transientRetryable)
+    }
+
+    func test_classify_503AndOther4xxAreTerminalOther() {
+        for status in [400, 402, 404, 415, 503] {
+            XCTAssertEqual(MinutiaClient.classify(status: status, body: nil), .terminalOther, "status \(status)")
+        }
+    }
+
+    func test_classify_zeroStatusIsTransientRetryable() {
+        XCTAssertEqual(MinutiaClient.classify(status: 0, body: nil), .transientRetryable)
+    }
+}
+
+/// Wires the classification through the two live ops: a 403 carrying FEATURE_UNAVAILABLE becomes the
+/// distinct featureUnavailable error (terminal, surfaced), while a bare 403 is terminal-other (register
+/// returns false, no retry storm).
+final class TranscribeFeatureUnavailableTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        URLProtocol.registerClass(URLProtocolStub.self)
+    }
+
+    override func tearDown() {
+        URLProtocolStub.responseHandler = nil
+        URLProtocol.unregisterClass(URLProtocolStub.self)
+        super.tearDown()
+    }
+
+    private func stub(status: Int, json: String) {
+        URLProtocolStub.responseHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
+            return (Data(json.utf8), response)
+        }
+    }
+
+    func test_registerSegment_throwsFeatureUnavailableFor403Code() async {
+        stub(status: 403, json: #"{"code":"FEATURE_UNAVAILABLE"}"#)
+        do {
+            _ = try await makeStubbedClient().registerSegment(meetingId: "m1", seq: 0)
+            XCTFail("expected featureUnavailable throw")
+        } catch MinutiaClientError.featureUnavailable {
+        } catch {
+            XCTFail("unexpected error \(error)")
+        }
+    }
+
+    func test_registerSegment_bare403IsTerminalReturnsFalse() async {
+        stub(status: 403, json: #"{"code":"FORBIDDEN"}"#)
+        do {
+            let result = try await makeStubbedClient().registerSegment(meetingId: "m1", seq: 0)
+            XCTAssertFalse(result, "a 403 without FEATURE_UNAVAILABLE is terminal, not a retryable auth expiry")
+        } catch {
+            XCTFail("unexpected error \(error)")
+        }
+    }
+
+    func test_requestTranscription_throwsFeatureUnavailableFor403Code() async {
+        stub(status: 403, json: #"{"code":"FEATURE_UNAVAILABLE"}"#)
+        do {
+            try await makeStubbedClient().requestTranscription(meetingId: "m1", expectedSegments: nil)
+            XCTFail("expected featureUnavailable throw")
+        } catch MinutiaClientError.featureUnavailable {
+        } catch {
+            XCTFail("unexpected error \(error)")
         }
     }
 }

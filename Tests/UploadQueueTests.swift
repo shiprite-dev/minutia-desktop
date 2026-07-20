@@ -10,6 +10,7 @@ private final class StubTransport: SegmentTransport, @unchecked Sendable {
         var registerFailures = 0      // register throws this many times before succeeding
         var registerAlwaysThrows = false
         var registerResult = true     // terminal return once register stops throwing
+        var registerThrowsFeatureUnavailable = false  // every register attempt throws the terminal 403
     }
 
     struct StubError: Error {}
@@ -39,6 +40,7 @@ private final class StubTransport: SegmentTransport, @unchecked Sendable {
     func registerSegment(meetingId: String, seq: Int) async throws -> Bool {
         lock.lock(); defer { lock.unlock() }
         _registerAttempts += 1
+        if behavior.registerThrowsFeatureUnavailable { throw MinutiaClientError.featureUnavailable }
         if behavior.registerAlwaysThrows { throw StubError() }
         if _registerAttempts <= behavior.registerFailures { throw StubError() }
         _registered += 1
@@ -50,6 +52,12 @@ private final class StubTransport: SegmentTransport, @unchecked Sendable {
 private actor ReconnectRecorder {
     private(set) var events: [Bool] = []
     func record(_ value: Bool) { events.append(value) }
+}
+
+/// Counts how many times the queue fires its featureUnavailable signal, to prove it is once-per-session.
+private actor SignalCounter {
+    private(set) var count = 0
+    func increment() { count += 1 }
 }
 
 final class UploadQueueBackoffTests: XCTestCase {
@@ -208,6 +216,27 @@ final class UploadQueueBehaviorTests: XCTestCase {
         XCTAssertEqual(counts.failed, 0)
         let events = await recorder.events
         XCTAssertEqual(events, [true, false], "true after the 3rd failed attempt, false once upload succeeds")
+    }
+
+    func test_featureUnavailableRegister_signalsOnceUploadsContinueNoRetry() async {
+        // The account lacks the AI entitlement: every segment's register hits the same terminal 403.
+        // Uploads still land (not a hard failure), register is attempted exactly once per segment (no
+        // futile retry), and the user-facing signal fires once for the whole session, not per segment.
+        let transport = StubTransport(behavior: .init(registerThrowsFeatureUnavailable: true))
+        let counter = SignalCounter()
+        let queue = UploadQueue(
+            transport: transport, meetingId: "m1",
+            sleep: { _ in }, onFeatureUnavailable: { await counter.increment() })
+        queue.enqueue(segment(0))
+        queue.enqueue(segment(1))
+        let counts = await queue.drainAndWait()
+
+        XCTAssertEqual(counts.uploaded, 2, "uploads still succeed")
+        XCTAssertEqual(counts.registered, 0, "featureUnavailable never registers")
+        XCTAssertEqual(counts.failed, 0, "not counted as a hard failure")
+        XCTAssertEqual(transport.registerAttempts, 2, "one register attempt per segment, never retried")
+        let signals = await counter.count
+        XCTAssertEqual(signals, 1, "one signal for the session, no banner spam")
     }
 
     func test_cancelAll_haltsRetryLoopBeforeMaxAttempts() async {

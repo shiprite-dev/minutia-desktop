@@ -72,15 +72,76 @@ final class RecordingLifecycleDecisionsTests: XCTestCase {
 
     func test_finalizeFailureMessage_timeoutIsHonestAudioIsSafe() {
         XCTAssertEqual(
-            AppController.finalizeFailureMessage(for: TimeoutError()),
+            AppController.finalizeFailureMessage(for: TimeoutError(), host: "minutia.example.com"),
             "Finishing the recording timed out. Your audio is saved locally; Retry to finish uploading.")
     }
 
     func test_finalizeFailureMessage_otherErrorUsesLocalizedDescription() {
         struct Boom: LocalizedError { var errorDescription: String? { "network down" } }
         XCTAssertEqual(
-            AppController.finalizeFailureMessage(for: Boom()),
+            AppController.finalizeFailureMessage(for: Boom(), host: "minutia.example.com"),
             "Could not finish recording: network down")
+    }
+
+    /// featureUnavailable names the host and reassures the audio is saved; a nil host (an instance
+    /// URL with no host component) falls back to "the server".
+    func test_finalizeFailureMessage_featureUnavailableNamesHost() {
+        XCTAssertEqual(
+            AppController.finalizeFailureMessage(for: MinutiaClientError.featureUnavailable, host: "acme.getminutia.com"),
+            "Transcription is not enabled for this account on acme.getminutia.com. Your audio is saved. Ask your workspace admin to enable AI features.")
+    }
+
+    func test_finalizeFailureMessage_featureUnavailableNilHostFallsBackToServer() {
+        XCTAssertEqual(
+            AppController.finalizeFailureMessage(for: MinutiaClientError.featureUnavailable, host: nil),
+            "Transcription is not enabled for this account on the server. Your audio is saved. Ask your workspace admin to enable AI features.")
+    }
+
+    // MARK: - Startup recovery outcome
+
+    func test_recoveryOutcome_nilErrorIsRecovered() {
+        XCTAssertEqual(AppController.recoveryOutcome(for: nil), .recovered)
+    }
+
+    func test_recoveryOutcome_featureUnavailableNotifiesAndKeeps() {
+        XCTAssertEqual(
+            AppController.recoveryOutcome(for: MinutiaClientError.featureUnavailable),
+            .transcriptionUnavailable)
+    }
+
+    func test_recoveryOutcome_otherErrorsRetryNextLaunch() {
+        struct Boom: Error {}
+        XCTAssertEqual(AppController.recoveryOutcome(for: Boom()), .retryLater)
+        XCTAssertEqual(AppController.recoveryOutcome(for: MinutiaClientError.serverError(status: 500)), .retryLater)
+    }
+
+    // MARK: - Startup recovery attempt bound
+
+    /// A fresh or mid-way capture is still attempted, incrementing the persisted count; the count that
+    /// reaches the ceiling notifies exactly once; at or past the ceiling the sweep skips the directory
+    /// entirely (audio kept) so a dead recording never retries on every launch forever.
+    func test_recoverySweep_belowCeilingAttemptsAndIncrements() {
+        XCTAssertEqual(
+            AppController.recoverySweep(priorAttempts: 0),
+            .init(skip: false, nextAttempts: 1, notifyOnExhaustion: false))
+    }
+
+    func test_recoverySweep_lastAttemptReachesCeilingAndNotifiesOnce() {
+        XCTAssertEqual(
+            AppController.recoverySweep(priorAttempts: AppController.maxRecoveryAttempts - 1),
+            .init(skip: false, nextAttempts: AppController.maxRecoveryAttempts, notifyOnExhaustion: true))
+    }
+
+    func test_recoverySweep_atCeilingSkipsWithoutReNotifying() {
+        XCTAssertEqual(
+            AppController.recoverySweep(priorAttempts: AppController.maxRecoveryAttempts),
+            .init(skip: true, nextAttempts: AppController.maxRecoveryAttempts, notifyOnExhaustion: false))
+    }
+
+    func test_recoverySweep_pastCeilingStaysSkippedAndSilent() {
+        XCTAssertEqual(
+            AppController.recoverySweep(priorAttempts: AppController.maxRecoveryAttempts + 1),
+            .init(skip: true, nextAttempts: AppController.maxRecoveryAttempts + 1, notifyOnExhaustion: false))
     }
 
     // MARK: - B8: mic pre-check gate

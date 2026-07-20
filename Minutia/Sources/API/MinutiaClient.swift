@@ -26,9 +26,12 @@ private struct AgendaResponse: Codable {
     let events: [AgendaItem]
 }
 
-enum MinutiaClientError: Error {
+enum MinutiaClientError: Error, Equatable {
     /// A retriable server failure (5xx other than the terminal 503).
     case serverError(status: Int)
+    /// The account lacks the AI transcription entitlement: a 403 whose JSON body carries
+    /// code "FEATURE_UNAVAILABLE". Terminal (no retry) and surfaced to the user, never swallowed.
+    case featureUnavailable
 }
 
 /// API contract layer: pure request builders (unit tested) plus thin async ops
@@ -138,6 +141,44 @@ struct MinutiaClient {
         return request
     }
 
+    // MARK: - Response classification
+
+    /// The single classification of a transcribe-route HTTP response, shared by `registerSegment`
+    /// and `requestTranscription` so the terminal-vs-retry decision lives in one tested place.
+    enum ResponseClass: Equatable {
+        case ok
+        /// 403 with body code "FEATURE_UNAVAILABLE": the account has no AI entitlement. Terminal.
+        case featureUnavailable
+        /// Bare 401: supabase-swift refreshes the token transparently, so this retries.
+        case authExpired
+        /// 5xx (other than the legacy terminal 503) and network/timeout: retry with backoff.
+        case transientRetryable
+        /// A 403 without the entitlement code, other terminal 4xx, and 503: retrying will not succeed.
+        case terminalOther
+    }
+
+    /// Pure: depends only on the status and the optional JSON body. A 403 carrying
+    /// {"code":"FEATURE_UNAVAILABLE"} is the entitlement failure; a bare 401 is a token expiry, but a
+    /// 403 without that code is terminal (a proxy-mangled or genuinely-forbidden body, not a
+    /// refreshable token) so it never degrades into a silent retry storm.
+    static func classify(status: Int, body: Data?) -> ResponseClass {
+        if (200...299).contains(status) { return .ok }
+        if status == 403 {
+            return Self.errorCode(from: body) == "FEATURE_UNAVAILABLE" ? .featureUnavailable : .terminalOther
+        }
+        if status == 401 { return .authExpired }
+        if status == 503 { return .terminalOther }
+        if (500...599).contains(status) { return .transientRetryable }
+        if (400...499).contains(status) { return .terminalOther }
+        return .transientRetryable
+    }
+
+    private static func errorCode(from body: Data?) -> String? {
+        guard let body, !body.isEmpty else { return nil }
+        struct ErrorEnvelope: Decodable { let code: String? }
+        return (try? JSONDecoder().decode(ErrorEnvelope.self, from: body))?.code
+    }
+
     // MARK: - Async ops
 
     func ownedSeries() async throws -> [Series] {
@@ -171,21 +212,24 @@ struct MinutiaClient {
     func registerSegment(meetingId: String, seq: Int) async throws -> Bool {
         let token = try await tokenProvider()
         let request = Self.registerSegmentRequest(instance: instance, meetingId: meetingId, seq: seq, token: token)
-        let (_, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
 
-        if (200...299).contains(status) || status == 409 { return true }
-        // 401/403 are transient far more often than terminal here: supabase-swift refreshes the
-        // access token transparently, so throwing lets UploadQueue's backoff retry with a fresh
-        // token instead of abandoning the segment as unregistered.
-        if status == 401 || status == 403 {
+        if status == 409 { return true }
+        switch Self.classify(status: status, body: data) {
+        case .ok:
+            return true
+        case .featureUnavailable:
+            // Terminal and account-wide: the entitlement will not appear mid-retry. Throw so
+            // UploadQueue stops retrying and surfaces it once, rather than spinning to the ceiling.
+            throw MinutiaClientError.featureUnavailable
+        case .authExpired, .transientRetryable:
+            // authExpired throws so the backoff retries with a token supabase-swift refreshes.
             throw MinutiaClientError.serverError(status: status)
-        }
-        if status == 503 || (400...499).contains(status) {
+        case .terminalOther:
             Self.logger.notice("Segment transcription terminal status \(status, privacy: .public) for meeting \(meetingId, privacy: .public) seq \(seq)")
             return false
         }
-        throw MinutiaClientError.serverError(status: status)
     }
 
     func uploadRecording(meetingId: String, fileURL: URL) async throws -> String {
@@ -219,16 +263,25 @@ struct MinutiaClient {
     func requestTranscription(meetingId: String, expectedSegments: Int?) async throws {
         let token = try await tokenProvider()
         let request = Self.finalTranscribeRequest(instance: instance, meetingId: meetingId, expectedSegments: expectedSegments, token: token)
-        let (_, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if !(200...299).contains(status) {
             Self.logger.notice("requestTranscription non-2xx status \(status, privacy: .public) for meeting \(meetingId, privacy: .public)")
         }
-        // Any status outside 2xx and the terminal 503 must throw so the caller never treats the
-        // request as accepted: on the stop path a false "accepted" deletes the local audio with no
-        // server transcript (data loss). 503 is terminal-not-configured; the transcript can still be
-        // assembled from fast-lane segments, so it alone is not a hard failure.
-        if !(200...299).contains(status) && status != 503 {
+        switch Self.classify(status: status, body: data) {
+        case .ok:
+            return
+        case .featureUnavailable:
+            // The stop path must tell the user and keep the local audio, never delete it silently.
+            throw MinutiaClientError.featureUnavailable
+        case .authExpired, .transientRetryable:
+            throw MinutiaClientError.serverError(status: status)
+        case .terminalOther:
+            // 503 is the legacy "transcription not configured" signal: the transcript can still be
+            // assembled from the fast-lane segments, so it alone is not a hard failure. Every other
+            // terminal 4xx must throw so the caller never treats the request as accepted and deletes
+            // the local audio with no server transcript (data loss).
+            if status == 503 { return }
             throw MinutiaClientError.serverError(status: status)
         }
     }

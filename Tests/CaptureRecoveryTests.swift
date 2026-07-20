@@ -37,6 +37,31 @@ final class CaptureManifestTests: XCTestCase {
         XCTAssertNil(decoded.userId)
         XCTAssertEqual(decoded.meetingId, "abc")
     }
+
+    // Manifests written before the recovery-bound fields must decode with defaults (0 attempts, not
+    // notified), so an orphaned recording from an older build is swept normally, not skipped or lost.
+    func test_decode_missingRecoveryFieldsDefaultToZeroAndFalse() throws {
+        let json = """
+        {"meetingId":"abc","seriesId":null,"instanceURL":"https://x.example","userId":null,"createdAt":0}
+        """.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode(CaptureManifest.self, from: json)
+        XCTAssertEqual(decoded.recoveryAttempts, 0)
+        XCTAssertFalse(decoded.notified)
+    }
+
+    func test_roundTrip_preservesRecoveryAttemptsAndNotified() throws {
+        let manifest = CaptureManifest(
+            meetingId: "abc", seriesId: nil,
+            instanceURL: URL(string: "https://x.example")!,
+            userId: nil,
+            createdAt: Date(timeIntervalSince1970: 0),
+            recoveryAttempts: 4, notified: true)
+        let decoded = try JSONDecoder().decode(
+            CaptureManifest.self, from: try JSONEncoder().encode(manifest))
+        XCTAssertEqual(decoded.recoveryAttempts, 4)
+        XCTAssertTrue(decoded.notified)
+        XCTAssertEqual(decoded, manifest)
+    }
 }
 
 final class CaptureRecoveryDirectoriesTests: XCTestCase {
