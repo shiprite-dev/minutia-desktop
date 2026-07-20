@@ -29,6 +29,35 @@ struct CaptureManifest: Codable, Equatable {
     /// treated as recoverable.
     let userId: String?
     let createdAt: Date
+    /// How many startup recovery finalizes have already failed for this capture. Bounds the sweep: at
+    /// the ceiling the directory is left alone so a deterministically-dead recording never retries on
+    /// every launch forever. Older manifests have no field and decode as 0.
+    var recoveryAttempts: Int
+    /// True once the terminal "transcription unavailable" notification has been posted for this
+    /// directory, so it is not re-posted on every later launch or auth transition. Decodes false.
+    var notified: Bool
+
+    init(meetingId: String, seriesId: String?, instanceURL: URL, userId: String?, createdAt: Date,
+         recoveryAttempts: Int = 0, notified: Bool = false) {
+        self.meetingId = meetingId
+        self.seriesId = seriesId
+        self.instanceURL = instanceURL
+        self.userId = userId
+        self.createdAt = createdAt
+        self.recoveryAttempts = recoveryAttempts
+        self.notified = notified
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        meetingId = try c.decode(String.self, forKey: .meetingId)
+        seriesId = try c.decodeIfPresent(String.self, forKey: .seriesId)
+        instanceURL = try c.decode(URL.self, forKey: .instanceURL)
+        userId = try c.decodeIfPresent(String.self, forKey: .userId)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        recoveryAttempts = try c.decodeIfPresent(Int.self, forKey: .recoveryAttempts) ?? 0
+        notified = try c.decodeIfPresent(Bool.self, forKey: .notified) ?? false
+    }
 }
 
 /// Startup salvage for capture directories left behind by a quit, crash, or fatal mid-recording.
@@ -63,6 +92,12 @@ enum CaptureRecovery {
     static func loadManifest(from directory: URL) -> CaptureManifest? {
         guard let data = try? Data(contentsOf: directory.appendingPathComponent(manifestName)) else { return nil }
         return try? JSONDecoder().decode(CaptureManifest.self, from: data)
+    }
+
+    /// Rewrites the manifest in place so the sweep's persisted counters (recoveryAttempts, notified)
+    /// survive across launches. Best-effort: a write failure just means the next launch re-derives.
+    static func saveManifest(_ manifest: CaptureManifest, to directory: URL) {
+        try? JSONEncoder().encode(manifest).write(to: directory.appendingPathComponent(manifestName))
     }
 
     /// Recovery is scoped to the connected instance: a recording captured against instance A must

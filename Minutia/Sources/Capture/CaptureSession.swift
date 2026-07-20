@@ -25,6 +25,10 @@ final class CaptureSession: ObservableObject {
     /// stall keeps the partial audio; a zero-frame mic denial does not). Invoked on the main actor.
     var onFailure: (@MainActor (String, Bool) -> Void)?
 
+    /// Fired once per recording when a fast-lane segment register returns the account-lacks-AI
+    /// terminal 403. Recording and uploads continue; the controller surfaces a single banner.
+    var onTranscriptionUnavailable: (@MainActor () -> Void)?
+
     struct StopResult {
         let expectedSegments: Int?
         let transcriptRequested: Bool
@@ -94,6 +98,12 @@ final class CaptureSession: ObservableObject {
                 await MainActor.run {
                     guard let self, self.captureGeneration == generation else { return }
                     self.reconnecting = value
+                }
+            },
+            onFeatureUnavailable: { [weak self] in
+                await MainActor.run {
+                    guard let self, self.captureGeneration == generation else { return }
+                    self.onTranscriptionUnavailable?()
                 }
             }
         )
@@ -176,14 +186,12 @@ final class CaptureSession: ObservableObject {
             }
 
             let expected = allRegistered ? total : nil
-            var transcriptRequested = false
-            do {
-                try await client.requestTranscription(meetingId: meetingId, expectedSegments: expected)
-                transcriptRequested = true
-            } catch {
-                transcriptRequested = false
-            }
-            return (counts: counts, expected: expected, transcriptRequested: transcriptRequested)
+            // A failed requestTranscription must never read as an accepted transcript: it rethrows so
+            // the controller shows .failed (Retry re-runs refinalize) and the audio directory is kept
+            // below, deleted only when the request truly succeeds (a 2xx, or the terminal-503 the
+            // client treats as not-lost since the transcript assembles from fast-lane segments).
+            try await client.requestTranscription(meetingId: meetingId, expectedSegments: expected)
+            return (counts: counts, expected: expected, transcriptRequested: true)
         }
 
         segmentsUploaded = outcome.counts.uploaded
