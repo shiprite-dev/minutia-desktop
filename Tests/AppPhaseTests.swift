@@ -11,6 +11,11 @@ final class AppPhaseTests: XCTestCase {
         XCTAssertEqual(AppPhase.idle.next(.meetingDetected(nil)), .detected(app: nil))
     }
 
+    func test_idle_meetingDetectedBrowserLabel_goesToDetected() {
+        XCTAssertEqual(
+            AppPhase.idle.next(.meetingDetected("browser meeting")), .detected(app: "browser meeting"))
+    }
+
     func test_detected_recordStarted_goesToRecording() {
         XCTAssertEqual(AppPhase.detected(app: "Zoom").next(.recordStarted), .recording)
     }

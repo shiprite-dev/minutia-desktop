@@ -37,6 +37,21 @@ final class DetectionLabelTests: XCTestCase {
     func test_detectionLabel_mapsAppsAndCalendarFallback() {
         XCTAssertEqual(AppController.detectionLabel(.zoom), "Zoom")
         XCTAssertEqual(AppController.detectionLabel(.teams), "Teams")
+        XCTAssertEqual(AppController.detectionLabel(.browser), "browser meeting")
         XCTAssertEqual(AppController.detectionLabel(nil), "Calendar")
+    }
+
+    func test_detectionBannerText_namesAppOrCalendar() {
+        XCTAssertEqual(
+            AppController.detectionBannerText(via: "Zoom"), "Meeting detected via Zoom: Record?")
+        XCTAssertEqual(
+            AppController.detectionBannerText(via: "Calendar"), "Meeting detected via Calendar: Record?")
+    }
+
+    func test_detectionBannerText_browserStaysGeneric() {
+        // A browser meeting cannot be attributed to a named app, so it drops the "via X" phrasing.
+        XCTAssertEqual(
+            AppController.detectionBannerText(via: AppController.detectionLabel(.browser)),
+            "In a meeting? Record?")
     }
 }

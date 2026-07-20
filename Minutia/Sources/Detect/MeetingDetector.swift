@@ -2,37 +2,16 @@ import AppKit
 import CoreAudio
 import Darwin
 import Foundation
-import UserNotifications
 
-/// Watches the default input device for activity, then corroborates with the running meeting app
-/// and a live calendar agenda item to decide whether a meeting is actually happening. Mic state is
-/// event-driven via a CoreAudio property listener, corrected by a 15s poll (some devices, notably
-/// AirPods, report stale `DeviceIsRunningSomewhere` values). While the mic is active, app/agenda
-/// signals are polled every 5s and folded through `DetectionRules`.
+/// Watches the default input device for activity, then corroborates with the running meeting app,
+/// a browser holding a live audio-input stream, and a live calendar agenda item to decide whether a
+/// meeting is actually happening. Mic state is event-driven via a CoreAudio property listener,
+/// corrected by a 15s poll (some devices, notably AirPods, report stale `DeviceIsRunningSomewhere`
+/// values). While the mic is active, app/browser/agenda signals are polled every 5s and folded
+/// through `DetectionRules`; the app surfaces the result via the published `confidence`.
 @MainActor
 final class MeetingDetector: ObservableObject {
     @Published private(set) var confidence: DetectionConfidence = .none
-
-    static let notificationCategoryId = "app.minutia.meetingDetected"
-    static let recordActionId = "app.minutia.record"
-
-    /// The "Record this meeting?" notification category and its Record action. Exposed so the app
-    /// can register it together with the web-record consent category in a single
-    /// `setNotificationCategories` call, avoiding a read-modify-write race between two registrations.
-    static var notificationCategory: UNNotificationCategory {
-        let record = UNNotificationAction(
-            identifier: recordActionId, title: "Record", options: [.foreground])
-        return UNNotificationCategory(
-            identifier: notificationCategoryId, actions: [record], intentIdentifiers: [], options: [])
-    }
-
-    /// Post the "Record this meeting?" notification only on the rising edge into `.high`: high now
-    /// and not already notified for this mic session. `notifiedHigh` resets solely when the mic goes
-    /// inactive (a true meeting boundary), so a transient confidence dip during one continuous
-    /// session (e.g. a missed CptHost poll: high -> soft -> high) never re-notifies for it.
-    nonisolated static func shouldNotify(isHigh: Bool, alreadyNotified: Bool) -> Bool {
-        isHigh && !alreadyNotified
-    }
 
     private let controlQueue = DispatchQueue(label: "app.minutia.detector.control")
 
@@ -49,7 +28,10 @@ final class MeetingDetector: ObservableObject {
     private let agendaCacheTTL: TimeInterval = 60
 
     private var micActive = false
-    private var notifiedHigh = false
+    /// The previous poll's raw browser-input hit, so a browser meeting must persist across two
+    /// consecutive polls before it counts. Reset to false whenever the mic goes inactive, alongside
+    /// the rest of the per-mic-session state.
+    private var lastBrowserHit = false
     private var isRunning = false
 
     func start(agendaProvider: @escaping () async -> [AgendaItem]) {
@@ -79,7 +61,7 @@ final class MeetingDetector: ObservableObject {
         cachedAgendaAt = nil
         inputDeviceID = AudioObjectID(kAudioObjectUnknown)
         micActive = false
-        notifiedHigh = false
+        lastBrowserHit = false
         isRunning = false
         confidence = .none
     }
@@ -184,7 +166,7 @@ final class MeetingDetector: ObservableObject {
         }
 
         if !isActive {
-            notifiedHigh = false
+            lastBrowserHit = false
             confidence = .none
         } else {
             poll()
@@ -214,26 +196,26 @@ final class MeetingDetector: ObservableObject {
 
     private func evaluate() async {
         guard micActive else { return }
-        // `proc_listallpids` plus a `proc_name` syscall per PID is hundreds of syscalls; run it off
-        // the main actor so the 5s poll never stalls the UI. Re-check micActive after the hop: the
-        // mic can go inactive while it runs, and refreshMicState would already have reset state.
+        // `proc_listallpids` plus a `proc_name` syscall per PID, plus the CoreAudio process-object
+        // sweep, is hundreds of syscalls; run it off the main actor so the 5s poll never stalls the
+        // UI. Re-check micActive after the hop: the mic can go inactive while it runs, and
+        // refreshMicState would already have reset state.
         let signals = await Task.detached {
-            (processNames: Self.runningProcessNames(), bundleIds: Self.runningBundleIds())
+            (processNames: Self.runningProcessNames(),
+             bundleIds: Self.runningBundleIds(),
+             inputBundleIds: Self.inputBundleIds())
         }.value
         guard micActive else { return }
         let app = DetectionRules.detectApp(
             processNames: signals.processNames, bundleIds: signals.bundleIds)
+        let browserHit = DetectionRules.detectBrowserMeeting(inputBundleIds: signals.inputBundleIds)
+        let browserConfirmed = DetectionRules.browserSignalConfirmed(
+            previousPollHit: lastBrowserHit, currentPollHit: browserHit)
+        lastBrowserHit = browserHit
         let agenda = await agendaSnapshot()
         let calendarLive = DetectionRules.liveAgendaItem(agenda, now: Date()) != nil
-        let result = DetectionRules.assess(micActive: micActive, app: app, calendarLive: calendarLive)
-
-        confidence = result
-        let isHigh: Bool
-        if case .high = result { isHigh = true } else { isHigh = false }
-        if Self.shouldNotify(isHigh: isHigh, alreadyNotified: notifiedHigh) {
-            notifiedHigh = true
-            postRecordNotification(app: app)
-        }
+        confidence = DetectionRules.assess(
+            micActive: micActive, app: app, calendarLive: calendarLive, browserActive: browserConfirmed)
     }
 
     private func agendaSnapshot() async -> [AgendaItem] {
@@ -245,17 +227,6 @@ final class MeetingDetector: ObservableObject {
         cachedAgenda = items
         cachedAgendaAt = Date()
         return items
-    }
-
-    private func postRecordNotification(app: MeetingApp?) {
-        let content = UNMutableNotificationContent()
-        content.title = "Record this meeting?"
-        content.body = app.map { "Detected \($0.rawValue.capitalized) running." }
-            ?? "Looks like a meeting just started."
-        content.categoryIdentifier = Self.notificationCategoryId
-        let request = UNNotificationRequest(
-            identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
     }
 
     // MARK: - Raw signal gathering
@@ -290,5 +261,77 @@ final class MeetingDetector: ObservableObject {
 
     nonisolated private static func runningBundleIds() -> [String] {
         NSWorkspace.shared.runningApplications.compactMap { $0.bundleIdentifier }
+    }
+
+    /// Bundle ids of every process that currently holds a live audio-input stream, read from
+    /// CoreAudio's process-object list. This is what catches a browser meeting (Google Meet in
+    /// Chrome/Safari/Arc), which registers no meeting-specific process or bundle. Our own process is
+    /// excluded by both pid and bundle id so Minutia's own mic/system-audio capture never reads back
+    /// as a meeting.
+    ///
+    /// The process-object list and its per-process properties are macOS 14.4+ (the app's deployment
+    /// floor, and the same HAL generation SystemAudioTap relies on for its process-tap API), so no
+    /// runtime availability check is needed, matching SystemAudioTap.
+    nonisolated private static func inputBundleIds() -> Set<String> {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyProcessObjectList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var dataSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &dataSize) == noErr,
+            dataSize > 0 else { return [] }
+        let count = Int(dataSize) / MemoryLayout<AudioObjectID>.size
+        var processes = [AudioObjectID](repeating: AudioObjectID(kAudioObjectUnknown), count: count)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &dataSize, &processes) == noErr
+        else { return [] }
+
+        let ownPID = getpid()
+        let ownBundleID = Bundle.main.bundleIdentifier
+        var ids: Set<String> = []
+        for process in processes where process != AudioObjectID(kAudioObjectUnknown) {
+            guard readProcessRunningInput(process) else { continue }
+            if readProcessPID(process) == ownPID { continue }
+            guard let bundleID = readProcessBundleID(process) else { continue }
+            if bundleID == ownBundleID { continue }
+            ids.insert(bundleID)
+        }
+        return ids
+    }
+
+    nonisolated private static func readProcessRunningInput(_ process: AudioObjectID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyIsRunningInput,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var running: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(process, &address, 0, nil, &size, &running)
+        return status == noErr && running != 0
+    }
+
+    nonisolated private static func readProcessPID(_ process: AudioObjectID) -> pid_t {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyPID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var pid: pid_t = -1
+        var size = UInt32(MemoryLayout<pid_t>.size)
+        let status = AudioObjectGetPropertyData(process, &address, 0, nil, &size, &pid)
+        return status == noErr ? pid : -1
+    }
+
+    nonisolated private static func readProcessBundleID(_ process: AudioObjectID) -> String? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioProcessPropertyBundleID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var bundleID: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let status = AudioObjectGetPropertyData(process, &address, 0, nil, &size, &bundleID)
+        guard status == noErr, let value = bundleID?.takeRetainedValue() else { return nil }
+        let string = value as String
+        return string.isEmpty ? nil : string
     }
 }
