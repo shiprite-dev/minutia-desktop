@@ -239,7 +239,7 @@ private struct DetectionBanner: View {
         HStack(spacing: 8) {
             Image(systemName: "sparkles")
                 .foregroundStyle(.tint)
-            Text("Meeting detected via \(via): Record?")
+            Text(AppController.detectionBannerText(via: via))
                 .font(.callout)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)

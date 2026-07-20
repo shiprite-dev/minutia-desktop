@@ -449,6 +449,14 @@ final class AppController: NSObject, ObservableObject {
         return true
     }
 
+    /// The proactive "start taking notes?" floating panel and its per-mic-session state. Suppression
+    /// is set the moment the panel shows or is dismissed and cleared only when the mic goes inactive
+    /// (confidence returns to `.none`), giving one prompt per continuous mic session. The panel wrapper
+    /// creates no AppKit window until `show`, so holding it costs nothing under the headless test host.
+    private let meetingPromptPanel = MeetingPromptPanel()
+    private var promptSuppressedForSession = false
+    private var promptExpiryTimer: Timer?
+
     private var cancellables: Set<AnyCancellable> = []
     private var lastConfidence: DetectionConfidence = .none
     private var recordingMeetingId: UUID?
@@ -511,6 +519,9 @@ final class AppController: NSObject, ObservableObject {
         // Drop it the moment we leave one (recording started by any path, finalizing, or sign-out)
         // so a stale banner cannot linger past the meeting or a sign-out.
         if !Self.canStartRecording(from: next) { pendingRecordConsent = nil }
+        // The floating prompt only belongs over a promptable phase; leaving one (recording started
+        // from the menu or a deep link, finalizing, error, or sign-out) dismisses it.
+        if !MeetingPrompt.canPrompt(phase: next) { dismissMeetingPrompt() }
         // Transient feedback lives for exactly one phase; any transition clears it.
         recordFeedback = nil
         // The remembered failed-start route is only meaningful while parked in .error. Any
@@ -602,23 +613,74 @@ final class AppController: NSObject, ObservableObject {
         switch confidence {
         case .high(let app):
             apply(.meetingDetected(Self.detectionLabel(app)))
+            showMeetingPromptIfNeeded(app: app)
         case .none:
-            // The corroborating signal is gone (mic released): retire a stale banner.
+            // The corroborating signal is gone (mic released): retire a stale banner and reset the
+            // prompt session so the next meeting can prompt again.
             if case .detected = phase { apply(.dismissedDetection) }
+            resetMeetingPromptSession()
         case .soft:
-            // Quiet by design: no phase change, no notification, just the menu bar hint.
+            // Quiet by design: no phase change, no prompt, just the menu bar hint.
             break
         }
         refreshSoftHint()
     }
 
-    /// Banner wording source: "Meeting detected via {Zoom/Teams/Calendar}".
+    // MARK: - Proactive meeting prompt
+
+    /// Present the floating prompt on the rising `.high` edge, once per mic session. `apply` has
+    /// already moved the phase to `.detected` by the time this runs, so the phase check reflects the
+    /// promptable state. Confirming starts capture via the same `startRecording` path the in-menu
+    /// banner uses (mic preflight included); dismissing suppresses re-prompt for the rest of the
+    /// session.
+    private func showMeetingPromptIfNeeded(app: MeetingApp?) {
+        guard MeetingPrompt.shouldShow(
+            isHigh: true, phase: phase, suppressedForSession: promptSuppressedForSession) else { return }
+        promptSuppressedForSession = true
+        meetingPromptPanel.show(
+            content: MeetingPrompt.content(for: app),
+            onStart: { [weak self] in
+                self?.dismissMeetingPrompt()
+                self?.startRecording()
+            },
+            onDismiss: { [weak self] in self?.dismissMeetingPrompt() })
+        promptExpiryTimer?.invalidate()
+        promptExpiryTimer = Timer.scheduledTimer(
+            withTimeInterval: MeetingPrompt.lifetime, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.dismissMeetingPrompt() }
+        }
+    }
+
+    /// Hide the panel and cancel its expiry. Does not clear the session suppression: a dismissed or
+    /// expired prompt must not re-show until the mic session resets.
+    private func dismissMeetingPrompt() {
+        promptExpiryTimer?.invalidate()
+        promptExpiryTimer = nil
+        meetingPromptPanel.dismiss()
+    }
+
+    /// A new mic session (mic went inactive, then a fresh meeting): hide any stale panel and clear
+    /// suppression so the next detection can prompt again.
+    private func resetMeetingPromptSession() {
+        promptSuppressedForSession = false
+        dismissMeetingPrompt()
+    }
+
+    /// Detection label carried in `.detected(app:)`: "Zoom" / "Teams" / "browser meeting" / "Calendar".
     static func detectionLabel(_ app: MeetingApp?) -> String {
         switch app {
         case .zoom: return "Zoom"
         case .teams: return "Teams"
+        case .browser: return "browser meeting"
         case nil: return "Calendar"
         }
+    }
+
+    /// The in-menu detection banner headline. A browser meeting cannot be attributed to a named app,
+    /// so it drops the "via X" phrasing for a generic prompt; a named app or calendar keeps it.
+    static func detectionBannerText(via: String) -> String {
+        if via == detectionLabel(.browser) { return "In a meeting? Record?" }
+        return "Meeting detected via \(via): Record?"
     }
 
     // MARK: - Series
@@ -766,9 +828,8 @@ final class AppController: NSObject, ObservableObject {
         pendingRecordConsent = nil
     }
 
-    /// Registers both notification categories (the detector's "Record this meeting?" and the
-    /// web-record consent prompt) in a single synchronous `setNotificationCategories` call, so
-    /// neither can clobber the other through a read-modify-write race.
+    /// Registers the web-record consent notification category. (Local meeting detection now surfaces
+    /// through the floating prompt and the in-menu banner, not a notification.)
     private static func registerNotificationCategories() {
         let confirm = UNNotificationAction(
             identifier: confirmWebRecordActionId, title: "Start recording", options: [.foreground])
@@ -777,9 +838,7 @@ final class AppController: NSObject, ObservableObject {
         let webRecord = UNNotificationCategory(
             identifier: webRecordCategoryId, actions: [confirm, dismiss],
             intentIdentifiers: [], options: [])
-        UNUserNotificationCenter.current().setNotificationCategories([
-            MeetingDetector.notificationCategory, webRecord,
-        ])
+        UNUserNotificationCenter.current().setNotificationCategories([webRecord])
     }
 
     private static func postNotification(title: String, body: String) {
@@ -1042,8 +1101,6 @@ extension AppController: UNUserNotificationCenterDelegate {
         let userInfo = response.notification.request.content.userInfo
         Task { @MainActor in
             switch actionId {
-            case MeetingDetector.recordActionId:
-                self.startRecording()
             case Self.confirmWebRecordActionId:
                 self.confirmPendingRecord()
             case Self.dismissWebRecordActionId:

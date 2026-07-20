@@ -27,24 +27,142 @@ final class DetectionRulesTests: XCTestCase {
         XCTAssertNil(DetectionRules.detectApp(processNames: [], bundleIds: ["com.microsoft.teams"]))
     }
 
+    // MARK: - detectBrowserMeeting
+
+    func test_detectBrowserMeeting_knownBrowserWithInput_isHit() {
+        for id in DetectionRules.browserBundleIds {
+            XCTAssertTrue(
+                DetectionRules.detectBrowserMeeting(inputBundleIds: [id]),
+                "\(id) should be recognized as a browser meeting")
+        }
+    }
+
+    func test_detectBrowserMeeting_helperProcessForEveryBrowser_isHit() {
+        // CoreAudio commonly attributes browser mic input to a helper/content process, not the
+        // top-level bundle id, so every browser's `.helper` child must also register.
+        for id in DetectionRules.browserBundleIds {
+            XCTAssertTrue(
+                DetectionRules.detectBrowserMeeting(inputBundleIds: ["\(id).helper"]),
+                "\(id).helper should be recognized as a browser meeting")
+        }
+    }
+
+    func test_detectBrowserMeeting_webKitContentAndGPUHelpers_isHit() {
+        XCTAssertTrue(
+            DetectionRules.detectBrowserMeeting(inputBundleIds: ["com.apple.WebKit.WebContent"]))
+        XCTAssertTrue(
+            DetectionRules.detectBrowserMeeting(inputBundleIds: ["com.apple.WebKit.GPU"]))
+    }
+
+    func test_detectBrowserMeeting_nonBrowserInput_isNoHit() {
+        XCTAssertFalse(
+            DetectionRules.detectBrowserMeeting(inputBundleIds: ["com.apple.Preview", "com.tinyspeck.slackmacgap"]))
+    }
+
+    func test_detectBrowserMeeting_dotBoundaryNegatives_isNoHit() {
+        // `com.google.ChromeCast` is a sibling, not a dot-scoped child of `com.google.Chrome`;
+        // `com.apple.WebKitFakeNo` starts with `com.apple.WebKit` but not `com.apple.WebKit.`.
+        XCTAssertFalse(DetectionRules.detectBrowserMeeting(inputBundleIds: ["com.google.ChromeCast"]))
+        XCTAssertFalse(DetectionRules.detectBrowserMeeting(inputBundleIds: ["com.apple.WebKitFakeNo"]))
+        XCTAssertFalse(DetectionRules.detectBrowserMeeting(inputBundleIds: ["com.spotify.client"]))
+    }
+
+    func test_detectBrowserMeeting_emptySet_isNoHit() {
+        XCTAssertFalse(DetectionRules.detectBrowserMeeting(inputBundleIds: []))
+    }
+
+    func test_detectBrowserMeeting_mixedSet_isHit() {
+        XCTAssertTrue(
+            DetectionRules.detectBrowserMeeting(inputBundleIds: ["com.apple.Preview", "com.google.Chrome"]))
+    }
+
+    // MARK: - browserSignalConfirmed (two consecutive polls)
+
+    func test_browserSignalConfirmed_zeroHits_isFalse() {
+        XCTAssertFalse(DetectionRules.browserSignalConfirmed(previousPollHit: false, currentPollHit: false))
+    }
+
+    func test_browserSignalConfirmed_singleRisingHit_isFalse() {
+        // One poll's blip (e.g. a 2-second dictation) must not count as a meeting.
+        XCTAssertFalse(DetectionRules.browserSignalConfirmed(previousPollHit: false, currentPollHit: true))
+    }
+
+    func test_browserSignalConfirmed_twoConsecutiveHits_isTrue() {
+        XCTAssertTrue(DetectionRules.browserSignalConfirmed(previousPollHit: true, currentPollHit: true))
+    }
+
+    func test_browserSignalConfirmed_hitThenGap_isFalse() {
+        XCTAssertFalse(DetectionRules.browserSignalConfirmed(previousPollHit: true, currentPollHit: false))
+    }
+
+    /// A hit, a gap, then a hit is two isolated single hits: the rising edge restarts, so it must
+    /// still take a further consecutive poll to confirm. Threads the raw hit through as the detector
+    /// does.
+    func test_browserSignalConfirmed_hitGapHit_neverConfirms() {
+        var previous = false
+        let polls = [true, false, true]
+        var confirmations: [Bool] = []
+        for hit in polls {
+            confirmations.append(
+                DetectionRules.browserSignalConfirmed(previousPollHit: previous, currentPollHit: hit))
+            previous = hit
+        }
+        XCTAssertEqual(confirmations, [false, false, false])
+    }
+
     // MARK: - assess
 
     func test_assess_micActiveWithApp_isHighWithApp() {
         XCTAssertEqual(
-            DetectionRules.assess(micActive: true, app: .zoom, calendarLive: false), .high(.zoom))
+            DetectionRules.assess(micActive: true, app: .zoom, calendarLive: false, browserActive: false),
+            .high(.zoom))
     }
 
     func test_assess_micActiveWithCalendarLive_isHighWithNilApp() {
         XCTAssertEqual(
-            DetectionRules.assess(micActive: true, app: nil, calendarLive: true), .high(nil))
+            DetectionRules.assess(micActive: true, app: nil, calendarLive: true, browserActive: false),
+            .high(nil))
     }
 
     func test_assess_micActiveAlone_isSoft() {
-        XCTAssertEqual(DetectionRules.assess(micActive: true, app: nil, calendarLive: false), .soft)
+        XCTAssertEqual(
+            DetectionRules.assess(micActive: true, app: nil, calendarLive: false, browserActive: false),
+            .soft)
     }
 
     func test_assess_micInactive_isNone() {
-        XCTAssertEqual(DetectionRules.assess(micActive: false, app: .teams, calendarLive: true), .none)
+        XCTAssertEqual(
+            DetectionRules.assess(micActive: false, app: .teams, calendarLive: true, browserActive: false),
+            .none)
+    }
+
+    // MARK: - assess: browser signal and precedence
+
+    func test_assess_micActiveWithBrowserOnly_isHighBrowser() {
+        XCTAssertEqual(
+            DetectionRules.assess(micActive: true, app: nil, calendarLive: false, browserActive: true),
+            .high(.browser))
+    }
+
+    func test_assess_micInactiveWithBrowserHit_isNone() {
+        XCTAssertEqual(
+            DetectionRules.assess(micActive: false, app: nil, calendarLive: false, browserActive: true),
+            .none)
+    }
+
+    func test_assess_nativeAppWinsOverBrowser() {
+        XCTAssertEqual(
+            DetectionRules.assess(micActive: true, app: .zoom, calendarLive: false, browserActive: true),
+            .high(.zoom))
+        XCTAssertEqual(
+            DetectionRules.assess(micActive: true, app: .teams, calendarLive: false, browserActive: true),
+            .high(.teams))
+    }
+
+    func test_assess_calendarWinsOverBrowser() {
+        XCTAssertEqual(
+            DetectionRules.assess(micActive: true, app: nil, calendarLive: true, browserActive: true),
+            .high(nil))
     }
 
     // MARK: - liveAgendaItem
