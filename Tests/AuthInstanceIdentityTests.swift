@@ -149,6 +149,12 @@ final class AuthInstanceIdentityTests: XCTestCase {
         XCTAssertEqual(AuthManager.rejectionMessage(for: .rejectStateMismatch), stale)
     }
 
+    func test_rejectionMessage_stateMissingNamesOutdatedInstance() {
+        XCTAssertEqual(
+            AuthManager.rejectionMessage(for: .rejectStateMissing),
+            "This Minutia instance runs an older version that does not confirm sign-in requests. Update the instance, then try signing in again.")
+    }
+
     func test_rejectionMessage_silentForAlreadySignedInAndAccept() {
         XCTAssertNil(AuthManager.rejectionMessage(for: .rejectAlreadySignedIn))
         XCTAssertNil(AuthManager.rejectionMessage(for: .accept))
@@ -169,6 +175,7 @@ final class AuthInstanceIdentityTests: XCTestCase {
         XCTAssertEqual(AuthManager.preExchangeOutcome(hasClient: true, decision: .rejectAlreadySignedIn), .rejected)
         XCTAssertEqual(AuthManager.preExchangeOutcome(hasClient: true, decision: .rejectNoPendingFlow), .rejected)
         XCTAssertEqual(AuthManager.preExchangeOutcome(hasClient: true, decision: .rejectStateMismatch), .rejected)
+        XCTAssertEqual(AuthManager.preExchangeOutcome(hasClient: true, decision: .rejectStateMissing), .rejected)
     }
 
     func test_callbackOutcome_equatable() {

@@ -58,13 +58,14 @@ final class AuthManager: ObservableObject {
         case rejectAlreadySignedIn
         case rejectNoPendingFlow
         case rejectStateMismatch
+        case rejectStateMissing
     }
 
     /// A signed-in app must never process a new sign-in token (session fixation). An unsolicited
-    /// or expired callback (no pending flow) is rejected. When the server echoes `state`, it must
-    /// match the pending nonce; a nil state with a valid pending flow still accepts, because the
-    /// pending-flow plus not-already-signed-in gates are the client-side protection and the state
-    /// match only tightens it once the server echoes it.
+    /// or expired callback (no pending flow) is rejected. The server echoes the pending nonce as
+    /// `state`; the callback must carry it and it must match. A callback with no state cannot prove
+    /// it belongs to this flow, so it is rejected distinctly from a mismatch: the instance is too
+    /// old to confirm the request rather than actively contradicting it.
     nonisolated static func authCallbackDecision(
         alreadySignedIn: Bool,
         pending: PendingAuth?,
@@ -76,7 +77,8 @@ final class AuthManager: ObservableObject {
         guard let pending else { return .rejectNoPendingFlow }
         let elapsed = now.timeIntervalSince(pending.startedAt)
         guard elapsed >= 0, elapsed <= ttl else { return .rejectNoPendingFlow }
-        if let callbackState, callbackState != pending.nonce { return .rejectStateMismatch }
+        guard let callbackState, !callbackState.isEmpty else { return .rejectStateMissing }
+        if callbackState != pending.nonce { return .rejectStateMismatch }
         return .accept
     }
 
@@ -141,11 +143,14 @@ final class AuthManager: ObservableObject {
 
     /// User-facing copy for a rejected callback, or nil when the rejection is silent by design.
     /// A stale/reused link (no pending flow, or a state mismatch) tells the user to request a new
-    /// one; an already-signed-in rejection stays silent (the session is fine).
+    /// one; a missing state names the outdated instance so the user knows to update it; an
+    /// already-signed-in rejection stays silent (the session is fine).
     nonisolated static func rejectionMessage(for decision: AuthCallbackDecision) -> String? {
         switch decision {
         case .rejectNoPendingFlow, .rejectStateMismatch:
             return "That sign-in link is stale or was already used. Request a new one from the app."
+        case .rejectStateMissing:
+            return "This Minutia instance runs an older version that does not confirm sign-in requests. Update the instance, then try signing in again."
         case .rejectAlreadySignedIn, .accept:
             return nil
         }
@@ -353,8 +358,8 @@ final class AuthManager: ObservableObject {
 
         // Bind the callback to a locally-initiated sign-in before touching any token: an attacker
         // can feed a victim a token_hash for the attacker's account, so an unsolicited callback,
-        // one that arrives while already signed in, or one whose echoed state does not match must
-        // never reach verifyOTP/session(from:).
+        // one that arrives while already signed in, or one whose echoed state is missing or does
+        // not match must never reach verifyOTP/session(from:).
         let decision = Self.authCallbackDecision(
             alreadySignedIn: userEmail != nil,
             pending: pendingAuth,

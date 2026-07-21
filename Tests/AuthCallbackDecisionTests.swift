@@ -2,8 +2,9 @@ import XCTest
 @testable import Minutia
 
 /// The S2 session-fixation gate: an inbound `minutia://auth-callback` is honored only when it
-/// binds to a locally-initiated sign-in that is still pending, not already signed in, and (once
-/// the server echoes it) carries a matching state nonce.
+/// binds to a locally-initiated sign-in that is still pending, not already signed in, and carries
+/// a state nonce matching that flow. A callback with no state is rejected: the instance did not
+/// confirm the request, so the binding cannot be proven.
 @MainActor
 final class AuthCallbackDecisionTests: XCTestCase {
     private let now = Date()
@@ -54,11 +55,18 @@ final class AuthCallbackDecisionTests: XCTestCase {
             .rejectStateMismatch)
     }
 
-    func test_validPendingNilState_accepts() {
+    func test_validPendingNilState_rejectsStateMissing() {
         XCTAssertEqual(
             AuthManager.authCallbackDecision(
                 alreadySignedIn: false, pending: pending(), callbackState: nil, now: now),
-            .accept)
+            .rejectStateMissing)
+    }
+
+    func test_validPendingEmptyState_rejectsStateMissing() {
+        XCTAssertEqual(
+            AuthManager.authCallbackDecision(
+                alreadySignedIn: false, pending: pending("nonce-1"), callbackState: "", now: now),
+            .rejectStateMissing)
     }
 
     func test_validPendingMatchingState_accepts() {
@@ -68,10 +76,10 @@ final class AuthCallbackDecisionTests: XCTestCase {
             .accept)
     }
 
-    func test_boundaryAtTtl_accepts() {
+    func test_boundaryAtTtl_acceptsWithMatchingState() {
         XCTAssertEqual(
             AuthManager.authCallbackDecision(
-                alreadySignedIn: false, pending: pending(ageSeconds: 900), callbackState: nil, now: now),
+                alreadySignedIn: false, pending: pending("nonce-1", ageSeconds: 900), callbackState: "nonce-1", now: now),
             .accept)
     }
 
