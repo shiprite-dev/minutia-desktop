@@ -74,4 +74,64 @@ final class MeetingPromptTests: XCTestCase {
         XCTAssertEqual(content.title, "Looks like you're in a Zoom meeting")
         XCTAssertFalse(content.symbol.isEmpty)
     }
+
+    func test_startContent_carriesStartVariantButtons() {
+        let content = MeetingPrompt.content(for: .zoom)
+        XCTAssertEqual(content.primaryTitle, "Start taking notes")
+        // The start variant renders the compact xmark dismiss, not a labeled secondary button.
+        XCTAssertNil(content.secondaryTitle)
+    }
+
+    // MARK: - End variant
+
+    func test_endContent_carriesEndVariantCopy() {
+        let content = MeetingPrompt.endContent()
+        XCTAssertEqual(content.title, "Meeting ended?")
+        XCTAssertEqual(content.primaryTitle, "Wrap up my notes")
+        XCTAssertEqual(content.secondaryTitle, "Keep recording")
+        XCTAssertFalse(content.symbol.isEmpty)
+    }
+
+    // MARK: - canPromptEnd
+
+    func test_canPromptEnd_trueOnlyWhileRecording() {
+        XCTAssertTrue(MeetingPrompt.canPromptEnd(phase: .recording))
+    }
+
+    func test_canPromptEnd_falseInEveryOtherPhase() {
+        // A web-end or manual stop leaves .recording (to .finalizing), so any pending end prompt is
+        // dismissed by the same phase gate; the end prompt never shows outside a live recording.
+        let others: [AppPhase] = [
+            .signedOut, .idle, .detected(app: "Zoom"), .detected(app: nil), .finalizing, .error("boom"),
+        ]
+        for phase in others {
+            XCTAssertFalse(MeetingPrompt.canPromptEnd(phase: phase), "\(phase) must not host the end prompt")
+        }
+    }
+
+    // MARK: - shouldShowEnd
+
+    func test_shouldShowEnd_whileRecordingNotDisabledNotShowing_shows() {
+        XCTAssertTrue(
+            MeetingPrompt.shouldShowEnd(phase: .recording, autoEndDisabled: false, alreadyShowing: false))
+    }
+
+    func test_shouldShowEnd_keepRecordingDisablesFurtherAutoEnd() {
+        XCTAssertFalse(
+            MeetingPrompt.shouldShowEnd(phase: .recording, autoEndDisabled: true, alreadyShowing: false))
+    }
+
+    func test_shouldShowEnd_notReShownWhileAlreadyShowing() {
+        XCTAssertFalse(
+            MeetingPrompt.shouldShowEnd(phase: .recording, autoEndDisabled: false, alreadyShowing: true))
+    }
+
+    func test_shouldShowEnd_neverOutsideRecording() {
+        let others: [AppPhase] = [.idle, .detected(app: nil), .finalizing, .error("boom"), .signedOut]
+        for phase in others {
+            XCTAssertFalse(
+                MeetingPrompt.shouldShowEnd(phase: phase, autoEndDisabled: false, alreadyShowing: false),
+                "end prompt must not show in \(phase)")
+        }
+    }
 }

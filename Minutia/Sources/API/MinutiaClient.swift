@@ -300,6 +300,21 @@ struct MinutiaClient {
         return response.value.series_id
     }
 
+    /// Reads a meeting's status so a recording can follow the meeting's end: the web app ends a
+    /// meeting by setting this to "completed". A single-row select of the recording user's own
+    /// meeting row (RLS lets them read it); the id is lowercased through `meetingLookupId` to match
+    /// the canonical DB row.
+    func meetingStatus(meetingId: String) async throws -> String? {
+        struct Row: Decodable { let status: String? }
+        let response: PostgrestResponse<Row> = try await supabase
+            .from("meetings")
+            .select("status")
+            .eq("id", value: Self.meetingLookupId(meetingId))
+            .single()
+            .execute()
+        return response.value.status
+    }
+
     /// The meetings-table lookup id: lowercased to match the canonical DB id (Swift `UUID.uuidString`
     /// is uppercase). The shared seam so a recap-resolution query is never issued with an uppercase id.
     static func meetingLookupId(_ meetingId: String) -> String { meetingId.lowercased() }

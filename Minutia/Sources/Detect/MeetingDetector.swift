@@ -13,6 +13,17 @@ import Foundation
 final class MeetingDetector: ObservableObject {
     @Published private(set) var confidence: DetectionConfidence = .none
 
+    /// The raw per-poll signals folded into a confidence, exposed so the controller can watch for a
+    /// meeting ending (its origin's signal going absent) while a recording keeps the mic active.
+    struct RawSignals: Equatable {
+        let nativeAppPresent: Bool
+        let browserInputPresent: Bool
+    }
+
+    /// Fired once per active-mic poll with the raw native/browser signals. Independent of the
+    /// confidence pipeline: it changes no detection semantics, it only surfaces what each poll saw.
+    var onRawSignals: ((RawSignals) -> Void)?
+
     private let controlQueue = DispatchQueue(label: "app.minutia.detector.control")
 
     private var inputDeviceID = AudioObjectID(kAudioObjectUnknown)
@@ -209,6 +220,7 @@ final class MeetingDetector: ObservableObject {
         let app = DetectionRules.detectApp(
             processNames: signals.processNames, bundleIds: signals.bundleIds)
         let browserHit = DetectionRules.detectBrowserMeeting(inputBundleIds: signals.inputBundleIds)
+        onRawSignals?(RawSignals(nativeAppPresent: app != nil, browserInputPresent: browserHit))
         let browserConfirmed = DetectionRules.browserSignalConfirmed(
             previousPollHit: lastBrowserHit, currentPollHit: browserHit)
         lastBrowserHit = browserHit

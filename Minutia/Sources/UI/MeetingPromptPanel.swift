@@ -64,7 +64,7 @@ final class MeetingPromptPanel {
             element: NSApp as Any,
             notification: .announcementRequested,
             userInfo: [
-                .announcement: "\(content.title). Start taking notes available.",
+                .announcement: "\(content.title). \(content.primaryTitle) available.",
                 .priority: NSAccessibilityPriorityLevel.high.rawValue,
             ])
     }
@@ -102,8 +102,10 @@ final class MeetingPromptPanel {
     }
 }
 
-/// The capsule content: a glyph, the headline, a prominent "Start taking notes" action, and a quiet
-/// dismiss. System materials and SF Pro defaults; both actions carry VoiceOver labels.
+/// The capsule content: a glyph, the headline, a prominent primary action, and a quiet secondary.
+/// The primary label and the secondary shape come from the content, so the same shell renders both
+/// the start ("Start taking notes" + xmark dismiss) and end ("Wrap up my notes" + "Keep recording")
+/// variants. System materials and SF Pro defaults; both actions carry VoiceOver labels.
 private struct MeetingPromptView: View {
     let content: MeetingPromptContent
     let onStart: () -> Void
@@ -124,19 +126,28 @@ private struct MeetingPromptView: View {
                 .fixedSize()
 
             Button(action: onStart) {
-                Text("Start taking notes")
+                Text(content.primaryTitle)
                     .fontWeight(.semibold)
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.regular)
 
-            Button(action: onDismiss) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(.secondary)
+            if let secondaryTitle = content.secondaryTitle {
+                Button(action: onDismiss) {
+                    Text(secondaryTitle)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel(secondaryTitle)
+            } else {
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Dismiss")
             }
-            .buttonStyle(.borderless)
-            .accessibilityLabel("Dismiss")
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 12)
