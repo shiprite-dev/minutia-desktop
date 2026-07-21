@@ -457,6 +457,108 @@ final class AppController: NSObject, ObservableObject {
         return true
     }
 
+    // MARK: - Following the meeting's end
+
+    /// What one web-app status poll should do. The web app ends a meeting by setting its status to
+    /// "completed"; anything else (live, upcoming, an unknown value, or nil from a read that could not
+    /// resolve the row) means the meeting is still going, so keep polling. Pure so the branch matrix
+    /// is tested without a live client.
+    enum MeetingEndPollDecision: Equatable {
+        case stop
+        case keepPolling
+    }
+
+    nonisolated static func meetingEndPollDecision(status: String?) -> MeetingEndPollDecision {
+        status == "completed" ? .stop : .keepPolling
+    }
+
+    /// The web-end status poll runs only while a recording is live: it watches for the meeting being
+    /// ended from the web app. Started on entering `.recording`, cancelled on every exit.
+    nonisolated static func shouldPollMeetingEnd(phase: AppPhase) -> Bool {
+        if case .recording = phase { return true }
+        return false
+    }
+
+    /// Why a recording stopped, which decides whether the recap opens. A manual stop and a
+    /// locally-detected end both land the user on the fresh notes; a web-end stop suppresses the recap
+    /// because the user is already on the web app and auto-opening a tab is noise.
+    enum StopReason: Equatable {
+        case manual
+        case webEnded
+        case localEnded
+    }
+
+    nonisolated static func opensRecap(for reason: StopReason) -> Bool {
+        switch reason {
+        case .manual, .localEnded: return true
+        case .webEnded: return false
+        }
+    }
+
+    /// How a recording was detected when it started, so local end-detection knows which raw signal
+    /// marks the meeting as over. Captured from the `DetectionConfidence` at start time; a menu or
+    /// deep-link start with no active detection is `.none`.
+    enum DetectionOrigin: Equatable {
+        case zoom
+        case teams
+        case browser
+        case calendar
+        case none
+    }
+
+    nonisolated static func detectionOrigin(for confidence: DetectionConfidence) -> DetectionOrigin {
+        switch confidence {
+        case .high(.zoom): return .zoom
+        case .high(.teams): return .teams
+        case .high(.browser): return .browser
+        case .high(nil): return .calendar
+        case .soft, .none: return .none
+        }
+    }
+
+    /// Whether this poll's raw signals show the origin's meeting signal as absent: a native origin
+    /// (Zoom/Teams) watches the native-app signal, a browser origin watches the browser-input signal.
+    /// A calendar/none origin has no signal to lose, so it is never absent and never auto-ends.
+    nonisolated static func endSignalAbsent(origin: DetectionOrigin, signals: MeetingDetector.RawSignals) -> Bool {
+        switch origin {
+        case .zoom, .teams: return !signals.nativeAppPresent
+        case .browser: return !signals.browserInputPresent
+        case .calendar, .none: return false
+        }
+    }
+
+    /// Consecutive absent polls before a meeting is treated as ended, so a single blip never wraps up
+    /// a live recording (mirrors the two-poll browser-signal confirmation on the detection side).
+    static let endAbsentThreshold = 2
+
+    /// Whether the meeting has ended for a native/browser origin: its signal has been absent for two
+    /// consecutive polls. A calendar/none origin never auto-ends. Pure over the origin and the
+    /// controller's running consecutive-absent count.
+    nonisolated static func meetingEndDetected(origin: DetectionOrigin, consecutiveAbsent: Int) -> Bool {
+        switch origin {
+        case .zoom, .teams, .browser: return consecutiveAbsent >= endAbsentThreshold
+        case .calendar, .none: return false
+        }
+    }
+
+    /// Whether the end-prompt countdown, when it fires, should actually stop the recording: only while
+    /// still recording and the user has not chosen "Keep recording". Guards the one-shot timer so a
+    /// manual/web-end stop that already left `.recording`, or a waved-off auto-end, is a no-op.
+    nonisolated static func shouldAutoStopOnEndTimeout(phase: AppPhase, autoEndDisabled: Bool) -> Bool {
+        guard case .recording = phase else { return false }
+        return !autoEndDisabled
+    }
+
+    /// A recovered origin signal while the end prompt is up cancels the pending wrap-up: the signal
+    /// returning is stronger evidence the meeting is live than the countdown honors, mirroring the
+    /// consecutive-absent threshold that guards arming it. The wave-off flag is left untouched, so a
+    /// later real end re-prompts.
+    nonisolated static func shouldDismissEndPromptOnRecovery(
+        signalAbsent: Bool, endPromptShowing: Bool
+    ) -> Bool {
+        !signalAbsent && endPromptShowing
+    }
+
     /// The proactive "start taking notes?" floating panel and its per-mic-session state. Suppression
     /// is set the moment the panel shows or is dismissed and cleared only when the mic goes inactive
     /// (confidence returns to `.none`), giving one prompt per continuous mic session. The panel wrapper
@@ -464,6 +566,20 @@ final class AppController: NSObject, ObservableObject {
     private let meetingPromptPanel = MeetingPromptPanel()
     private var promptSuppressedForSession = false
     private var promptExpiryTimer: Timer?
+
+    /// Local end-detection state for the live recording. `recordingOrigin` (captured from the
+    /// detection confidence at start) selects which raw signal marks the meeting as over;
+    /// `endAbsentCount` is the running consecutive-absent count; `autoEndDisabled` is set by
+    /// "Keep recording" to suppress auto-end for the rest of the recording; `endPromptShowing` gates
+    /// re-showing the panel; the timer is the 10s wrap-up countdown.
+    private var recordingOrigin: DetectionOrigin = .none
+    private var endAbsentCount = 0
+    private var autoEndDisabled = false
+    private var endPromptShowing = false
+    private var endCountdownTimer: Timer?
+    /// Single-flight 5s poll of the recording meeting's server status, so ending the meeting from the
+    /// web app stops the desktop recording. Started on recording start, cancelled on stop/sign-out/error.
+    private var webEndPollTask: Task<Void, Never>?
 
     private var cancellables: Set<AnyCancellable> = []
     private var lastConfidence: DetectionConfidence = .none
@@ -515,6 +631,9 @@ final class AppController: NSObject, ObservableObject {
             .removeDuplicates()
             .sink { [weak self] confidence in self?.handleDetection(confidence) }
             .store(in: &cancellables)
+
+        // Raw per-poll signals drive local end-detection while a recording keeps the mic active.
+        detector.onRawSignals = { [weak self] signals in self?.handleRawSignals(signals) }
     }
 
     /// Rehydrate the Supabase client from the stored instance (or the managed cloud
@@ -542,6 +661,12 @@ final class AppController: NSObject, ObservableObject {
         // The floating prompt only belongs over a promptable phase; leaving one (recording started
         // from the menu or a deep link, finalizing, error, or sign-out) dismisses it.
         if !MeetingPrompt.canPrompt(phase: next) { dismissMeetingPrompt() }
+        // The end prompt belongs only over a live recording; leaving it (a manual stop, a web-end
+        // stop, an error, or sign-out) dismisses it and cancels its wrap-up countdown, so the two
+        // end paths never fight.
+        if !MeetingPrompt.canPromptEnd(phase: next) { dismissEndPrompt() }
+        // The web-end status poll runs only while recording; start on entry, cancel on every exit.
+        if Self.shouldPollMeetingEnd(phase: next) { startWebEndPoll() } else { stopWebEndPoll() }
         // Transient feedback lives for exactly one phase; any transition clears it.
         recordFeedback = nil
         // The remembered failed-start route is only meaningful while parked in .error. Any
@@ -570,11 +695,14 @@ final class AppController: NSObject, ObservableObject {
         softHint = Self.shouldShowSoftHint(confidence: lastConfidence, phase: phase)
     }
 
-    /// The detector runs only while signed in and not capturing; our own mic use during a
-    /// recording would otherwise re-trigger detection and post a spurious notification.
+    /// The detector runs while signed in and resting (idle/detected) and continues through
+    /// `.recording` so it can watch the meeting's own signal for the meeting ending. During recording
+    /// the phase guards keep it inert on the detection side (no start prompt, no phase change); only
+    /// its raw per-poll signals are consumed, for local end-detection. Finalizing/error/signed-out
+    /// stop it.
     private func syncDetector() {
         switch phase {
-        case .idle, .detected:
+        case .idle, .detected, .recording:
             guard let client = authManager.client() else {
                 detector.stop()
                 detectorBoundInstance = nil
@@ -686,6 +814,112 @@ final class AppController: NSObject, ObservableObject {
         dismissMeetingPrompt()
     }
 
+    // MARK: - Following the meeting's end
+
+    /// Reset the local end-detection state for a new recording: capture its origin (which signal
+    /// marks the meeting as over) and clear the absent count, the wave-off, and the panel gate.
+    private func resetEndDetectionState(origin: DetectionOrigin) {
+        recordingOrigin = origin
+        endAbsentCount = 0
+        autoEndDisabled = false
+        endPromptShowing = false
+    }
+
+    /// Each active-mic poll while recording: fold the origin's raw signal into the consecutive-absent
+    /// count (a recovered signal resets it and cancels a pending wrap-up), and offer to wrap up once
+    /// the meeting looks over.
+    private func handleRawSignals(_ signals: MeetingDetector.RawSignals) {
+        guard case .recording = phase else { return }
+        let absent = Self.endSignalAbsent(origin: recordingOrigin, signals: signals)
+        endAbsentCount = absent ? endAbsentCount + 1 : 0
+        if Self.shouldDismissEndPromptOnRecovery(signalAbsent: absent, endPromptShowing: endPromptShowing) {
+            dismissEndPrompt()
+        }
+        guard Self.meetingEndDetected(origin: recordingOrigin, consecutiveAbsent: endAbsentCount) else { return }
+        showEndPromptIfNeeded()
+    }
+
+    /// Present the end-variant panel: "Wrap up my notes" stops now (recap opens as usual), "Keep
+    /// recording" waves off auto-end for the rest of the recording. If the user does nothing, the 10s
+    /// countdown auto-stops through the same normal path so the notes appear untouched.
+    private func showEndPromptIfNeeded() {
+        guard MeetingPrompt.shouldShowEnd(
+            phase: phase, autoEndDisabled: autoEndDisabled, alreadyShowing: endPromptShowing) else { return }
+        endPromptShowing = true
+        meetingPromptPanel.show(
+            content: MeetingPrompt.endContent(),
+            onStart: { [weak self] in self?.stopRecording(reason: .localEnded) },
+            onDismiss: { [weak self] in self?.keepRecording() })
+        endCountdownTimer?.invalidate()
+        endCountdownTimer = Timer.scheduledTimer(
+            withTimeInterval: MeetingPrompt.endCountdown, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.autoStopFromEndPrompt() }
+        }
+    }
+
+    /// "Keep recording": disable auto-end for the rest of this recording and hide the panel.
+    private func keepRecording() {
+        autoEndDisabled = true
+        dismissEndPrompt()
+    }
+
+    /// The wrap-up countdown fired. Stop through the normal path (recap opens) only if still recording
+    /// and not waved off, so it triggers at most once and never after a manual/web-end stop.
+    private func autoStopFromEndPrompt() {
+        guard Self.shouldAutoStopOnEndTimeout(phase: phase, autoEndDisabled: autoEndDisabled) else { return }
+        stopRecording(reason: .localEnded)
+    }
+
+    /// Hide the end panel and cancel its wrap-up countdown. Driven from `apply` whenever the phase
+    /// leaves `.recording`, so a manual stop, a web-end stop, an error, or sign-out all cancel it.
+    private func dismissEndPrompt() {
+        endCountdownTimer?.invalidate()
+        endCountdownTimer = nil
+        endPromptShowing = false
+        meetingPromptPanel.dismiss()
+    }
+
+    /// Poll the recording meeting's server status every 5s so ending the meeting from the web app
+    /// stops the desktop recording. Single-flight, and self-guarded on a live client and meeting id.
+    /// Poll errors are logged and swallowed: a network blip must never stop capture, the poll simply
+    /// tries again on the next tick.
+    private func startWebEndPoll() {
+        guard webEndPollTask == nil,
+              let client = authManager.client(),
+              let meetingId = recordingMeetingId?.uuidString else { return }
+        webEndPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                guard !Task.isCancelled else { return }
+                let status: String?
+                do {
+                    status = try await client.meetingStatus(meetingId: meetingId)
+                } catch {
+                    Self.logger.debug("meeting-end poll error: \(error.localizedDescription, privacy: .public)")
+                    continue
+                }
+                guard let self, !Task.isCancelled else { return }
+                if case .stop = Self.meetingEndPollDecision(status: status) {
+                    self.handleWebMeetingEnded()
+                    return
+                }
+            }
+        }
+    }
+
+    private func stopWebEndPoll() {
+        webEndPollTask?.cancel()
+        webEndPollTask = nil
+    }
+
+    /// The meeting was ended from the web app: stop the recording through the normal path but suppress
+    /// the recap (the user is already on the web), leaving a calm note that the recording is finishing.
+    /// The stop leaves `.recording`, which cancels any pending local end prompt via `apply`.
+    private func handleWebMeetingEnded() {
+        stopRecording(reason: .webEnded)
+        recordFeedback = "Meeting ended from the web. Finishing your notes."
+    }
+
     /// Detection label carried in `.detected(app:)`: "Zoom" / "Teams" / "browser meeting" / "Calendar".
     static func detectionLabel(_ app: MeetingApp?) -> String {
         switch app {
@@ -757,6 +991,7 @@ final class AppController: NSObject, ObservableObject {
                 recordingMeetingId = meeting.id
                 recordingSeriesId = seriesId
                 recordingInstance = instance
+                resetEndDetectionState(origin: Self.detectionOrigin(for: lastConfidence))
                 apply(.recordStarted)
             } catch {
                 lastFailedStart = .series
@@ -782,6 +1017,7 @@ final class AppController: NSObject, ObservableObject {
                 recordingMeetingId = UUID(uuidString: meetingId)
                 recordingSeriesId = nil
                 recordingInstance = instance
+                resetEndDetectionState(origin: Self.detectionOrigin(for: lastConfidence))
                 apply(.recordStarted)
             } catch {
                 lastFailedStart = .meeting(meetingId)
@@ -870,7 +1106,12 @@ final class AppController: NSObject, ObservableObject {
         UNUserNotificationCenter.current().add(request)
     }
 
-    func stopRecording() {
+    func stopRecording() { stopRecording(reason: .manual) }
+
+    /// Stop and finalize the recording. `reason` decides whether the recap opens: a manual or
+    /// locally-detected end lands the user on the fresh notes; a web-end stop suppresses the recap
+    /// (the user is already on the web app).
+    private func stopRecording(reason: StopReason) {
         // Re-entrancy guard: a second Stop press while already finalizing must not call
         // captureSession.stop() again (it would throw notRunning and flip the UI to error).
         guard case .recording = phase else { return }
@@ -885,7 +1126,7 @@ final class AppController: NSObject, ObservableObject {
                 recordingSeriesId = nil
                 recordingInstance = nil
                 apply(.finalized)
-                if let meetingId, let instance {
+                if let meetingId, let instance, Self.opensRecap(for: reason) {
                     await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance)
                 }
             } catch {
