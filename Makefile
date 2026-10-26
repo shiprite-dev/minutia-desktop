@@ -1,4 +1,4 @@
-.PHONY: gen test build run archive export dmg notarize release
+.PHONY: gen test build adhoc run archive export dmg notarize release
 
 APP_NAME    := Minutia
 BUILD_DIR   := build
@@ -18,7 +18,13 @@ test: gen
 build: gen
 	xcodebuild -project Minutia.xcodeproj -scheme Minutia -destination 'platform=macOS' -derivedDataPath build build CODE_SIGNING_ALLOWED=NO
 
-run: build
+# A local build has CODE_SIGNING_ALLOWED=NO, and hardened runtime refuses to load the
+# embedded Sparkle.framework unless the whole bundle shares one identity. Ad-hoc sign
+# the bundle so a source build can actually launch.
+adhoc: build
+	scripts/adhoc-sign.sh "$(DEBUG_APP)"
+
+run: adhoc
 	open $(DEBUG_APP)
 
 # Developer ID archive. Requires a Developer ID Application identity in the keychain and a team
@@ -39,7 +45,7 @@ export:
 dmg:
 	@set -e; \
 	if [ -d "$(EXPORT_APP)" ]; then APP="$(EXPORT_APP)"; \
-	else echo "No exported app; building an unsigned local app for the DMG"; $(MAKE) build; APP="$(DEBUG_APP)"; fi; \
+	else echo "No exported app; building and ad-hoc signing a local app for the DMG"; $(MAKE) adhoc; APP="$(DEBUG_APP)"; fi; \
 	STAGE="$(BUILD_DIR)/dmg-stage"; \
 	rm -rf "$$STAGE" "$(DMG)"; mkdir -p "$$STAGE"; \
 	cp -R "$$APP" "$$STAGE/"; \
