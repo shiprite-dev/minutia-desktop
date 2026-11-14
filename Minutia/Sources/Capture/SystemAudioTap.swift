@@ -107,7 +107,8 @@ final class SystemAudioTap {
             let outputUID = try defaultOutputDeviceUID()
             try createAggregateDevice(tapUUID: desc.uuid, outputUID: outputUID)
 
-            let source = readAggregateInputFormat() ?? format
+            var source = readAggregateInputFormat() ?? format
+            if let rate = readAggregateSampleRate() { source.mSampleRate = rate }
             sourceFormat = source
             resizeScratch(sourceRate: source.mSampleRate)
             resampler = LinearResampler(sourceRate: source.mSampleRate, targetRate: MixPlan.sampleRate)
@@ -175,6 +176,19 @@ final class SystemAudioTap {
             AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, &format),
             "AudioObjectGetPropertyData(TapFormat)")
         return format
+    }
+
+    /// The aggregate's clock rate. The stream format can keep reporting the tap's native rate after
+    /// the output device drops to a headset rate, so the device rate is authoritative for resampling.
+    private func readAggregateSampleRate() -> Double? {
+        var rate: Double = 0
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var size = UInt32(MemoryLayout<Double>.size)
+        let status = AudioObjectGetPropertyData(aggregateID, &address, 0, nil, &size, &rate)
+        return status == noErr && rate > 0 ? rate : nil
     }
 
     /// Reads the aggregate device's actual input stream format. Returns nil on any failure so the
@@ -384,55 +398,38 @@ final class SystemAudioTap {
 
     private func render(_ inInputData: UnsafePointer<AudioBufferList>) {
         guard let format = sourceFormat else { return }
-        let channels = Int(format.mChannelsPerFrame)
-        guard channels > 0, format.mBitsPerChannel == 32 else { return }
-
-        let ablPointer = UnsafeMutableAudioBufferListPointer(
-            UnsafeMutablePointer(mutating: inInputData))
-        guard ablPointer.count > 0 else { return }
-
-        let nonInterleaved = (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
-        let bytesPerSample = MemoryLayout<Float>.size
-
-        let monoCount: Int = monoScratch.withUnsafeMutableBufferPointer { mono -> Int in
-            let maxFrames = mono.count
-            if nonInterleaved {
-                // One buffer per channel, each mono.
-                let bufferCount = min(ablPointer.count, channels)
-                guard let first = ablPointer[0].mData else { return 0 }
-                let frames = min(Int(ablPointer[0].mDataByteSize) / bytesPerSample, maxFrames)
-                guard frames > 0 else { return 0 }
-                let scale = Float(1) / Float(channels)
-                let firstPtr = first.assumingMemoryBound(to: Float.self)
-                for f in 0..<frames { mono[f] = firstPtr[f] }
-                for b in 1..<bufferCount {
-                    guard let data = ablPointer[b].mData else { continue }
-                    let ptr = data.assumingMemoryBound(to: Float.self)
-                    let bf = min(Int(ablPointer[b].mDataByteSize) / bytesPerSample, frames)
-                    for f in 0..<bf { mono[f] += ptr[f] }
-                }
-                for f in 0..<frames { mono[f] *= scale }
-                return frames
-            } else {
-                // Interleaved single buffer of `channels` samples per frame.
-                guard let data = ablPointer[0].mData else { return 0 }
-                let ptr = data.assumingMemoryBound(to: Float.self)
-                let totalSamples = Int(ablPointer[0].mDataByteSize) / bytesPerSample
-                let frames = min(totalSamples / channels, maxFrames)
-                guard frames > 0 else { return 0 }
-                let scale = Float(1) / Float(channels)
-                for f in 0..<frames {
-                    var sum: Float = 0
-                    let base = f * channels
-                    for c in 0..<channels { sum += ptr[base + c] }
-                    mono[f] = sum * scale
-                }
-                return frames
-            }
-        }
-
+        let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
+        let monoCount = monoScratch.withUnsafeMutableBufferPointer { Self.downmix(abl, into: $0) }
         guard monoCount > 0 else { return }
         pushResampled(monoCount: monoCount, sourceRate: format.mSampleRate)
+    }
+
+    /// Averages every channel of every delivered buffer into mono Float32. The layout comes from
+    /// the buffers themselves, not a cached stream format: a Bluetooth headset entering its headset
+    /// mode changes the buffer count and channel layout mid-recording.
+    static func downmix(_ abl: UnsafeMutableAudioBufferListPointer, into mono: UnsafeMutableBufferPointer<Float>) -> Int {
+        var frames = mono.count
+        var channels = 0
+        for buffer in abl {
+            let ch = max(1, Int(buffer.mNumberChannels))
+            guard buffer.mData != nil else { return 0 }
+            frames = min(frames, Int(buffer.mDataByteSize) / MemoryLayout<Float>.size / ch)
+            channels += ch
+        }
+        guard channels > 0, frames > 0 else { return 0 }
+        for f in 0..<frames { mono[f] = 0 }
+        for buffer in abl {
+            let ch = max(1, Int(buffer.mNumberChannels))
+            let ptr = buffer.mData!.assumingMemoryBound(to: Float.self)
+            for f in 0..<frames {
+                var sum: Float = 0
+                for c in 0..<ch { sum += ptr[f * ch + c] }
+                mono[f] += sum
+            }
+        }
+        let scale = 1 / Float(channels)
+        for f in 0..<frames { mono[f] *= scale }
+        return frames
     }
 
     private func pushResampled(monoCount: Int, sourceRate: Double) {
