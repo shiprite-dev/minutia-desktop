@@ -30,7 +30,9 @@ macOS prompts for two permissions the first time you record, never before:
 
 Grab the latest `Minutia-<version>.dmg` from the [Releases](https://github.com/shiprite-dev/minutia-desktop/releases/latest) page, open it, and drag **Minutia** into **Applications**. Launch it from Applications; it lives in the menu bar (no Dock icon).
 
-The first time you record, macOS prompts once for **Microphone** and once for **System audio recording** (never before). Grant both so the other participants' audio makes it into the transcript. The app checks for and installs its own updates via Sparkle.
+The first time you record, macOS prompts once for **Microphone** and once for **System audio recording** (never before). Grant both so the other participants' audio makes it into the transcript.
+
+> **Current builds are unsigned previews.** Until a Developer ID certificate is in place, releases are ad-hoc signed and not notarized, so macOS blocks the first launch. Right-click **Minutia** in Applications and choose **Open**; if macOS calls the app damaged instead, clear the download flag with `xattr -dr com.apple.quarantine /Applications/Minutia.app`. These builds do not update themselves. The release pipeline already produces signed, notarized, self-updating builds once signing credentials exist.
 
 ## Building from source
 
@@ -55,7 +57,7 @@ One-time setup:
 
 1. **Developer ID Application certificate.** Export it (with its private key) as a `.p12`, then `base64` it into the `DEVELOPER_ID_CERT_P12` secret; put the export password in `DEVELOPER_ID_CERT_PASSWORD` and your 10-character Team ID in `DEVELOPMENT_TEAM`.
 2. **App Store Connect API key** (for notarization). Create a key in App Store Connect, `base64` the `.p8` into `ASC_KEY_P8`, and set `ASC_KEY_ID` and `ASC_ISSUER_ID`.
-3. **Sparkle EdDSA key pair.** Run `generate_keys` from the [Sparkle](https://github.com/sparkle-project/Sparkle/releases) distribution once. Put the **private** key in the `SPARKLE_PRIVATE_KEY` secret and the **public** key in `SUPublicEDKey` in `project.yml` (it currently holds the `REPLACE_WITH_SPARKLE_PUBLIC_ED_KEY` placeholder, which builds fine but must be swapped in before the first real release).
+3. **Sparkle EdDSA key pair.** Run `generate_keys` from the [Sparkle](https://github.com/sparkle-project/Sparkle/releases) distribution once. Put the **private** key in the `SPARKLE_PRIVATE_KEY` secret. The public half is already installed in `SUPublicEDKey` in `project.yml`; it was generated once for this project, so reuse that key pair rather than generating a new one. Losing the private key breaks auto-update for every existing install, and the workflow refuses to run if `SUPublicEDKey` still holds the placeholder.
 
 Required GitHub secrets: `DEVELOPER_ID_CERT_P12`, `DEVELOPER_ID_CERT_PASSWORD`, `DEVELOPMENT_TEAM`, `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8`, `SPARKLE_PRIVATE_KEY`.
 

@@ -7,6 +7,7 @@ All notable changes to this project are documented in this file.
 ## [0.2.0]
 
 ### Distribution
+- First published build (`v0.2.0`) ships as an ad-hoc signed, unnotarized preview: macOS blocks the first launch until the app is opened from the context menu, and these builds do not self-update. A Developer ID certificate is the remaining step before clean, self-updating builds.
 - Developer ID signing, notarization, and DMG packaging pipeline: a `v*` tag drives a signed, notarized, stapled `Minutia-<version>.dmg` published to GitHub Releases. `make dmg` also builds a runnable local DMG.
 - Self-updating via Sparkle: an in-app "Check for Updates" control plus automatic background checks against a signed appcast, with nested Sparkle helpers signed individually (never `codesign --deep`).
 - Version and build number are stamped from the pushed git tag and the CI run number, so every release advertises a strictly increasing build to Sparkle.
