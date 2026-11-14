@@ -285,15 +285,22 @@ final class SystemAudioTap {
         }
     }
 
+    /// Output-device properties that invalidate the running aggregate. A nominal-rate change (a
+    /// Bluetooth headset switching profile when its mic opens) leaves the device alive, but the
+    /// aggregate then clocks the IOProc at the new rate while `sourceFormat` still holds the old one.
+    static let outputDeviceRebuildSelectors = [kAudioDevicePropertyDeviceIsAlive, kAudioDevicePropertyNominalSampleRate]
+
     private func installAliveListener() {
         guard deviceListener == nil, outputDeviceID != AudioObjectID(kAudioObjectUnknown) else { return }
         let rebuild = makeRebuildListener()
-        var aliveAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyDeviceIsAlive,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
-        if AudioObjectAddPropertyListenerBlock(outputDeviceID, &aliveAddress, controlQueue, rebuild) == noErr {
-            deviceListener = rebuild
+        for selector in Self.outputDeviceRebuildSelectors {
+            var address = AudioObjectPropertyAddress(
+                mSelector: selector,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain)
+            if AudioObjectAddPropertyListenerBlock(outputDeviceID, &address, controlQueue, rebuild) == noErr {
+                deviceListener = rebuild
+            }
         }
     }
 
@@ -314,11 +321,13 @@ final class SystemAudioTap {
 
     private func removeDeviceListeners() {
         if let block = deviceListener, outputDeviceID != AudioObjectID(kAudioObjectUnknown) {
-            var aliveAddress = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyDeviceIsAlive,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain)
-            AudioObjectRemovePropertyListenerBlock(outputDeviceID, &aliveAddress, controlQueue, block)
+            for selector in Self.outputDeviceRebuildSelectors {
+                var address = AudioObjectPropertyAddress(
+                    mSelector: selector,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMain)
+                AudioObjectRemovePropertyListenerBlock(outputDeviceID, &address, controlQueue, block)
+            }
             deviceListener = nil
         }
         if let block = defaultOutputListener {
