@@ -9,6 +9,7 @@ final class MicCapture {
     enum CaptureError: Error {
         case permissionDenied
         case converterUnavailable
+        case noInputDevice
     }
 
     private let buffer: RingBuffer
@@ -51,6 +52,7 @@ final class MicCapture {
     /// because enabling VP changes the input node's output format.
     func start() async throws {
         guard !running else { return }
+        guard AVCaptureDevice.default(for: .audio) != nil else { throw CaptureError.noInputDevice }
         guard await AVCaptureDevice.requestAccess(for: .audio) else {
             throw CaptureError.permissionDenied
         }
@@ -77,7 +79,12 @@ final class MicCapture {
         }
 
         engine.prepare()
-        try engine.start()
+        do { try engine.start() } catch {
+            input.removeTap(onBus: 0)
+            try? input.setVoiceProcessingEnabled(false)
+            setConverter(nil)
+            throw error
+        }
         running = true
 
         // Rebuild the tap + converter when the input device changes mid-recording (an AirPods mic

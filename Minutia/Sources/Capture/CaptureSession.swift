@@ -19,6 +19,11 @@ final class CaptureSession: ObservableObject {
     /// failed), so only the microphone is being captured. Drives a persistent caption in
     /// RecordingView. Reset false on every start.
     @Published private(set) var systemAudioDegraded = false
+    /// True when no microphone exists, so only system audio is being captured. Reset like
+    /// `systemAudioDegraded`.
+    @Published private(set) var micUnavailable = false
+
+    static let micUnavailableNotice = "No microphone found. Recording meeting audio only."
 
     /// Fired when capture dies mid-flight (denied mic, disk-full write). Carries a user-facing
     /// message and whether the capture directory was preserved for startup recovery (a disk-full or
@@ -125,6 +130,9 @@ final class CaptureSession: ObservableObject {
         pipeline.onSystemAudioUnavailable = { [weak self] in
             Task { @MainActor in self?.systemAudioDegraded = true }
         }
+        pipeline.onMicUnavailable = { [weak self] in
+            Task { @MainActor in self?.micUnavailable = true }
+        }
         try pipeline.start()
 
         self.pipeline = pipeline
@@ -140,6 +148,7 @@ final class CaptureSession: ObservableObject {
         segmentsTotal = 0
         reconnecting = false
         systemAudioDegraded = false
+        micUnavailable = false
     }
 
     /// Stops capture, drains fast-lane uploads, uploads the full recording, and requests the final
@@ -162,6 +171,7 @@ final class CaptureSession: ObservableObject {
             self.startedAt = nil
             self.lastFramesAt = nil
             self.reconnecting = false
+            self.micUnavailable = false
         }
 
         let finished = pipeline.finishCapture()
@@ -252,6 +262,7 @@ final class CaptureSession: ObservableObject {
         segmentsUploaded = 0
         segmentsTotal = 0
         reconnecting = false
+        micUnavailable = false
         onFailure?(Self.failureMessage(for: error), preserveForRecovery)
     }
 
@@ -263,7 +274,26 @@ final class CaptureSession: ObservableObject {
         framesWritten > 0
     }
 
+    enum MicFailureDisposition: Equatable { case continueWithoutMic, fatal }
+
+    /// A missing input device is survivable while system audio records; anything else (a denied
+    /// permission, a converter or engine fault) stays fatal.
+    nonisolated static func micFailureDisposition(for error: Error, systemAudioAvailable: Bool) -> MicFailureDisposition {
+        isNoInputDevice(error) && systemAudioAvailable ? .continueWithoutMic : .fatal
+    }
+
+    /// kAudioUnitErr_NoConnection (-10876) is what AVAudioEngine throws when the input device
+    /// vanishes between MicCapture's device check and the engine start.
+    nonisolated private static func isNoInputDevice(_ error: Error) -> Bool {
+        if case .noInputDevice? = error as? MicCapture.CaptureError { return true }
+        let ns = error as NSError
+        return ns.domain == "com.apple.coreaudio.avfaudio" && ns.code == -10876
+    }
+
     nonisolated static func failureMessage(for error: Error) -> String {
+        if isNoInputDevice(error) {
+            return "No microphone or meeting audio found to record."
+        }
         if let micError = error as? MicCapture.CaptureError, case .permissionDenied = micError {
             return "Grant microphone access in System Settings to record."
         }
@@ -290,6 +320,9 @@ private final class CapturePipeline {
     /// Fired when the system-audio tap cannot start, or a mid-recording rebuild permanently fails,
     /// so capture continues mic-only. Non-fatal: the recording keeps going.
     var onSystemAudioUnavailable: (() -> Void)?
+    /// Fired when no microphone exists but system audio is recording, so capture continues
+    /// system-only. Non-fatal.
+    var onMicUnavailable: (() -> Void)?
 
     private let micBuffer: RingBuffer
     private let sysBuffer: RingBuffer
@@ -325,17 +358,28 @@ private final class CapturePipeline {
         // HAL error), degrade to mic-only rather than failing the whole recording. The tick mixes
         // against an empty sys buffer, which the existing silence-pad already handles. Only a mic
         // failure (below) is fatal.
+        var systemAudioAvailable = true
         do { try tap.start() }
         catch {
+            systemAudioAvailable = false
             Self.logger.warning("System audio unavailable, recording mic-only: \(String(describing: error), privacy: .public)")
             onSystemAudioUnavailable?()
         }
         // A denied mic must surface, not be swallowed: without this a permission-denied recording
         // looks healthy but captures only system audio. Preserve the dir when the tick has already
         // written system audio during the permission prompt; deleting it would lose that audio.
-        Task {
+        // A Mac with no microphone at all keeps recording system audio; the tick pads the empty mic.
+        Task { [systemAudioAvailable] in
             do { try await mic.start() }
-            catch { self.onFatal?(error, CaptureSession.shouldPreserve(framesWritten: self.writer.totalFrames)) }
+            catch {
+                switch CaptureSession.micFailureDisposition(for: error, systemAudioAvailable: systemAudioAvailable) {
+                case .continueWithoutMic:
+                    Self.logger.warning("No microphone, recording system audio only: \(String(describing: error), privacy: .public)")
+                    self.onMicUnavailable?()
+                case .fatal:
+                    self.onFatal?(error, CaptureSession.shouldPreserve(framesWritten: self.writer.totalFrames))
+                }
+            }
         }
 
         let timer = DispatchSource.makeTimerSource(queue: tickQueue)

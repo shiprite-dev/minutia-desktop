@@ -51,6 +51,13 @@ struct RecordingView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            if session.micUnavailable {
+                Text(CaptureSession.micUnavailableNotice)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             Button {
                 onNotes()
             } label: {
