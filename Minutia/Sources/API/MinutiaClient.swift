@@ -34,6 +34,8 @@ enum MinutiaClientError: Error, Equatable {
     /// The account lacks the AI transcription entitlement: a 403 whose JSON body carries
     /// code "FEATURE_UNAVAILABLE". Terminal (no retry) and surfaced to the user, never swallowed.
     case featureUnavailable
+    /// A zero-row notes update: the meeting is gone or the user cannot write it. Terminal.
+    case meetingNotWritable
 }
 
 /// API contract layer: pure request builders (unit tested) plus thin async ops
@@ -111,6 +113,14 @@ struct MinutiaClient {
         let body: [String: Int] = expectedSegments.map { ["expected_segments": $0] } ?? [:]
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         return request
+    }
+
+    struct CompanionNotesUpdate: Encodable, Equatable {
+        let companion_notes_markdown: String
+    }
+
+    static func companionNotesUpdate(text: String) -> CompanionNotesUpdate {
+        CompanionNotesUpdate(companion_notes_markdown: NotepadDraft.clamp(text))
     }
 
     static func summaryWarmupRequest(instance: URL, meetingId: String, token: String) -> URLRequest {
@@ -269,6 +279,17 @@ struct MinutiaClient {
             .update(update)
             .eq("id", value: meetingId)
             .execute()
+    }
+
+    func syncCompanionNotes(meetingId: String, text: String) async throws {
+        struct Row: Decodable { let id: UUID }
+        let response: PostgrestResponse<[Row]> = try await supabase
+            .from("meetings")
+            .update(Self.companionNotesUpdate(text: text))
+            .eq("id", value: Self.meetingLookupId(meetingId))
+            .select("id")
+            .execute()
+        if response.value.isEmpty { throw MinutiaClientError.meetingNotWritable }
     }
 
     func requestTranscription(meetingId: String, expectedSegments: Int?) async throws {

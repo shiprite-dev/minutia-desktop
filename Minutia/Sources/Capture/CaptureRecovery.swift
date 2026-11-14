@@ -125,7 +125,10 @@ enum CaptureRecovery {
     /// register is idempotent by seq), then upload the full recording, finalize the meeting, and
     /// request transcription. On success the CALLER deletes the directory; a throw leaves it intact
     /// for the next launch to retry.
-    static func recover(directory: URL, manifest: CaptureManifest, client: MinutiaClient) async throws {
+    static func recover(
+        directory: URL, manifest: CaptureManifest, client: MinutiaClient,
+        flushNotes: @escaping @Sendable () async throws -> Void = {}
+    ) async throws {
         let fm = FileManager.default
 
         let names = (try? fm.contentsOfDirectory(atPath: directory.path)) ?? []
@@ -142,7 +145,9 @@ enum CaptureRecovery {
         let attrs = try? fm.attributesOfItem(atPath: recordingURL.path)
         let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
         try await client.finalizeMeeting(meetingId: manifest.meetingId, audioPath: path, duration: duration, sizeBytes: size)
-        try await client.requestTranscription(meetingId: manifest.meetingId, expectedSegments: nil)
+        _ = try await NotepadFinalize.flushThenTranscribe(
+            flush: flushNotes,
+            requestTranscription: { try await client.requestTranscription(meetingId: manifest.meetingId, expectedSegments: nil) })
     }
 
     /// "seg-3-me.m4a" -> 3; nil for the system file, legacy mixed segments, the recording or any other entry.

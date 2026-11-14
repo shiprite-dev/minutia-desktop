@@ -144,7 +144,7 @@ final class CaptureSession: ObservableObject {
 
     /// Stops capture, drains fast-lane uploads, uploads the full recording, and requests the final
     /// transcription. Local files are deleted only once transcription has been accepted.
-    func stop() async throws -> StopResult {
+    func stop(flushNotes: @escaping @Sendable () async throws -> Void = {}) async throws -> StopResult {
         guard let pipeline, let queue, let client, let meetingId, let directory else {
             throw CaptureError.notRunning
         }
@@ -190,7 +190,9 @@ final class CaptureSession: ObservableObject {
             // the controller shows .failed (Retry re-runs refinalize) and the audio directory is kept
             // below, deleted only when the request truly succeeds (a 2xx, or the terminal-503 the
             // client treats as not-lost since the transcript assembles from fast-lane segments).
-            try await client.requestTranscription(meetingId: meetingId, expectedSegments: expected)
+            _ = try await NotepadFinalize.flushThenTranscribe(
+                flush: flushNotes,
+                requestTranscription: { try await client.requestTranscription(meetingId: meetingId, expectedSegments: expected) })
             return (counts: counts, expected: expected, transcriptRequested: true)
         }
 
