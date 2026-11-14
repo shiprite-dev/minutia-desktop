@@ -202,3 +202,31 @@ final class CapturePreserveTests: XCTestCase {
         XCTAssertTrue(CaptureSession.shouldPreserve(framesWritten: 48_000))
     }
 }
+
+final class CaptureRecoverySegmentFileTests: XCTestCase {
+    // Recovery keys one segment off its mic file and derives the system file from the same seq, so a
+    // pair is re-uploaded once; legacy mixed "seg-N.m4a" files from older builds are skipped and the
+    // meeting falls back to the full recording.m4a.
+    func test_segmentSeq_parsesMicChannelFile() {
+        XCTAssertEqual(CaptureRecovery.segmentSeq(from: "seg-3-me.m4a"), 3)
+        XCTAssertEqual(CaptureRecovery.segmentSeq(from: "seg-12-me.m4a"), 12)
+    }
+
+    func test_segmentSeq_ignoresSystemFileLegacyMixedFileAndOthers() {
+        XCTAssertNil(CaptureRecovery.segmentSeq(from: "seg-3-them.m4a"))
+        XCTAssertNil(CaptureRecovery.segmentSeq(from: "seg-3.m4a"))
+        XCTAssertNil(CaptureRecovery.segmentSeq(from: "recording.m4a"))
+        XCTAssertNil(CaptureRecovery.segmentSeq(from: "manifest.json"))
+        XCTAssertNil(CaptureRecovery.segmentSeq(from: "seg-x-me.m4a"))
+    }
+
+    func test_recoveredSegment_pairsBothChannelFilesForTheSeq() throws {
+        let dir = URL(fileURLWithPath: "/tmp/cap", isDirectory: true)
+        let segment = try XCTUnwrap(CaptureRecovery.recoveredSegment(in: dir, name: "seg-2-me.m4a"))
+        XCTAssertEqual(segment.seq, 2)
+        XCTAssertEqual(segment.micURL.lastPathComponent, "seg-2-me.m4a")
+        XCTAssertEqual(segment.sysURL.lastPathComponent, "seg-2-them.m4a")
+        XCTAssertEqual(segment.micURL.deletingLastPathComponent().path, dir.path)
+        XCTAssertNil(CaptureRecovery.recoveredSegment(in: dir, name: "seg-2-them.m4a"))
+    }
+}

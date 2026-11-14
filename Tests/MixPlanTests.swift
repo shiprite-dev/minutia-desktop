@@ -79,4 +79,19 @@ final class MixPlanTests: XCTestCase {
             MixPlan.catchUpChunks(micAvailable: 100 * MixPlan.tickFrames, sysAvailable: 100 * MixPlan.tickFrames),
             MixPlan.maxCatchUpChunks)
     }
+
+    // Each source is written to its own channel file, so a short pop is silence-padded to the tick's
+    // common frame count rather than summed into a mix.
+    func test_pad_extendsShortSourceWithSilence() {
+        XCTAssertEqual(MixPlan.pad([0.1, 0.2], to: 4), [0.1, 0.2, 0, 0])
+    }
+
+    func test_pad_atOrBeyondCount_truncatesToCount() {
+        XCTAssertEqual(MixPlan.pad([0.1, 0.2, 0.3], to: 3), [0.1, 0.2, 0.3])
+        XCTAssertEqual(MixPlan.pad([0.1, 0.2, 0.3], to: 2), [0.1, 0.2])
+    }
+
+    func test_pad_zeroCount_isEmpty() {
+        XCTAssertEqual(MixPlan.pad([0.1], to: 0), [])
+    }
 }

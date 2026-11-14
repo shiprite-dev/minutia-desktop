@@ -29,7 +29,7 @@ private final class StubTransport: SegmentTransport, @unchecked Sendable {
     var uploadedCount: Int { lock.lock(); defer { lock.unlock() }; return _uploaded }
     var registeredCount: Int { lock.lock(); defer { lock.unlock() }; return _registered }
 
-    func uploadSegment(meetingId: String, seq: Int, fileURL: URL) async throws {
+    func uploadSegment(meetingId: String, segment: SegmentWriter.ClosedSegment) async throws {
         lock.lock(); defer { lock.unlock() }
         _uploadAttempts += 1
         if behavior.uploadAlwaysFails { throw StubError() }
@@ -76,7 +76,11 @@ final class UploadQueueBackoffTests: XCTestCase {
 
 final class UploadQueueBehaviorTests: XCTestCase {
     private func segment(_ seq: Int) -> SegmentWriter.ClosedSegment {
-        SegmentWriter.ClosedSegment(seq: seq, fileURL: URL(fileURLWithPath: "/tmp/seg-\(seq).m4a"), frames: 48_000)
+        SegmentWriter.ClosedSegment(
+            seq: seq,
+            micURL: URL(fileURLWithPath: "/tmp/seg-\(seq)-me.m4a"),
+            sysURL: URL(fileURLWithPath: "/tmp/seg-\(seq)-them.m4a"),
+            frames: 48_000)
     }
 
     /// No sleeping in tests: retries resolve instantly.

@@ -26,6 +26,8 @@ private struct AgendaResponse: Codable {
     let events: [AgendaItem]
 }
 
+enum SegmentChannel: String { case me, them }
+
 enum MinutiaClientError: Error, Equatable {
     /// A retriable server failure (5xx other than the terminal 503).
     case serverError(status: Int)
@@ -71,8 +73,8 @@ struct MinutiaClient {
     // RLS policy compares the path's meeting folder to the (lowercase, canonical) meeting id
     // case-sensitively, so a Swift `UUID.uuidString` (uppercase) would be denied on every upload.
 
-    static func segmentPath(meetingId: String, seq: Int) -> String {
-        "\(meetingId.lowercased())/seg-\(seq).m4a"
+    static func segmentPath(meetingId: String, seq: Int, channel: SegmentChannel) -> String {
+        "\(meetingId.lowercased())/seg-\(seq)-\(channel.rawValue).m4a"
     }
 
     static func recordingPath(meetingId: String) -> String {
@@ -87,7 +89,14 @@ struct MinutiaClient {
             token: token
         )
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["path": segmentPath(meetingId: meetingId, seq: seq)])
+        let body: [String: Any] = [
+            "paths": [
+                "me": segmentPath(meetingId: meetingId, seq: seq, channel: .me),
+                "them": segmentPath(meetingId: meetingId, seq: seq, channel: .them),
+            ],
+            "offset_seconds": Double(seq) * SegmentWriter.segmentSeconds,
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         return request
     }
 
@@ -199,14 +208,16 @@ struct MinutiaClient {
         return response.value
     }
 
-    func uploadSegment(meetingId: String, seq: Int, fileURL: URL) async throws {
-        try await supabase.storage
-            .from(Self.audioBucket)
-            .upload(
-                Self.segmentPath(meetingId: meetingId, seq: seq),
-                fileURL: fileURL,
-                options: FileOptions(contentType: "audio/mp4", upsert: true)
-            )
+    func uploadSegment(meetingId: String, segment: SegmentWriter.ClosedSegment) async throws {
+        for (channel, fileURL) in [(SegmentChannel.me, segment.micURL), (.them, segment.sysURL)] {
+            try await supabase.storage
+                .from(Self.audioBucket)
+                .upload(
+                    Self.segmentPath(meetingId: meetingId, seq: segment.seq, channel: channel),
+                    fileURL: fileURL,
+                    options: FileOptions(contentType: "audio/mp4", upsert: true)
+                )
+        }
     }
 
     func registerSegment(meetingId: String, seq: Int) async throws -> Bool {

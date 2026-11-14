@@ -119,9 +119,9 @@ final class MinutiaClientBuilderTests: XCTestCase {
         return object as? NSDictionary
     }
 
-    func test_segmentPath_buildsMeetingScopedM4aPath() {
-        XCTAssertEqual(MinutiaClient.segmentPath(meetingId: "m1", seq: 0), "m1/seg-0.m4a")
-        XCTAssertEqual(MinutiaClient.segmentPath(meetingId: "abc", seq: 12), "abc/seg-12.m4a")
+    func test_segmentPath_buildsMeetingScopedPerChannelM4aPath() {
+        XCTAssertEqual(MinutiaClient.segmentPath(meetingId: "m1", seq: 0, channel: .me), "m1/seg-0-me.m4a")
+        XCTAssertEqual(MinutiaClient.segmentPath(meetingId: "abc", seq: 12, channel: .them), "abc/seg-12-them.m4a")
     }
 
     // Storage RLS compares the path's meeting folder to the lowercase canonical id case-sensitively,
@@ -130,7 +130,8 @@ final class MinutiaClientBuilderTests: XCTestCase {
     private let lowerUUID = "eda64c8e-901a-4b7c-8f21-0a1b2c3d4e5f"
 
     func test_segmentPath_lowercasesUppercaseMeetingId() {
-        XCTAssertEqual(MinutiaClient.segmentPath(meetingId: upperUUID, seq: 3), "\(lowerUUID)/seg-3.m4a")
+        XCTAssertEqual(MinutiaClient.segmentPath(meetingId: upperUUID, seq: 3, channel: .me), "\(lowerUUID)/seg-3-me.m4a")
+        XCTAssertEqual(MinutiaClient.segmentPath(meetingId: upperUUID, seq: 3, channel: .them), "\(lowerUUID)/seg-3-them.m4a")
     }
 
     func test_recordingPath_lowercasesUppercaseMeetingId() {
@@ -160,7 +161,10 @@ final class MinutiaClientBuilderTests: XCTestCase {
         let request = MinutiaClient.registerSegmentRequest(instance: instance, meetingId: upperUUID, seq: 0, token: token)
 
         XCTAssertEqual(request.url, URL(string: "https://minutia.example.com/api/meetings/\(lowerUUID)/segments/0/transcribe"))
-        XCTAssertEqual(jsonBody(request), ["path": "\(lowerUUID)/seg-0.m4a"] as NSDictionary)
+        XCTAssertEqual(jsonBody(request), [
+            "paths": ["me": "\(lowerUUID)/seg-0-me.m4a", "them": "\(lowerUUID)/seg-0-them.m4a"],
+            "offset_seconds": 0,
+        ] as NSDictionary)
     }
 
     func test_finalTranscribeRequest_lowercasesRoute() {
@@ -182,7 +186,27 @@ final class MinutiaClientBuilderTests: XCTestCase {
         XCTAssertEqual(request.httpMethod, "POST")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-access-token")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
-        XCTAssertEqual(jsonBody(request), ["path": "m1/seg-0.m4a"] as NSDictionary)
+        XCTAssertEqual(jsonBody(request), [
+            "paths": ["me": "m1/seg-0-me.m4a", "them": "m1/seg-0-them.m4a"],
+            "offset_seconds": 0,
+        ] as NSDictionary)
+    }
+
+    // The dual-channel body carries no legacy `path` key, so an older server rejects it with a clean
+    // 400 (terminal, uploaded-not-registered) and falls back to the mixed recording.m4a at stop.
+    func test_registerSegmentRequest_omitsLegacyPathKey() {
+        let request = MinutiaClient.registerSegmentRequest(instance: instance, meetingId: "m1", seq: 2, token: token)
+        XCTAssertNil(jsonBody(request)?["path"])
+    }
+
+    // Each segment is exactly SegmentWriter.segmentFrames long except the trailing one, so a segment's
+    // absolute start is seq * segmentSeconds; the server adds it to every provider timestamp.
+    func test_registerSegmentRequest_sendsAbsoluteOffsetForLaterSegments() {
+        let request = MinutiaClient.registerSegmentRequest(instance: instance, meetingId: "m1", seq: 3, token: token)
+        XCTAssertEqual(jsonBody(request)?["offset_seconds"] as? Double, 900)
+        XCTAssertEqual(
+            jsonBody(request)?["paths"] as? NSDictionary,
+            ["me": "m1/seg-3-me.m4a", "them": "m1/seg-3-them.m4a"] as NSDictionary)
     }
 
     func test_finalTranscribeRequest_withExpectedSegments_sendsCount() {

@@ -345,7 +345,7 @@ private final class CapturePipeline {
 
     /// Stops the timer, tap, and mic, then closes the files. Returns the trailing partial segment
     /// (if any) and the full recording.
-    func finishCapture() -> (finalSegment: SegmentWriter.ClosedSegment?, recording: SegmentWriter.ClosedSegment)? {
+    func finishCapture() -> (finalSegment: SegmentWriter.ClosedSegment?, recording: SegmentWriter.Recording)? {
         timer?.cancel()
         timer = nil
         // cancel() does not wait for an in-flight handler; barrier on tickQueue so no tick() is
@@ -407,19 +407,17 @@ private final class CapturePipeline {
         onTick?(peak, closedCount, framesDrained)
     }
 
-    /// Mixes one drained chunk, appends it to the writer, hands off any closed segments, and returns
+    /// Pads one drained chunk, appends it to the writer, hands off any closed segments, and returns
     /// the chunk's peak. Accumulates the closed-segment count across the tick's chunks.
     private func mixAndWrite(micGot: Int, sysGot: Int, count: Int, closedCount: inout Int) throws -> Float {
-        let mixed = MixPlan.mix(
-            mic: Array(micScratch[0..<micGot]),
-            sys: Array(sysScratch[0..<sysGot]),
-            count: count
-        )
-        let closed = try writer.append(mixed)
+        let mic = MixPlan.pad(Array(micScratch[0..<micGot]), to: count)
+        let sys = MixPlan.pad(Array(sysScratch[0..<sysGot]), to: count)
+        let closed = try writer.append(mic: mic, sys: sys)
         for segment in closed { onSegment?(segment) }
         closedCount += closed.count
         var peak: Float = 0
-        for sample in mixed { peak = max(peak, abs(sample)) }
+        for sample in mic { peak = max(peak, abs(sample)) }
+        for sample in sys { peak = max(peak, abs(sample)) }
         return peak
     }
 }
