@@ -3,7 +3,7 @@ import Foundation
 /// Upload + register surface the queue drives. MinutiaClient satisfies it directly (its method
 /// names and signatures already match), so tests can stand in a stub without touching the network.
 protocol SegmentTransport {
-    func uploadSegment(meetingId: String, seq: Int, fileURL: URL) async throws
+    func uploadSegment(meetingId: String, segment: SegmentWriter.ClosedSegment) async throws
     func registerSegment(meetingId: String, seq: Int) async throws -> Bool
 }
 
@@ -119,7 +119,7 @@ actor UploadQueue {
             if Task.isCancelled { return }
             do {
                 if !didUpload {
-                    try await transport.uploadSegment(meetingId: meetingId, seq: segment.seq, fileURL: segment.fileURL)
+                    try await transport.uploadSegment(meetingId: meetingId, segment: segment)
                     didUpload = true
                     uploaded += 1
                     await onProgress(uploaded)

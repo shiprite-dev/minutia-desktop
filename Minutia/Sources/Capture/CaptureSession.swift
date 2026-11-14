@@ -19,6 +19,11 @@ final class CaptureSession: ObservableObject {
     /// failed), so only the microphone is being captured. Drives a persistent caption in
     /// RecordingView. Reset false on every start.
     @Published private(set) var systemAudioDegraded = false
+    /// True when no microphone exists, so only system audio is being captured. Reset like
+    /// `systemAudioDegraded`.
+    @Published private(set) var micUnavailable = false
+
+    static let micUnavailableNotice = "No microphone found. Recording meeting audio only."
 
     /// Fired when capture dies mid-flight (denied mic, disk-full write). Carries a user-facing
     /// message and whether the capture directory was preserved for startup recovery (a disk-full or
@@ -125,6 +130,12 @@ final class CaptureSession: ObservableObject {
         pipeline.onSystemAudioUnavailable = { [weak self] in
             Task { @MainActor in self?.systemAudioDegraded = true }
         }
+        pipeline.onSystemAudioRecovered = { [weak self] in
+            Task { @MainActor in self?.systemAudioDegraded = false }
+        }
+        pipeline.onMicUnavailable = { [weak self] in
+            Task { @MainActor in self?.micUnavailable = true }
+        }
         try pipeline.start()
 
         self.pipeline = pipeline
@@ -140,11 +151,12 @@ final class CaptureSession: ObservableObject {
         segmentsTotal = 0
         reconnecting = false
         systemAudioDegraded = false
+        micUnavailable = false
     }
 
     /// Stops capture, drains fast-lane uploads, uploads the full recording, and requests the final
     /// transcription. Local files are deleted only once transcription has been accepted.
-    func stop() async throws -> StopResult {
+    func stop(flushNotes: @escaping @Sendable () async throws -> Void = {}) async throws -> StopResult {
         guard let pipeline, let queue, let client, let meetingId, let directory else {
             throw CaptureError.notRunning
         }
@@ -162,6 +174,7 @@ final class CaptureSession: ObservableObject {
             self.startedAt = nil
             self.lastFramesAt = nil
             self.reconnecting = false
+            self.micUnavailable = false
         }
 
         let finished = pipeline.finishCapture()
@@ -174,8 +187,7 @@ final class CaptureSession: ObservableObject {
         // .finalizing forever. TimeoutError propagates to the controller, which shows .error (Retry).
         let outcome = try await withTimeout(seconds: Self.finalizeTimeout) {
             let counts = await queue.drainAndWait()
-            let total = counts.enqueued
-            let allRegistered = total > 0 && counts.registered == total
+            let expected = Self.expectedSegments(enqueued: counts.enqueued, registered: counts.registered)
 
             if let recording = finished?.recording {
                 let path = try await client.uploadRecording(meetingId: meetingId, fileURL: recording.fileURL)
@@ -185,12 +197,13 @@ final class CaptureSession: ObservableObject {
                 try await client.finalizeMeeting(meetingId: meetingId, audioPath: path, duration: duration, sizeBytes: size)
             }
 
-            let expected = allRegistered ? total : nil
             // A failed requestTranscription must never read as an accepted transcript: it rethrows so
             // the controller shows .failed (Retry re-runs refinalize) and the audio directory is kept
             // below, deleted only when the request truly succeeds (a 2xx, or the terminal-503 the
             // client treats as not-lost since the transcript assembles from fast-lane segments).
-            try await client.requestTranscription(meetingId: meetingId, expectedSegments: expected)
+            _ = try await NotepadFinalize.flushThenTranscribe(
+                flush: flushNotes,
+                requestTranscription: { try await client.requestTranscription(meetingId: meetingId, expectedSegments: expected) })
             return (counts: counts, expected: expected, transcriptRequested: true)
         }
 
@@ -223,6 +236,13 @@ final class CaptureSession: ObservableObject {
         }
     }
 
+    /// Only a fully registered set of fast-lane segments is announced; otherwise (none registered on
+    /// a server that rejects segment registers, or some lost) the server transcribes the whole
+    /// recording instead of waiting on segments that never arrive.
+    nonisolated static func expectedSegments(enqueued: Int, registered: Int) -> Int? {
+        enqueued > 0 && registered == enqueued ? enqueued : nil
+    }
+
     nonisolated static func shouldWatchdogFire(secondsSinceFrames: TimeInterval, threshold: TimeInterval) -> Bool {
         secondsSinceFrames >= threshold
     }
@@ -250,6 +270,7 @@ final class CaptureSession: ObservableObject {
         segmentsUploaded = 0
         segmentsTotal = 0
         reconnecting = false
+        micUnavailable = false
         onFailure?(Self.failureMessage(for: error), preserveForRecovery)
     }
 
@@ -261,7 +282,26 @@ final class CaptureSession: ObservableObject {
         framesWritten > 0
     }
 
+    enum MicFailureDisposition: Equatable { case continueWithoutMic, fatal }
+
+    /// A missing input device is survivable while system audio records; anything else (a denied
+    /// permission, a converter or engine fault) stays fatal.
+    nonisolated static func micFailureDisposition(for error: Error, systemAudioAvailable: Bool) -> MicFailureDisposition {
+        isNoInputDevice(error) && systemAudioAvailable ? .continueWithoutMic : .fatal
+    }
+
+    /// kAudioUnitErr_NoConnection (-10876) is what AVAudioEngine throws when the input device
+    /// vanishes between MicCapture's device check and the engine start.
+    nonisolated private static func isNoInputDevice(_ error: Error) -> Bool {
+        if case .noInputDevice? = error as? MicCapture.CaptureError { return true }
+        let ns = error as NSError
+        return ns.domain == "com.apple.coreaudio.avfaudio" && ns.code == -10876
+    }
+
     nonisolated static func failureMessage(for error: Error) -> String {
+        if isNoInputDevice(error) {
+            return "No microphone or meeting audio found to record."
+        }
         if let micError = error as? MicCapture.CaptureError, case .permissionDenied = micError {
             return "Grant microphone access in System Settings to record."
         }
@@ -288,6 +328,11 @@ private final class CapturePipeline {
     /// Fired when the system-audio tap cannot start, or a mid-recording rebuild permanently fails,
     /// so capture continues mic-only. Non-fatal: the recording keeps going.
     var onSystemAudioUnavailable: (() -> Void)?
+    /// Fired when a mid-recording rebuild succeeds after it was reported as failing.
+    var onSystemAudioRecovered: (() -> Void)?
+    /// Fired when no microphone exists but system audio is recording, so capture continues
+    /// system-only. Non-fatal.
+    var onMicUnavailable: (() -> Void)?
 
     private let micBuffer: RingBuffer
     private let sysBuffer: RingBuffer
@@ -319,21 +364,33 @@ private final class CapturePipeline {
             Self.logger.error("System audio lost mid-recording: \(String(describing: error), privacy: .public)")
             self?.onSystemAudioUnavailable?()
         }
+        tap.onRecovered = { [weak self] in self?.onSystemAudioRecovered?() }
         // System audio is best-effort: if the tap can't start (no default output device, transient
         // HAL error), degrade to mic-only rather than failing the whole recording. The tick mixes
         // against an empty sys buffer, which the existing silence-pad already handles. Only a mic
         // failure (below) is fatal.
+        var systemAudioAvailable = true
         do { try tap.start() }
         catch {
+            systemAudioAvailable = false
             Self.logger.warning("System audio unavailable, recording mic-only: \(String(describing: error), privacy: .public)")
             onSystemAudioUnavailable?()
         }
         // A denied mic must surface, not be swallowed: without this a permission-denied recording
         // looks healthy but captures only system audio. Preserve the dir when the tick has already
         // written system audio during the permission prompt; deleting it would lose that audio.
-        Task {
+        // A Mac with no microphone at all keeps recording system audio; the tick pads the empty mic.
+        Task { [systemAudioAvailable] in
             do { try await mic.start() }
-            catch { self.onFatal?(error, CaptureSession.shouldPreserve(framesWritten: self.writer.totalFrames)) }
+            catch {
+                switch CaptureSession.micFailureDisposition(for: error, systemAudioAvailable: systemAudioAvailable) {
+                case .continueWithoutMic:
+                    Self.logger.warning("No microphone, recording system audio only: \(String(describing: error), privacy: .public)")
+                    self.onMicUnavailable?()
+                case .fatal:
+                    self.onFatal?(error, CaptureSession.shouldPreserve(framesWritten: self.writer.totalFrames))
+                }
+            }
         }
 
         let timer = DispatchSource.makeTimerSource(queue: tickQueue)
@@ -345,7 +402,7 @@ private final class CapturePipeline {
 
     /// Stops the timer, tap, and mic, then closes the files. Returns the trailing partial segment
     /// (if any) and the full recording.
-    func finishCapture() -> (finalSegment: SegmentWriter.ClosedSegment?, recording: SegmentWriter.ClosedSegment)? {
+    func finishCapture() -> (finalSegment: SegmentWriter.ClosedSegment?, recording: SegmentWriter.Recording)? {
         timer?.cancel()
         timer = nil
         // cancel() does not wait for an in-flight handler; barrier on tickQueue so no tick() is
@@ -407,19 +464,17 @@ private final class CapturePipeline {
         onTick?(peak, closedCount, framesDrained)
     }
 
-    /// Mixes one drained chunk, appends it to the writer, hands off any closed segments, and returns
+    /// Pads one drained chunk, appends it to the writer, hands off any closed segments, and returns
     /// the chunk's peak. Accumulates the closed-segment count across the tick's chunks.
     private func mixAndWrite(micGot: Int, sysGot: Int, count: Int, closedCount: inout Int) throws -> Float {
-        let mixed = MixPlan.mix(
-            mic: Array(micScratch[0..<micGot]),
-            sys: Array(sysScratch[0..<sysGot]),
-            count: count
-        )
-        let closed = try writer.append(mixed)
+        let mic = MixPlan.pad(Array(micScratch[0..<micGot]), to: count)
+        let sys = MixPlan.pad(Array(sysScratch[0..<sysGot]), to: count)
+        let closed = try writer.append(mic: mic, sys: sys)
         for segment in closed { onSegment?(segment) }
         closedCount += closed.count
         var peak: Float = 0
-        for sample in mixed { peak = max(peak, abs(sample)) }
+        for sample in mic { peak = max(peak, abs(sample)) }
+        for sample in sys { peak = max(peak, abs(sample)) }
         return peak
     }
 }

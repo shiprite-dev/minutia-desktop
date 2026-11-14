@@ -41,9 +41,10 @@ struct MenuContent: View {
                 case .detected(let app):
                     IdleView(controller: controller, detectedVia: app ?? "Calendar")
                 case .recording:
-                    RecordingView(session: controller.captureSession) {
-                        controller.stopRecording()
-                    }
+                    RecordingView(
+                        session: controller.captureSession,
+                        onNotes: { controller.notepad.showAndFocus() },
+                        onStop: { controller.stopRecording() })
                 case .finalizing:
                     FinalizingView()
                 case .error(let message):
@@ -66,7 +67,7 @@ private struct IdleView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if !controller.micAuthorized {
+            if controller.micBannerVisible {
                 MicPermissionBanner()
             }
 

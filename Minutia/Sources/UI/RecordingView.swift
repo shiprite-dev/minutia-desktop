@@ -4,6 +4,7 @@ import SwiftUI
 /// peak-hold level, upload progress, and the Stop button.
 struct RecordingView: View {
     @ObservedObject var session: CaptureSession
+    let onNotes: () -> Void
     let onStop: () -> Void
 
     static let barCount = 8
@@ -49,6 +50,23 @@ struct RecordingView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            if session.micUnavailable {
+                Text(CaptureSession.micUnavailableNotice)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Button {
+                onNotes()
+            } label: {
+                Label("Notes", systemImage: "note.text")
+                    .frame(maxWidth: .infinity)
+            }
+            .controlSize(.large)
+            .accessibilityLabel("Show meeting notes")
+            .accessibilityHint("Option Command N")
 
             Button {
                 onStop()

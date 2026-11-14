@@ -37,4 +37,12 @@ enum MixPlan {
         }
         return out
     }
+
+    /// Silence-pads (or truncates) `samples` to exactly `count` frames.
+    static func pad(_ samples: [Float], to count: Int) -> [Float] {
+        guard count > 0 else { return [] }
+        return samples.count >= count
+            ? Array(samples[0..<count])
+            : samples + [Float](repeating: 0, count: count - samples.count)
+    }
 }

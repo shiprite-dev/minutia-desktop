@@ -264,9 +264,11 @@ final class AppController: NSObject, ObservableObject {
     /// Soft detection: mic active with no corroborating app/calendar signal. Surfaced quietly
     /// (menu bar glyph + one secondary row), never a notification. See `shouldShowSoftHint`.
     @Published private(set) var softHint: Bool = false
-    /// True when the app has microphone access; drives the in-menu "grant access" banner. System
-    /// audio TCC has no queryable status, so only the mic is reflected here.
-    @Published private(set) var micAuthorized = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    /// Drives the in-menu "grant access" banner. System audio TCC has no queryable status, so only
+    /// the mic is reflected here.
+    @Published private(set) var micBannerVisible = AppController.showsMicPermissionBanner(
+        status: AVCaptureDevice.authorizationStatus(for: .audio),
+        hasInputDevice: AVCaptureDevice.default(for: .audio) != nil)
     /// True when notification permission is denied; drives the Settings row nudging the user to
     /// enable it, since detection and consent prompts otherwise have no way to reach them.
     @Published private(set) var notificationsDenied = false
@@ -284,6 +286,7 @@ final class AppController: NSObject, ObservableObject {
 
     let authManager = AuthManager()
     let captureSession = CaptureSession()
+    let notepad = NotepadController()
     let detector = MeetingDetector()
 
     static let lastSeriesKey = "app.minutia.lastSeries"
@@ -389,8 +392,15 @@ final class AppController: NSObject, ObservableObject {
     /// denied/restricted; starting the RPC first would orphan an empty server meeting. A
     /// `.notDetermined` status flows through unchanged so the deliberate prompt-during-capture design
     /// (which preserves system audio recorded while the dialog is up) is untouched.
-    nonisolated static func micPreCheckFails(status: AVAuthorizationStatus) -> Bool {
-        status == .denied || status == .restricted
+    /// Without an input device the permission is moot: recording continues with system audio only.
+    nonisolated static func micPreCheckFails(status: AVAuthorizationStatus, hasInputDevice: Bool = true) -> Bool {
+        hasInputDevice && (status == .denied || status == .restricted)
+    }
+
+    /// With no input device the permission is never requested, so the status never settles and
+    /// there is nothing to grant.
+    nonisolated static func showsMicPermissionBanner(status: AVAuthorizationStatus, hasInputDevice: Bool) -> Bool {
+        hasInputDevice && status != .authorized
     }
 
     /// The pre-flight branch for a series Record press: refuse before any server call when the mic is
@@ -402,8 +412,8 @@ final class AppController: NSObject, ObservableObject {
         case proceed
     }
 
-    nonisolated static func recordPreflight(micStatus: AVAuthorizationStatus, hasSeries: Bool) -> RecordPreflight {
-        if micPreCheckFails(status: micStatus) { return .micDenied }
+    nonisolated static func recordPreflight(micStatus: AVAuthorizationStatus, hasInputDevice: Bool = true, hasSeries: Bool) -> RecordPreflight {
+        if micPreCheckFails(status: micStatus, hasInputDevice: hasInputDevice) { return .micDenied }
         if !hasSeries { return .noSeries }
         return .proceed
     }
@@ -612,6 +622,7 @@ final class AppController: NSObject, ObservableObject {
                 preservedForRecovery: preserved,
                 recordingMeetingId: self.recordingMeetingId?.uuidString,
                 hasSeries: self.recordingSeriesId != nil)
+            self.notepad.end()
             self.apply(.failed(message))
         }
 
@@ -681,7 +692,9 @@ final class AppController: NSObject, ObservableObject {
     /// Refresh the mic-authorization and notification-permission flags that drive the in-menu and
     /// Settings guidance. Called on idle entry and when the menu/Settings appear.
     func refreshPermissionState() {
-        micAuthorized = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        micBannerVisible = Self.showsMicPermissionBanner(
+            status: AVCaptureDevice.authorizationStatus(for: .audio),
+            hasInputDevice: AVCaptureDevice.default(for: .audio) != nil)
         UNUserNotificationCenter.current().getNotificationSettings { settings in
             Task { @MainActor in
                 self.notificationsDenied = settings.authorizationStatus == .denied
@@ -749,6 +762,7 @@ final class AppController: NSObject, ObservableObject {
                 recordingSeriesId = nil
                 recordingInstance = nil
             }
+            notepad.signOut()
             lastFailedStart = nil
             pendingRecordConsent = nil
             apply(.signedOut)
@@ -966,6 +980,7 @@ final class AppController: NSObject, ObservableObject {
         guard let client = authManager.client() else { return }
         switch Self.recordPreflight(
             micStatus: AVCaptureDevice.authorizationStatus(for: .audio),
+            hasInputDevice: AVCaptureDevice.default(for: .audio) != nil,
             hasSeries: selectedSeriesId != nil) {
         case .micDenied:
             // Refuse before any server call: starting the RPC first would orphan an empty meeting.
@@ -988,6 +1003,7 @@ final class AppController: NSObject, ObservableObject {
                 let meeting = try await client.startOrJoinMeeting(seriesId: seriesId)
                 let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
                 try captureSession.start(meetingId: meeting.id.uuidString, seriesId: seriesId, userId: userId, client: client)
+                notepad.begin(meetingId: meeting.id.uuidString, instance: instance, userId: userId, client: client)
                 recordingMeetingId = meeting.id
                 recordingSeriesId = seriesId
                 recordingInstance = instance
@@ -1005,7 +1021,9 @@ final class AppController: NSObject, ObservableObject {
     /// No series is known, so the stop-time recap is left to the browser tab the user came from.
     func startRecording(meetingId: String) {
         guard Self.canStartRecording(from: phase), let client = authManager.client() else { return }
-        if Self.micPreCheckFails(status: AVCaptureDevice.authorizationStatus(for: .audio)) {
+        if Self.micPreCheckFails(
+            status: AVCaptureDevice.authorizationStatus(for: .audio),
+            hasInputDevice: AVCaptureDevice.default(for: .audio) != nil) {
             apply(.failed(CaptureSession.failureMessage(for: MicCapture.CaptureError.permissionDenied)))
             return
         }
@@ -1014,6 +1032,7 @@ final class AppController: NSObject, ObservableObject {
             do {
                 let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
                 try captureSession.start(meetingId: meetingId, seriesId: nil, userId: userId, client: client)
+                notepad.begin(meetingId: meetingId, instance: instance, userId: userId, client: client)
                 recordingMeetingId = UUID(uuidString: meetingId)
                 recordingSeriesId = nil
                 recordingInstance = instance
@@ -1116,12 +1135,13 @@ final class AppController: NSObject, ObservableObject {
         // captureSession.stop() again (it would throw notRunning and flip the UI to error).
         guard case .recording = phase else { return }
         apply(.recordStopped)
+        notepad.end()
         let meetingId = recordingMeetingId
         let seriesId = recordingSeriesId
         let instance = recordingInstance
         Task {
             do {
-                _ = try await captureSession.stop()
+                _ = try await captureSession.stop(flushNotes: { [notepad] in try await notepad.flushNow() })
                 recordingMeetingId = nil
                 recordingSeriesId = nil
                 recordingInstance = nil
@@ -1147,7 +1167,7 @@ final class AppController: NSObject, ObservableObject {
         case .stop:
             apply(.recordStopped)
             do {
-                _ = try await captureSession.stop()
+                _ = try await captureSession.stop(flushNotes: { [notepad] in try await notepad.flushNow() })
                 recordingMeetingId = nil
                 recordingSeriesId = nil
                 recordingInstance = nil
@@ -1185,10 +1205,13 @@ final class AppController: NSObject, ObservableObject {
         guard recoveryTask == nil, let client = authManager.client(), let instance = authManager.instance else { return }
         let activeId = recordingMeetingId?.uuidString
         recoveryActive = true
+        let notepad = notepad
         recoveryTask = Task { [weak self] in
             let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
             let result = await Self.recoverAll(
-                client: client, instance: instance, connectedUserId: userId, excluding: activeId)
+                client: client, instance: instance, connectedUserId: userId, excluding: activeId,
+                flushNotes: { id in try await notepad.flush(meetingId: id, client: client) })
+            await notepad.replayPending(client: client)
             // Recovery is otherwise silent; tell the user each rescued meeting is being finished, and
             // make tapping the notification open its recap.
             for manifest in result.recovered {
@@ -1258,7 +1281,8 @@ final class AppController: NSObject, ObservableObject {
     /// manifests it successfully recovered (and deleted) so the caller can notify. Nonisolated and
     /// static so it stays testable and off the main actor.
     nonisolated static func recoverAll(
-        client: MinutiaClient, instance: URL, connectedUserId: String?, excluding activeMeetingId: String?
+        client: MinutiaClient, instance: URL, connectedUserId: String?, excluding activeMeetingId: String?,
+        flushNotes: @escaping @Sendable (String) async throws -> Void = { _ in }
     ) async -> (recovered: [CaptureManifest], transcriptionUnavailable: [CaptureManifest], exhausted: [CaptureManifest]) {
         var recovered: [CaptureManifest] = []
         var transcriptionUnavailable: [CaptureManifest] = []
@@ -1280,13 +1304,18 @@ final class AppController: NSObject, ObservableObject {
             if sweep.skip { continue }
             var caught: Error?
             do {
-                try await CaptureRecovery.recover(directory: dir, manifest: manifest, client: client)
+                try await CaptureRecovery.recover(
+                    directory: dir, manifest: manifest, client: client,
+                    flushNotes: { try await flushNotes(manifest.meetingId) })
             } catch {
                 caught = error
             }
             switch recoveryOutcome(for: caught) {
             case .recovered:
                 try? FileManager.default.removeItem(at: dir)
+                if let notesRoot = try? NotepadStore.notesRoot() {
+                    NotepadStore.removeIfSynced(meetingId: manifest.meetingId, in: notesRoot)
+                }
                 recovered.append(manifest)
             case .transcriptionUnavailable:
                 // Keep the directory: the audio is safe (uploaded + finalized) and the entitlement may
@@ -1359,8 +1388,13 @@ final class AppController: NSObject, ObservableObject {
                 guard let manifest = CaptureRecovery.loadManifest(from: dir) else {
                     throw CaptureSession.CaptureError.notRunning
                 }
-                try await CaptureRecovery.recover(directory: dir, manifest: manifest, client: client)
+                try await CaptureRecovery.recover(
+                    directory: dir, manifest: manifest, client: client,
+                    flushNotes: { [notepad] in try await notepad.flush(meetingId: meetingId, client: client) })
                 try? FileManager.default.removeItem(at: dir)
+                if let notesRoot = try? NotepadStore.notesRoot() {
+                    NotepadStore.removeIfSynced(meetingId: meetingId, in: notesRoot)
+                }
                 apply(.finalized)
                 if let meetingUUID = UUID(uuidString: manifest.meetingId) {
                     await openRecap(

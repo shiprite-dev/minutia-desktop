@@ -1,14 +1,22 @@
 import Foundation
 import AVFoundation
 
-/// Writes mixed mono 48k PCM to the rotating segment file AND the continuous full recording file.
-/// Every file is AAC in an .m4a container; PCM is handed over via an `AVAudioPCMBuffer` in the
-/// file's `processingFormat`.
+/// Writes each rotating segment as two mono files (microphone, system audio) AND the continuous mixed
+/// full recording. Every file is AAC in an .m4a container; PCM is handed over via an
+/// `AVAudioPCMBuffer` in the file's `processingFormat`.
 final class SegmentWriter {
-    static let segmentFrames: Int64 = 48_000 * 300   // 5 minutes
+    static let segmentSeconds: Double = 300
+    static let segmentFrames: Int64 = 48_000 * Int64(segmentSeconds)
 
     struct ClosedSegment: Equatable {
         let seq: Int
+        let micURL: URL
+        let sysURL: URL
+        let frames: Int64
+        var offsetSeconds: Double { Double(seq) * SegmentWriter.segmentSeconds }
+    }
+
+    struct Recording {
         let fileURL: URL
         let frames: Int64
     }
@@ -26,7 +34,8 @@ final class SegmentWriter {
     private let format: AVAudioFormat
     private let recordingURL: URL
     private var recordingFile: AVAudioFile?
-    private var segmentFile: AVAudioFile?
+    private var micFile: AVAudioFile?
+    private var sysFile: AVAudioFile?
     private var segmentFrameCount: Int64 = 0
 
     private(set) var currentSeq: Int = 0
@@ -38,15 +47,20 @@ final class SegmentWriter {
         let recording = try AVAudioFile(forWriting: recordingURL, settings: SegmentWriter.fileSettings)
         recordingFile = recording
         format = recording.processingFormat
-        segmentFile = try openSegment(seq: 0)
+        (micFile, sysFile) = try openSegment(seq: 0)
     }
 
-    private func segmentURL(_ seq: Int) -> URL {
-        directory.appendingPathComponent("seg-\(seq).m4a")
+    private func segmentURL(_ seq: Int, _ channel: String) -> URL {
+        directory.appendingPathComponent("seg-\(seq)-\(channel).m4a")
     }
 
-    private func openSegment(seq: Int) throws -> AVAudioFile {
-        try AVAudioFile(forWriting: segmentURL(seq), settings: SegmentWriter.fileSettings)
+    private func openSegment(seq: Int) throws -> (AVAudioFile, AVAudioFile) {
+        (try AVAudioFile(forWriting: segmentURL(seq, "me"), settings: SegmentWriter.fileSettings),
+         try AVAudioFile(forWriting: segmentURL(seq, "them"), settings: SegmentWriter.fileSettings))
+    }
+
+    private func closedSegment(seq: Int, frames: Int64) -> ClosedSegment {
+        ClosedSegment(seq: seq, micURL: segmentURL(seq, "me"), sysURL: segmentURL(seq, "them"), frames: frames)
     }
 
     private func write(_ samples: [Float], from start: Int, count: Int, to file: AVAudioFile) throws {
@@ -60,56 +74,60 @@ final class SegmentWriter {
         try file.write(from: buffer)
     }
 
-    /// Appends samples to both files, rotating the segment file whenever it fills. Loops until every
-    /// sample is consumed so a single call spanning multiple rotation boundaries surfaces every
-    /// closed segment (empty array = no rotation this call).
-    func append(_ samples: [Float]) throws -> [ClosedSegment] {
-        guard !samples.isEmpty, let active0 = segmentFile, let recording = recordingFile else {
+    /// Appends equal-length mic and system samples: each goes to its own segment file and the mix to
+    /// the recording, rotating whenever the segment fills. Loops until every sample is consumed so a
+    /// single call spanning multiple rotation boundaries surfaces every closed segment (empty array =
+    /// no rotation this call).
+    func append(mic: [Float], sys: [Float]) throws -> [ClosedSegment] {
+        precondition(mic.count == sys.count)
+        guard !mic.isEmpty, var micActive = micFile, var sysActive = sysFile, let recording = recordingFile else {
             return []
         }
+        let mixed = MixPlan.mix(mic: mic, sys: sys, count: mic.count)
         var idx = 0
         var closed: [ClosedSegment] = []
-        var active = active0
-        while idx < samples.count {
+        while idx < mic.count {
             let remainInSegment = Int(SegmentWriter.segmentFrames - segmentFrameCount)
-            let chunk = min(samples.count - idx, remainInSegment, SegmentWriter.chunkFrames)
+            let chunk = min(mic.count - idx, remainInSegment, SegmentWriter.chunkFrames)
 
-            try write(samples, from: idx, count: chunk, to: recording)
-            try write(samples, from: idx, count: chunk, to: active)
+            try write(mixed, from: idx, count: chunk, to: recording)
+            try write(mic, from: idx, count: chunk, to: micActive)
+            try write(sys, from: idx, count: chunk, to: sysActive)
             segmentFrameCount += Int64(chunk)
             totalFrames += Int64(chunk)
             idx += chunk
 
             if segmentFrameCount == SegmentWriter.segmentFrames {
                 let nextSeq = currentSeq + 1
-                active = try openSegment(seq: nextSeq)
-                closed.append(ClosedSegment(seq: currentSeq, fileURL: segmentURL(currentSeq), frames: segmentFrameCount))
+                (micActive, sysActive) = try openSegment(seq: nextSeq)
+                closed.append(closedSegment(seq: currentSeq, frames: segmentFrameCount))
                 currentSeq = nextSeq
                 segmentFrameCount = 0
-                segmentFile = active
+                micFile = micActive
+                sysFile = sysActive
             }
         }
         return closed
     }
 
-    /// Closes both files. Returns the trailing partial segment (nil when it holds no frames) and the
-    /// full recording. An empty trailing segment file (rotation landed exactly on the boundary) is
-    /// deleted from disk rather than left as an orphan.
-    func finish() throws -> (finalSegment: ClosedSegment?, recording: ClosedSegment) {
+    /// Closes all files. Returns the trailing partial segment (nil when it holds no frames) and the
+    /// full recording. Empty trailing channel files (rotation landed exactly on the boundary) are
+    /// deleted from disk rather than left as orphans.
+    func finish() throws -> (finalSegment: ClosedSegment?, recording: Recording) {
         let partialFrames = segmentFrameCount
         let seq = currentSeq
         let recordingFrames = totalFrames
-        segmentFile = nil
+        micFile = nil
+        sysFile = nil
         recordingFile = nil
 
         let finalSegment: ClosedSegment?
         if partialFrames > 0 {
-            finalSegment = ClosedSegment(seq: seq, fileURL: segmentURL(seq), frames: partialFrames)
+            finalSegment = closedSegment(seq: seq, frames: partialFrames)
         } else {
             finalSegment = nil
-            try? FileManager.default.removeItem(at: segmentURL(seq))
+            for channel in ["me", "them"] { try? FileManager.default.removeItem(at: segmentURL(seq, channel)) }
         }
-        let recording = ClosedSegment(seq: -1, fileURL: recordingURL, frames: recordingFrames)
-        return (finalSegment, recording)
+        return (finalSegment, Recording(fileURL: recordingURL, frames: recordingFrames))
     }
 }

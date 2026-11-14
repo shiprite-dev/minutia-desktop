@@ -125,14 +125,18 @@ enum CaptureRecovery {
     /// register is idempotent by seq), then upload the full recording, finalize the meeting, and
     /// request transcription. On success the CALLER deletes the directory; a throw leaves it intact
     /// for the next launch to retry.
-    static func recover(directory: URL, manifest: CaptureManifest, client: MinutiaClient) async throws {
+    static func recover(
+        directory: URL, manifest: CaptureManifest, client: MinutiaClient,
+        flushNotes: @escaping @Sendable () async throws -> Void = {}
+    ) async throws {
         let fm = FileManager.default
 
-        let segments = (try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
-        for url in segments {
-            guard let seq = segmentSeq(from: url.lastPathComponent) else { continue }
-            try? await client.uploadSegment(meetingId: manifest.meetingId, seq: seq, fileURL: url)
-            _ = try? await client.registerSegment(meetingId: manifest.meetingId, seq: seq)
+        let names = (try? fm.contentsOfDirectory(atPath: directory.path)) ?? []
+        for name in names {
+            guard let segment = recoveredSegment(in: directory, name: name),
+                  fm.fileExists(atPath: segment.sysURL.path) else { continue }
+            try? await client.uploadSegment(meetingId: manifest.meetingId, segment: segment)
+            _ = try? await client.registerSegment(meetingId: manifest.meetingId, seq: segment.seq)
         }
 
         let recordingURL = directory.appendingPathComponent(recordingName)
@@ -141,13 +145,25 @@ enum CaptureRecovery {
         let attrs = try? fm.attributesOfItem(atPath: recordingURL.path)
         let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
         try await client.finalizeMeeting(meetingId: manifest.meetingId, audioPath: path, duration: duration, sizeBytes: size)
-        try await client.requestTranscription(meetingId: manifest.meetingId, expectedSegments: nil)
+        _ = try await NotepadFinalize.flushThenTranscribe(
+            flush: flushNotes,
+            requestTranscription: { try await client.requestTranscription(meetingId: manifest.meetingId, expectedSegments: nil) })
     }
 
-    /// "seg-3.m4a" -> 3; nil for the recording file or any other entry.
+    /// "seg-3-me.m4a" -> 3; nil for the system file, legacy mixed segments, the recording or any other entry.
     static func segmentSeq(from name: String) -> Int? {
-        guard name.hasPrefix("seg-"), name.hasSuffix(".m4a") else { return nil }
-        return Int(name.dropFirst(4).dropLast(4))
+        guard name.hasPrefix("seg-"), name.hasSuffix("-me.m4a") else { return nil }
+        return Int(name.dropFirst(4).dropLast(7))
+    }
+
+    /// Pairs a recovered mic file with its system file; frames are unknown (0) after a crash.
+    static func recoveredSegment(in directory: URL, name: String) -> SegmentWriter.ClosedSegment? {
+        guard let seq = segmentSeq(from: name) else { return nil }
+        return SegmentWriter.ClosedSegment(
+            seq: seq,
+            micURL: directory.appendingPathComponent(name),
+            sysURL: directory.appendingPathComponent("seg-\(seq)-them.m4a"),
+            frames: 0)
     }
 
     private static func duration(of url: URL) throws -> Double {

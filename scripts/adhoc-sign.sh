@@ -6,7 +6,7 @@
 set -euo pipefail
 
 APP="${1:?usage: adhoc-sign.sh /path/to/Minutia.app}"
-IDENTITY="-"
+IDENTITY="${IDENTITY:--}"
 FRAMEWORK="$APP/Contents/Frameworks/Sparkle.framework"
 FW="$FRAMEWORK/Versions/B"
 
