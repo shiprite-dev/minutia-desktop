@@ -3,6 +3,66 @@ import CoreAudio
 import AudioToolbox
 import os
 
+/// Coalesces a burst of output-device notifications into one rebuild: it fires once the burst has
+/// been quiet for `quietInterval`, or `maxWait` after its first event, whichever comes first.
+struct DeviceChangeDebounce: Equatable {
+    enum Trigger: Equatable { case device, rate }
+    static let quietInterval: TimeInterval = 0.5
+    static let maxWait: TimeInterval = 2
+
+    private var firstEvent: TimeInterval?
+    private var deadline: TimeInterval = 0
+    private var sawDevice = false
+
+    mutating func record(_ trigger: Trigger, at now: TimeInterval) -> TimeInterval {
+        let first = firstEvent ?? now
+        firstEvent = first
+        if trigger == .device { sawDevice = true }
+        deadline = min(now + Self.quietInterval, first + Self.maxWait)
+        return deadline
+    }
+
+    mutating func takeDue(at now: TimeInterval) -> Trigger? {
+        guard firstEvent != nil, now >= deadline else { return nil }
+        let trigger: Trigger = sawDevice ? .device : .rate
+        reset()
+        return trigger
+    }
+
+    mutating func reset() { self = Self() }
+}
+
+/// Rebuild retries: a few fast backoffs for a device handoff, then a slow retry for as long as the
+/// tap should run. The failure is reported once, when the fast budget is spent.
+struct RebuildRetryPolicy: Equatable {
+    struct Step: Equatable {
+        let delay: TimeInterval
+        let reportFailure: Bool
+    }
+    static let fastBackoffs: [TimeInterval] = [0.3, 0.6, 1.2]
+    static let slowRetry: TimeInterval = 5
+
+    private var failures = 0
+    private var reported = false
+
+    mutating func attemptFailed() -> Step {
+        failures += 1
+        if failures <= Self.fastBackoffs.count {
+            return Step(delay: Self.fastBackoffs[failures - 1], reportFailure: false)
+        }
+        let report = failures == Self.fastBackoffs.count + 1
+        if report { reported = true }
+        return Step(delay: Self.slowRetry, reportFailure: report)
+    }
+
+    mutating func attemptSucceeded() -> Bool {
+        defer { reset() }
+        return reported
+    }
+
+    mutating func reset() { self = Self() }
+}
+
 /// Global system-audio tap that excludes our own process, feeding 48k mono Float32 into a ring
 /// buffer. Uses the C Core Audio HAL tapping API (macOS 14.4+); the typed AudioHardwareTap classes
 /// are macOS 15+ and deliberately avoided here.
@@ -19,6 +79,8 @@ final class SystemAudioTap {
     /// Invoked if an automatic rebuild after a device change fails to restart capture. Never
     /// crashes; the caller decides how to surface the failure.
     var onFailure: ((Error) -> Void)?
+    /// Invoked when a rebuild succeeds after `onFailure` was reported.
+    var onRecovered: (() -> Void)?
 
     private let buffer: RingBuffer
     private let ioQueue = DispatchQueue(label: "app.minutia.systemtap.io", qos: .userInitiated)
@@ -39,11 +101,11 @@ final class SystemAudioTap {
     /// rebuild (and its retries) should run; independent of `ioProcID`, which is briefly nil during a
     /// rebuild and after a failed start attempt.
     private var wantRunning = false
-    private var rebuildRetries = 0
-    /// Bumped by `stop()` so a retry timer scheduled before the stop cannot fire a rebuild against a
-    /// later run of the same instance.
+    private var debounce = DeviceChangeDebounce()
+    private var retry = RebuildRetryPolicy()
+    /// Bumped by `stop()` so a debounce or retry timer scheduled before the stop cannot fire a
+    /// rebuild against a later run of the same instance.
     private var rebuildEpoch = 0
-    private static let rebuildBackoffs: [TimeInterval] = [0.3, 0.6, 1.2]
 
     private static let logger = Logger(subsystem: "app.minutia.desktop", category: "SystemAudioTap")
 
@@ -80,7 +142,8 @@ final class SystemAudioTap {
     func stop() {
         controlQueue.sync {
             wantRunning = false
-            rebuildRetries = 0
+            debounce.reset()
+            retry.reset()
             isRebuilding = false
             rebuildEpoch += 1
             _stop()
@@ -108,7 +171,7 @@ final class SystemAudioTap {
             try createAggregateDevice(tapUUID: desc.uuid, outputUID: outputUID)
 
             var source = readAggregateInputFormat() ?? format
-            if let rate = readAggregateSampleRate() { source.mSampleRate = rate }
+            if let rate = readNominalSampleRate(aggregateID) { source.mSampleRate = rate }
             sourceFormat = source
             resizeScratch(sourceRate: source.mSampleRate)
             resampler = LinearResampler(sourceRate: source.mSampleRate, targetRate: MixPlan.sampleRate)
@@ -129,6 +192,9 @@ final class SystemAudioTap {
         if let procID = ioProcID {
             AudioDeviceStop(aggregateID, procID)
             AudioDeviceDestroyIOProcID(aggregateID, procID)
+            // Neither call waits for an IOBlock the HAL already dispatched; drain it so the state
+            // `_start` reassigns next cannot race `render`.
+            ioQueue.sync {}
             ioProcID = nil
         }
         if aggregateID != AudioObjectID(kAudioObjectUnknown) {
@@ -178,16 +244,16 @@ final class SystemAudioTap {
         return format
     }
 
-    /// The aggregate's clock rate. The stream format can keep reporting the tap's native rate after
-    /// the output device drops to a headset rate, so the device rate is authoritative for resampling.
-    private func readAggregateSampleRate() -> Double? {
+    /// A device's clock rate. The aggregate's stream format can keep reporting the tap's native rate
+    /// after the output device drops to a headset rate, so the device rate is authoritative.
+    private func readNominalSampleRate(_ id: AudioObjectID) -> Double? {
         var rate: Double = 0
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyNominalSampleRate,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain)
         var size = UInt32(MemoryLayout<Double>.size)
-        let status = AudioObjectGetPropertyData(aggregateID, &address, 0, nil, &size, &rate)
+        let status = AudioObjectGetPropertyData(id, &address, 0, nil, &size, &rate)
         return status == noErr && rate > 0 ? rate : nil
     }
 
@@ -294,9 +360,38 @@ final class SystemAudioTap {
     /// A listener block that defers the rebuild off its own callback so teardown never removes a
     /// listener from inside its own invocation.
     private func makeRebuildListener() -> AudioObjectPropertyListenerBlock {
-        { [weak self] _, _ in
-            self?.controlQueue.async { self?.rebuildForDeviceChange() }
+        { [weak self] count, addresses in
+            let changed = UnsafeBufferPointer(start: addresses, count: Int(count))
+            let trigger: DeviceChangeDebounce.Trigger =
+                changed.contains { $0.mSelector != kAudioDevicePropertyNominalSampleRate } ? .device : .rate
+            self?.controlQueue.async { self?.noteDeviceChange(trigger) }
         }
+    }
+
+    static func shouldRebuild(configuredRate: Double?, deviceRate: Double?) -> Bool {
+        guard let configuredRate, let deviceRate, configuredRate > 0, deviceRate > 0 else { return true }
+        return abs(configuredRate - deviceRate) > 0.5
+    }
+
+    private func noteDeviceChange(_ trigger: DeviceChangeDebounce.Trigger) {
+        guard wantRunning else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let deadline = debounce.record(trigger, at: now)
+        let epoch = rebuildEpoch
+        controlQueue.asyncAfter(deadline: .now() + (deadline - now)) { [weak self] in
+            guard let self, self.wantRunning, self.rebuildEpoch == epoch else { return }
+            self.fireDebounced()
+        }
+    }
+
+    /// Every event schedules a timer; only the one at the burst's current deadline finds it due.
+    private func fireDebounced() {
+        guard let trigger = debounce.takeDue(at: ProcessInfo.processInfo.systemUptime) else { return }
+        if trigger == .rate,
+           !Self.shouldRebuild(configuredRate: sourceFormat?.mSampleRate, deviceRate: readNominalSampleRate(outputDeviceID)) {
+            return
+        }
+        rebuildForDeviceChange()
     }
 
     /// Output-device properties that invalidate the running aggregate. A nominal-rate change (a
@@ -318,8 +413,6 @@ final class SystemAudioTap {
         }
     }
 
-    /// Installs the system default-output listener. Kept separately installable so a rebuild that
-    /// exhausted its retry budget can re-arm just this listener and still recover on a later settle.
     private func installDefaultOutputListener() {
         guard defaultOutputListener == nil else { return }
         let rebuild = makeRebuildListener()
@@ -361,34 +454,27 @@ final class SystemAudioTap {
     private func rebuildForDeviceChange() {
         guard wantRunning, !isRebuilding else { return }
         isRebuilding = true
-        rebuildRetries = 0
         attemptRebuild()
     }
 
-    /// One rebuild attempt on `controlQueue`. A transient failure (the new default output is briefly
-    /// unavailable during an AirPods handoff) is retried with backoff; once the budget is exhausted
-    /// the default-output listener is re-armed so a later device settle can still recover.
+    /// One rebuild attempt on `controlQueue`. A failure (the new default output is briefly
+    /// unavailable during an AirPods handoff, or gone until another device appears) is retried for
+    /// as long as the tap should run; each attempt reads the current default output.
     private func attemptRebuild() {
         _stop()
         do {
             try _start()
-            rebuildRetries = 0
             isRebuilding = false
+            if retry.attemptSucceeded() { onRecovered?() }
         } catch {
-            if rebuildRetries < Self.rebuildBackoffs.count {
-                let delay = Self.rebuildBackoffs[rebuildRetries]
-                rebuildRetries += 1
-                let epoch = rebuildEpoch
-                controlQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
-                    guard let self else { return }
-                    guard self.wantRunning, self.rebuildEpoch == epoch else { return }
-                    self.attemptRebuild()
-                }
-            } else {
-                Self.logger.error("System-audio rebuild gave up after retries: \(String(describing: error), privacy: .public)")
-                rebuildRetries = 0
-                isRebuilding = false
-                installDefaultOutputListener()
+            let step = retry.attemptFailed()
+            let epoch = rebuildEpoch
+            controlQueue.asyncAfter(deadline: .now() + step.delay) { [weak self] in
+                guard let self, self.wantRunning, self.rebuildEpoch == epoch else { return }
+                self.attemptRebuild()
+            }
+            if step.reportFailure {
+                Self.logger.error("System-audio rebuild failing, still retrying: \(String(describing: error), privacy: .public)")
                 onFailure?(error)
             }
         }
@@ -411,16 +497,17 @@ final class SystemAudioTap {
         var frames = mono.count
         var channels = 0
         for buffer in abl {
+            guard buffer.mData != nil else { continue }
             let ch = max(1, Int(buffer.mNumberChannels))
-            guard buffer.mData != nil else { return 0 }
             frames = min(frames, Int(buffer.mDataByteSize) / MemoryLayout<Float>.size / ch)
             channels += ch
         }
         guard channels > 0, frames > 0 else { return 0 }
         for f in 0..<frames { mono[f] = 0 }
         for buffer in abl {
+            guard let data = buffer.mData else { continue }
             let ch = max(1, Int(buffer.mNumberChannels))
-            let ptr = buffer.mData!.assumingMemoryBound(to: Float.self)
+            let ptr = data.assumingMemoryBound(to: Float.self)
             for f in 0..<frames {
                 var sum: Float = 0
                 for c in 0..<ch { sum += ptr[f * ch + c] }

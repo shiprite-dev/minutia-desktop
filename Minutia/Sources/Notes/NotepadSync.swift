@@ -16,10 +16,16 @@ enum NotepadSyncPolicy {
     static func retryDelay(attempt: Int) -> TimeInterval {
         min(60, 2 * pow(2, Double(max(attempt, 1) - 1)))
     }
+
+    /// An update that matched no row will never succeed for this meeting; anything else may.
+    static func isTerminal(_ error: Error) -> Bool {
+        if case .meetingNotWritable? = error as? MinutiaClientError { return true }
+        return false
+    }
 }
 
 enum NotepadSaveState: Equatable {
-    case empty, saving, synced, savedLocally
+    case empty, saving, synced, savedLocally, keptLocally
 
     var label: String {
         switch self {
@@ -27,12 +33,14 @@ enum NotepadSaveState: Equatable {
         case .saving: "Saving…"
         case .synced: "Saved to meeting"
         case .savedLocally: "Saved on this Mac"
+        case .keptLocally: "Kept on this Mac"
         }
     }
 
-    static func of(draft: NotepadDraft?, lastAttemptFailed: Bool) -> NotepadSaveState {
+    static func of(draft: NotepadDraft?, lastAttemptFailed: Bool, syncStopped: Bool = false) -> NotepadSaveState {
         guard let draft, draft.revision > 0 else { return .empty }
         if !draft.needsSync { return .synced }
+        if syncStopped { return .keptLocally }
         return lastAttemptFailed ? .savedLocally : .saving
     }
 }

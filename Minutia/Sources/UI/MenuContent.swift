@@ -67,7 +67,7 @@ private struct IdleView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if !controller.micAuthorized {
+            if controller.micBannerVisible {
                 MicPermissionBanner()
             }
 

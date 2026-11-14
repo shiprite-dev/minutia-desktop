@@ -8,9 +8,12 @@ import SwiftUI
 final class NotepadController: ObservableObject {
     @Published private(set) var draft: NotepadDraft?
     @Published private(set) var lastAttemptFailed = false
+    @Published private(set) var syncStopped = false
     @Published private(set) var shortcutAvailable = false
 
-    var saveState: NotepadSaveState { .of(draft: draft, lastAttemptFailed: lastAttemptFailed) }
+    var saveState: NotepadSaveState {
+        .of(draft: draft, lastAttemptFailed: lastAttemptFailed, syncStopped: syncStopped)
+    }
 
     private struct FlushFailed: Error {}
 
@@ -43,6 +46,7 @@ final class NotepadController: ObservableObject {
         ended = false
         attempts = 0
         lastAttemptFailed = false
+        syncStopped = false
         lastEditAt = nil
         firstUnsyncedEditAt = nil
         draft = root.flatMap { NotepadStore.load(meetingId: meetingId, in: $0) }
@@ -90,6 +94,7 @@ final class NotepadController: ObservableObject {
 
     func flushNow() async throws {
         persist()
+        guard !syncStopped else { throw FlushFailed() }
         while inFlight { try await Task.sleep(nanoseconds: 50_000_000) }
         while draft?.needsSync == true {
             guard await push() else { throw FlushFailed() }
@@ -159,6 +164,7 @@ final class NotepadController: ObservableObject {
     }
 
     private func scheduleSync(after delay: TimeInterval) {
+        guard !syncStopped else { return }
         syncTask?.cancel()
         syncTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(max(delay, 0.1) * 1_000_000_000))
@@ -183,7 +189,7 @@ final class NotepadController: ObservableObject {
 
     @discardableResult
     private func push() async -> Bool {
-        guard !inFlight, let draft, draft.needsSync, let client else { return false }
+        guard !inFlight, !syncStopped, let draft, draft.needsSync, let client else { return false }
         inFlight = true
         defer { inFlight = false }
         let revision = draft.revision
@@ -192,6 +198,11 @@ final class NotepadController: ObservableObject {
         } catch {
             Self.logger.error("Notes sync failed: \(String(describing: error), privacy: .public)")
             lastAttemptFailed = true
+            if NotepadSyncPolicy.isTerminal(error) {
+                syncStopped = true
+                persist()
+                return false
+            }
             attempts += 1
             scheduleSync(after: NotepadSyncPolicy.retryDelay(attempt: attempts))
             return false

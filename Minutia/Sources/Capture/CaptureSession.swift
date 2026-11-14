@@ -130,6 +130,9 @@ final class CaptureSession: ObservableObject {
         pipeline.onSystemAudioUnavailable = { [weak self] in
             Task { @MainActor in self?.systemAudioDegraded = true }
         }
+        pipeline.onSystemAudioRecovered = { [weak self] in
+            Task { @MainActor in self?.systemAudioDegraded = false }
+        }
         pipeline.onMicUnavailable = { [weak self] in
             Task { @MainActor in self?.micUnavailable = true }
         }
@@ -184,8 +187,7 @@ final class CaptureSession: ObservableObject {
         // .finalizing forever. TimeoutError propagates to the controller, which shows .error (Retry).
         let outcome = try await withTimeout(seconds: Self.finalizeTimeout) {
             let counts = await queue.drainAndWait()
-            let total = counts.enqueued
-            let allRegistered = total > 0 && counts.registered == total
+            let expected = Self.expectedSegments(enqueued: counts.enqueued, registered: counts.registered)
 
             if let recording = finished?.recording {
                 let path = try await client.uploadRecording(meetingId: meetingId, fileURL: recording.fileURL)
@@ -195,7 +197,6 @@ final class CaptureSession: ObservableObject {
                 try await client.finalizeMeeting(meetingId: meetingId, audioPath: path, duration: duration, sizeBytes: size)
             }
 
-            let expected = allRegistered ? total : nil
             // A failed requestTranscription must never read as an accepted transcript: it rethrows so
             // the controller shows .failed (Retry re-runs refinalize) and the audio directory is kept
             // below, deleted only when the request truly succeeds (a 2xx, or the terminal-503 the
@@ -233,6 +234,13 @@ final class CaptureSession: ObservableObject {
                     threshold: Self.watchdogTimeout) {
             handleFatal(CaptureError.stalled, preserveForRecovery: true)
         }
+    }
+
+    /// Only a fully registered set of fast-lane segments is announced; otherwise (none registered on
+    /// a server that rejects segment registers, or some lost) the server transcribes the whole
+    /// recording instead of waiting on segments that never arrive.
+    nonisolated static func expectedSegments(enqueued: Int, registered: Int) -> Int? {
+        enqueued > 0 && registered == enqueued ? enqueued : nil
     }
 
     nonisolated static func shouldWatchdogFire(secondsSinceFrames: TimeInterval, threshold: TimeInterval) -> Bool {
@@ -320,6 +328,8 @@ private final class CapturePipeline {
     /// Fired when the system-audio tap cannot start, or a mid-recording rebuild permanently fails,
     /// so capture continues mic-only. Non-fatal: the recording keeps going.
     var onSystemAudioUnavailable: (() -> Void)?
+    /// Fired when a mid-recording rebuild succeeds after it was reported as failing.
+    var onSystemAudioRecovered: (() -> Void)?
     /// Fired when no microphone exists but system audio is recording, so capture continues
     /// system-only. Non-fatal.
     var onMicUnavailable: (() -> Void)?
@@ -354,6 +364,7 @@ private final class CapturePipeline {
             Self.logger.error("System audio lost mid-recording: \(String(describing: error), privacy: .public)")
             self?.onSystemAudioUnavailable?()
         }
+        tap.onRecovered = { [weak self] in self?.onSystemAudioRecovered?() }
         // System audio is best-effort: if the tap can't start (no default output device, transient
         // HAL error), degrade to mic-only rather than failing the whole recording. The tick mixes
         // against an empty sys buffer, which the existing silence-pad already handles. Only a mic

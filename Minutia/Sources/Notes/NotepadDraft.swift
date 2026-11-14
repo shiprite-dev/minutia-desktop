@@ -90,8 +90,8 @@ enum NotepadStore {
                 guard draft.needsSync, draft.meetingId != active else { return false }
                 let instance = InstanceConfig.normalize(draft.instanceURL.absoluteString) ?? draft.instanceURL
                 guard instance == connected else { return false }
-                if let user = draft.userId, let connectedUserId, user != connectedUserId { return false }
-                return true
+                guard let user = draft.userId, let connectedUserId else { return false }
+                return user.lowercased() == connectedUserId.lowercased()
             }
             .sorted { $0.meetingId < $1.meetingId }
     }
