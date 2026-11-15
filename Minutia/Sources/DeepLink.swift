@@ -11,6 +11,8 @@ enum DeepLink: Equatable {
     case authCallback(tokenHash: String?, state: String?)
     /// `minutia://record?meeting_id=<uuid>`. The id is uuid-validated and lowercased.
     case record(meetingId: String)
+    /// `minutia://open`: the web asks the companion to check in now.
+    case open
     case invalid
 
     static func parse(_ url: URL) -> DeepLink {
@@ -30,6 +32,8 @@ enum DeepLink: Equatable {
                 return .invalid
             }
             return .record(meetingId: uuid.uuidString.lowercased())
+        case "open":
+            return .open
         default:
             return .invalid
         }
