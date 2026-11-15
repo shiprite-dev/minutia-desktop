@@ -14,7 +14,8 @@ final class SegmentWriter {
         let micURL: URL
         let sysURL: URL
         let frames: Int64
-        var offsetSeconds: Double { Double(seq) * SegmentWriter.segmentSeconds }
+        var startSeconds: Double? = nil
+        var offsetSeconds: Double { startSeconds ?? Double(seq) * SegmentWriter.segmentSeconds }
     }
 
     struct Recording {
@@ -95,6 +96,10 @@ final class SegmentWriter {
     private static let chunkFrames = 48_000   // bounds per-write buffer allocation to ~1s
 
     static let readyTimeout: TimeInterval = 3
+    static let pieceMinSeconds: Double = 20
+    static let pieceMaxSeconds: Double = 40
+    private static let blockFrames: Int64 = 4_800
+    private static let quietPeak: Float = 0.02
 
     private let directory: URL
     private let closeTimeout: TimeInterval
@@ -103,6 +108,17 @@ final class SegmentWriter {
     private var micTrack: Track?
     private var sysTrack: Track?
     private var segmentFrameCount: Int64 = 0
+
+    private var pieceMic: Track?
+    private var pieceSys: Track?
+    private var pieceFrames: Int64 = 0
+    private var pieceStartFrame: Int64 = 0
+    private var pieceIndex = 0
+    private var blockFrameCount: Int64 = 0
+    private var blockPeak: Float = 0
+    private var quietBlocks = 0
+    private var closedPieces: [ClosedSegment] = []
+    private var piecesFailed = false
 
     private(set) var currentSeq: Int = 0
     private(set) var totalFrames: Int64 = 0
@@ -124,6 +140,73 @@ final class SegmentWriter {
         (try Track(url: segmentURL(seq, "me")), try Track(url: segmentURL(seq, "them")))
     }
 
+    private func pieceURL(_ seq: Int, _ channel: String) -> URL {
+        directory.appendingPathComponent("tail-\(seq)-\(channel).m4a")
+    }
+
+    private func writePiece(mic: [Float], sys: [Float], mixed: [Float], from idx: Int, count: Int, deadline: Date) {
+        guard !piecesFailed else { return }
+        do {
+            if pieceMic == nil || pieceSys == nil {
+                let seq = currentSeq + pieceIndex
+                pieceMic = try Track(url: pieceURL(seq, "me"))
+                pieceSys = try Track(url: pieceURL(seq, "them"))
+            }
+            try pieceMic?.write(mic, from: idx, count: count, deadline: deadline)
+            try pieceSys?.write(sys, from: idx, count: count, deadline: deadline)
+            pieceFrames += Int64(count)
+            blockFrameCount += Int64(count)
+            for i in idx..<idx + count { blockPeak = max(blockPeak, abs(mixed[i])) }
+            guard blockFrameCount == SegmentWriter.blockFrames else { return }
+            quietBlocks = blockPeak < SegmentWriter.quietPeak ? quietBlocks + 1 : 0
+            blockFrameCount = 0
+            blockPeak = 0
+            let held = Double(pieceFrames) / MixPlan.sampleRate
+            if held >= SegmentWriter.pieceMaxSeconds || (held >= SegmentWriter.pieceMinSeconds && quietBlocks >= 2) {
+                try closePiece()
+            }
+        } catch {
+            discardPieces()
+            piecesFailed = true
+        }
+    }
+
+    private func closePiece() throws {
+        guard let micPiece = pieceMic, let sysPiece = pieceSys else { return }
+        pieceMic = nil
+        pieceSys = nil
+        let seq = currentSeq + pieceIndex
+        let frames = pieceFrames
+        let start = pieceStartFrame
+        try micPiece.close(timeout: closeTimeout)
+        try sysPiece.close(timeout: closeTimeout)
+        closedPieces.append(ClosedSegment(
+            seq: seq, micURL: pieceURL(seq, "me"), sysURL: pieceURL(seq, "them"), frames: frames,
+            startSeconds: Double(currentSeq) * SegmentWriter.segmentSeconds + Double(start) / MixPlan.sampleRate))
+        pieceIndex += 1
+        pieceStartFrame += frames
+        pieceFrames = 0
+        blockFrameCount = 0
+        blockPeak = 0
+        quietBlocks = 0
+    }
+
+    private func discardPieces() {
+        for track in [pieceMic, pieceSys].compactMap({ $0 }) { try? track.close(timeout: closeTimeout) }
+        let seq = currentSeq + pieceIndex
+        let urls = closedPieces.flatMap { [$0.micURL, $0.sysURL] } + [pieceURL(seq, "me"), pieceURL(seq, "them")]
+        for url in urls { try? FileManager.default.removeItem(at: url) }
+        pieceMic = nil
+        pieceSys = nil
+        closedPieces = []
+        pieceFrames = 0
+        pieceStartFrame = 0
+        pieceIndex = 0
+        blockFrameCount = 0
+        blockPeak = 0
+        quietBlocks = 0
+    }
+
     private func closedSegment(seq: Int, frames: Int64) -> ClosedSegment {
         ClosedSegment(seq: seq, micURL: segmentURL(seq, "me"), sysURL: segmentURL(seq, "them"), frames: frames)
     }
@@ -141,7 +224,11 @@ final class SegmentWriter {
         while idx < mic.count {
             let deadline = Date().addingTimeInterval(SegmentWriter.readyTimeout)
             let remainInSegment = Int(SegmentWriter.segmentFrames - segmentFrameCount)
-            let chunk = min(mic.count - idx, remainInSegment, SegmentWriter.chunkFrames)
+            var chunk = min(mic.count - idx, remainInSegment, SegmentWriter.chunkFrames)
+            if !piecesFailed {
+                let pieceCap = Int64(SegmentWriter.pieceMaxSeconds * MixPlan.sampleRate) - pieceFrames
+                chunk = min(chunk, Int(SegmentWriter.blockFrames - blockFrameCount), Int(pieceCap))
+            }
 
             try recording.write(mixed, from: idx, count: chunk, deadline: deadline)
             if let micActive = micTrack, let sysActive = sysTrack {
@@ -154,12 +241,15 @@ final class SegmentWriter {
                     segmentsDropped = true
                 }
             }
+            writePiece(mic: mic, sys: sys, mixed: mixed, from: idx, count: chunk, deadline: deadline)
             segmentFrameCount += Int64(chunk)
             totalFrames += Int64(chunk)
             idx += chunk
 
             if segmentFrameCount == SegmentWriter.segmentFrames {
                 segmentFrameCount = 0
+                discardPieces()
+                piecesFailed = false
                 if let micActive = micTrack, let sysActive = sysTrack {
                     micTrack = nil
                     sysTrack = nil
@@ -178,10 +268,11 @@ final class SegmentWriter {
         return closed
     }
 
-    /// Closes all files. Returns the trailing partial segment (nil when it holds no frames) and the
-    /// full recording. Empty trailing channel files (rotation landed exactly on the boundary) are
-    /// deleted from disk rather than left as orphans.
-    func finish() throws -> (finalSegment: ClosedSegment?, recording: Recording) {
+    /// Closes all files. Returns the trailing partial segment (nil when it holds no frames), the
+    /// full recording, and the tail window's local pieces (only when it split into two or more).
+    /// Empty trailing channel files (rotation landed exactly on the boundary) are deleted from disk
+    /// rather than left as orphans.
+    func finish() throws -> (finalSegment: ClosedSegment?, recording: Recording, tailPieces: [ClosedSegment]) {
         let partialFrames = segmentFrameCount
         let seq = currentSeq
         let recording = recordingTrack
@@ -189,16 +280,28 @@ final class SegmentWriter {
         recordingTrack = nil
         micTrack = nil
         sysTrack = nil
+        var pieces: [ClosedSegment] = []
+        if !piecesFailed, pieceFrames > 0 {
+            do { try closePiece() } catch { piecesFailed = true }
+        }
+        pieces = closedPieces
+        if piecesFailed { pieces = [] }
         var recordingError: Error?
         do { try recording?.close(timeout: closeTimeout) } catch { recordingError = error }
         for track in segmentTracks {
             do { try track.close(timeout: closeTimeout) } catch { segmentsDropped = true }
         }
+        let keepPieces = recordingError == nil && !segmentsDropped && !segmentTracks.isEmpty
+            && pieces.count >= 2 && pieces.reduce(0, { $0 + $1.frames }) == partialFrames
+        if !keepPieces {
+            pieces = []
+            discardPieces()
+        }
         if let recordingError { throw recordingError }
         let result = Recording(fileURL: recordingURL, frames: totalFrames)
-        if segmentsDropped || segmentTracks.isEmpty { return (nil, result) }
-        if partialFrames > 0 { return (closedSegment(seq: seq, frames: partialFrames), result) }
+        if segmentsDropped || segmentTracks.isEmpty { return (nil, result, pieces) }
+        if partialFrames > 0 { return (closedSegment(seq: seq, frames: partialFrames), result, pieces) }
         for channel in ["me", "them"] { try? FileManager.default.removeItem(at: segmentURL(seq, channel)) }
-        return (nil, result)
+        return (nil, result, pieces)
     }
 }

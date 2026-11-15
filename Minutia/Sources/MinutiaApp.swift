@@ -1139,14 +1139,24 @@ final class AppController: NSObject, ObservableObject {
         let meetingId = recordingMeetingId
         let seriesId = recordingSeriesId
         let instance = recordingInstance
+        let early = Self.opensRecap(for: reason) && meetingId != nil && instance != nil
+        if early, let meetingId, let instance {
+            Task {
+                try? await notepad.flushNow()
+                if let client = authManager.client() {
+                    await CaptureSession.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId.uuidString) }
+                }
+                await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance, autoRecap: true)
+            }
+        }
         Task {
             do {
-                _ = try await captureSession.stop(flushNotes: { [notepad] in try await notepad.flushNow() })
+                _ = try await captureSession.stop(flushNotes: { [notepad] in try await notepad.flushNow() }, recapOpened: early)
                 recordingMeetingId = nil
                 recordingSeriesId = nil
                 recordingInstance = nil
                 apply(.finalized)
-                if let meetingId, let instance, Self.opensRecap(for: reason) {
+                if !early, let meetingId, let instance, Self.opensRecap(for: reason) {
                     await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance)
                 }
             } catch {
@@ -1428,7 +1438,7 @@ final class AppController: NSObject, ObservableObject {
     /// id when unknown (a web-triggered record carries none) via the meetings table; if it still
     /// cannot be resolved, falls back to a notification rather than doing nothing. The URL is built
     /// from the instance capture started against, not the currently-connected one.
-    private func openRecap(meetingId: UUID, seriesId: UUID?, instance: URL) async {
+    private func openRecap(meetingId: UUID, seriesId: UUID?, instance: URL, autoRecap: Bool = false) async {
         var resolvedSeries = seriesId
         if resolvedSeries == nil, let client = authManager.client() {
             resolvedSeries = try? await client.meetingSeriesId(meetingId: meetingId.uuidString)
@@ -1440,7 +1450,7 @@ final class AppController: NSObject, ObservableObject {
             return
         }
         NSWorkspace.shared.open(
-            MinutiaClient.recapURL(instance: instance, seriesId: resolvedSeries, meetingId: meetingId))
+            MinutiaClient.recapURL(instance: instance, seriesId: resolvedSeries, meetingId: meetingId, autoRecap: autoRecap))
     }
 
     // MARK: - URL callback

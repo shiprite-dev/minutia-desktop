@@ -42,7 +42,7 @@ final class CaptureSession: ObservableObject {
     enum CaptureError: Error { case notRunning, stalled, recordingUnfinished }
 
     /// Ceiling for the stop-time network finalize (drain + upload + finalize + transcribe request).
-    static let finalizeTimeout: TimeInterval = 30
+    static let finalizeTimeout: TimeInterval = 60
 
     /// If no audio frames drain for this long while recording, the tap and mic have both stalled and
     /// the recording is silently frozen; the session flips to a fatal error rather than pinning a
@@ -156,7 +156,7 @@ final class CaptureSession: ObservableObject {
 
     /// Stops capture, drains fast-lane uploads, uploads the full recording, and requests the final
     /// transcription. Local files are deleted only once transcription has been accepted.
-    func stop(flushNotes: @escaping @Sendable () async throws -> Void = {}) async throws -> StopResult {
+    func stop(flushNotes: @escaping @Sendable () async throws -> Void = {}, recapOpened: Bool = false) async throws -> StopResult {
         guard let pipeline, let queue, let client, let meetingId, let directory else {
             throw CaptureError.notRunning
         }
@@ -180,7 +180,9 @@ final class CaptureSession: ObservableObject {
         // Without a finished recording the server has nothing to transcribe; throwing keeps the
         // directory so recovery uploads the readable fragmented file instead of deleting it.
         guard let finished = pipeline.finishCapture() else { throw CaptureError.recordingUnfinished }
-        if let finalSegment = finished.finalSegment {
+        if !finished.tailPieces.isEmpty {
+            for piece in finished.tailPieces { queue.enqueue(piece) }
+        } else if let finalSegment = finished.finalSegment {
             queue.enqueue(finalSegment)
         }
 
@@ -188,13 +190,13 @@ final class CaptureSession: ObservableObject {
         // hung 60s+, and indefinite hangs on repeated failures) throws instead of pinning the UI in
         // .finalizing forever. TimeoutError propagates to the controller, which shows .error (Retry).
         let outcome = try await withTimeout(seconds: Self.finalizeTimeout) {
+            let recording = finished.recording
+            async let uploadedPath = client.uploadRecording(meetingId: meetingId, fileURL: recording.fileURL)
             let counts = await queue.drainAndWait()
             let expected = Self.expectedSegments(
                 enqueued: counts.enqueued, registered: counts.registered,
                 segmentsDropped: finished.segmentsDropped)
-
-            let recording = finished.recording
-            let path = try await client.uploadRecording(meetingId: meetingId, fileURL: recording.fileURL)
+            let path = try await uploadedPath
             let duration = Double(recording.frames) / MixPlan.sampleRate
             let attrs = try? FileManager.default.attributesOfItem(atPath: recording.fileURL.path)
             let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
@@ -206,15 +208,17 @@ final class CaptureSession: ObservableObject {
             // client treats as not-lost since the transcript assembles from fast-lane segments).
             _ = try await NotepadFinalize.flushThenTranscribe(
                 flush: flushNotes,
-                requestTranscription: { try await client.requestTranscription(meetingId: meetingId, expectedSegments: expected) })
+                requestTranscription: { try await client.requestTranscription(meetingId: meetingId, expectedSegments: expected, deferExtraction: true) })
             return (counts: counts, expected: expected, transcriptRequested: true)
         }
 
         segmentsUploaded = outcome.counts.uploaded
         segmentsTotal = outcome.counts.enqueued
 
-        Task { await client.warmSummary(meetingId: meetingId) }
-        Task { await Self.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId) } }
+        if !recapOpened {
+            Task { await client.warmSummary(meetingId: meetingId) }
+            Task { await Self.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId) } }
+        }
 
         if outcome.transcriptRequested {
             try? FileManager.default.removeItem(at: directory)
@@ -413,7 +417,7 @@ private final class CapturePipeline {
 
     /// Stops the timer, tap, and mic, then closes the files. Returns the trailing partial segment
     /// (if any) and the full recording.
-    func finishCapture() -> (finalSegment: SegmentWriter.ClosedSegment?, recording: SegmentWriter.Recording, segmentsDropped: Bool)? {
+    func finishCapture() -> (finalSegment: SegmentWriter.ClosedSegment?, recording: SegmentWriter.Recording, tailPieces: [SegmentWriter.ClosedSegment], segmentsDropped: Bool)? {
         timer?.cancel()
         timer = nil
         // cancel() does not wait for an in-flight handler; barrier on tickQueue so no tick() is
@@ -423,7 +427,7 @@ private final class CapturePipeline {
         tap.stop()
         mic.stop()
         guard let result = try? writer.finish() else { return nil }
-        return (result.finalSegment, result.recording, writer.segmentsDropped)
+        return (result.finalSegment, result.recording, result.tailPieces, writer.segmentsDropped)
     }
 
     /// Lightweight stop for the fatal path: halts the timer, tap, and mic WITHOUT the network finalize
