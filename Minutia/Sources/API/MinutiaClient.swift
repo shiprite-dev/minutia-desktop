@@ -249,10 +249,6 @@ struct MinutiaClient {
         }
     }
 
-    func registerSegment(meetingId: String, seq: Int) async throws -> Bool {
-        try await registerSegment(meetingId: meetingId, seq: seq, offsetSeconds: Double(seq) * SegmentWriter.segmentSeconds)
-    }
-
     func registerSegment(meetingId: String, seq: Int, offsetSeconds: Double) async throws -> Bool {
         let token = try await tokenProvider()
         let request = Self.registerSegmentRequest(instance: instance, meetingId: meetingId, seq: seq, offsetSeconds: offsetSeconds, token: token)

@@ -397,14 +397,14 @@ final class RegisterSegmentStatusMappingTests: XCTestCase {
             switch outcome {
             case .some(let value):
                 do {
-                    let result = try await makeStubbedClient().registerSegment(meetingId: "m1", seq: 0)
+                    let result = try await makeStubbedClient().registerSegment(meetingId: "m1", seq: 0, offsetSeconds: 0)
                     XCTAssertEqual(result, value, "status \(status)")
                 } catch {
                     XCTFail("status \(status) unexpectedly threw \(error)")
                 }
             case .none:
                 do {
-                    _ = try await makeStubbedClient().registerSegment(meetingId: "m1", seq: 0)
+                    _ = try await makeStubbedClient().registerSegment(meetingId: "m1", seq: 0, offsetSeconds: 0)
                     XCTFail("status \(status) expected to throw")
                 } catch let error as MinutiaClientError {
                     guard case .serverError(let thrownStatus) = error else {
@@ -547,7 +547,7 @@ final class TranscribeFeatureUnavailableTests: XCTestCase {
     func test_registerSegment_throwsFeatureUnavailableFor403Code() async {
         stub(status: 403, json: #"{"code":"FEATURE_UNAVAILABLE"}"#)
         do {
-            _ = try await makeStubbedClient().registerSegment(meetingId: "m1", seq: 0)
+            _ = try await makeStubbedClient().registerSegment(meetingId: "m1", seq: 0, offsetSeconds: 0)
             XCTFail("expected featureUnavailable throw")
         } catch MinutiaClientError.featureUnavailable {
         } catch {
@@ -558,7 +558,7 @@ final class TranscribeFeatureUnavailableTests: XCTestCase {
     func test_registerSegment_bare403IsTerminalReturnsFalse() async {
         stub(status: 403, json: #"{"code":"FORBIDDEN"}"#)
         do {
-            let result = try await makeStubbedClient().registerSegment(meetingId: "m1", seq: 0)
+            let result = try await makeStubbedClient().registerSegment(meetingId: "m1", seq: 0, offsetSeconds: 0)
             XCTAssertFalse(result, "a 403 without FEATURE_UNAVAILABLE is terminal, not a retryable auth expiry")
         } catch {
             XCTFail("unexpected error \(error)")
