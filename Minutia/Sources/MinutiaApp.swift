@@ -1141,8 +1141,8 @@ final class AppController: NSObject, ObservableObject {
         let seriesId = recordingSeriesId
         let instance = recordingInstance
         let early = Self.opensRecap(for: reason) && meetingId != nil && instance != nil
+        earlyRecapMeetingId = early ? meetingId : nil
         if early, let meetingId, let instance {
-            earlyRecapMeetingId = meetingId
             Task {
                 try? await withTimeout(seconds: 3) { [notepad] in try await notepad.flushNow() }
                 if let client = authManager.client() {

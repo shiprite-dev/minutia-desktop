@@ -68,7 +68,7 @@ final class SegmentWriter {
             frames += Int64(count)
         }
 
-        func cancel() { writer.cancelWriting() }
+        func cancel() { if writer.status == .writing { writer.cancelWriting() } }
 
         func close(timeout: TimeInterval) throws {
             guard writer.status == .writing else { throw writer.error ?? SegmentWriter.failure(5) }
@@ -101,6 +101,7 @@ final class SegmentWriter {
     static let pieceMinSeconds: Double = 20
     static let pieceMaxSeconds: Double = 40
     static let pieceCloseTimeout: TimeInterval = 0.5
+    static let pieceReadyTimeout: TimeInterval = 0.25
     private static let pieceMinTailFrames: Int64 = 48_000
     private static let blockFrames: Int64 = 4_800
     private static let quietPeak: Float = 0.02
@@ -156,8 +157,9 @@ final class SegmentWriter {
                 pieceMic = try Track(url: pieceURL(seq, "me"))
                 pieceSys = try Track(url: pieceURL(seq, "them"))
             }
-            try pieceMic?.write(mic, from: idx, count: count, deadline: deadline)
-            try pieceSys?.write(sys, from: idx, count: count, deadline: deadline)
+            let pieceDeadline = min(deadline, Date().addingTimeInterval(SegmentWriter.pieceReadyTimeout))
+            try pieceMic?.write(mic, from: idx, count: count, deadline: pieceDeadline)
+            try pieceSys?.write(sys, from: idx, count: count, deadline: pieceDeadline)
             pieceFrames += Int64(count)
             blockFrameCount += Int64(count)
             for i in idx..<idx + count { blockPeak = max(blockPeak, abs(mixed[i])) }
@@ -182,8 +184,14 @@ final class SegmentWriter {
         let seq = currentSeq + pieceIndex
         let frames = pieceFrames
         let start = pieceStartFrame
-        try micPiece.close(timeout: SegmentWriter.pieceCloseTimeout)
-        try sysPiece.close(timeout: SegmentWriter.pieceCloseTimeout)
+        do {
+            try micPiece.close(timeout: SegmentWriter.pieceCloseTimeout)
+            try sysPiece.close(timeout: SegmentWriter.pieceCloseTimeout)
+        } catch {
+            micPiece.cancel()
+            sysPiece.cancel()
+            throw error
+        }
         closedPieces.append(ClosedSegment(
             seq: seq, micURL: pieceURL(seq, "me"), sysURL: pieceURL(seq, "them"), frames: frames,
             startSeconds: Double(currentSeq) * SegmentWriter.segmentSeconds + Double(start) / MixPlan.sampleRate))

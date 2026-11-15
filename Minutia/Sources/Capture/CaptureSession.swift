@@ -215,10 +215,8 @@ final class CaptureSession: ObservableObject {
         segmentsUploaded = outcome.counts.uploaded
         segmentsTotal = outcome.counts.enqueued
 
-        if !recapOpened {
-            Task { await client.warmSummary(meetingId: meetingId) }
-            Task { await Self.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId) } }
-        }
+        if !recapOpened { Task { await client.warmSummary(meetingId: meetingId) } }
+        Task { await Self.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId) } }
 
         if outcome.transcriptRequested {
             try? FileManager.default.removeItem(at: directory)
