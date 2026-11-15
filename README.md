@@ -71,7 +71,8 @@ Minutia Desktop connects to the managed Minutia Cloud instance by default, so th
 
 - Raw audio is discarded once the transcript has been safely captured, by default. This is configurable per instance (an admin can switch to keep-forever) in that instance's admin settings, not in this app.
 - Nothing is stored outside the Minutia instance you connect to. There is no separate Minutia Desktop backend.
-- Recording starts only from a Record button press, an explicit notification action, or a meeting you started yourself on the web after choosing "Always start automatically" on this Mac. A notification with a Stop action always appears when a web start begins recording.
+- Recording starts only from a Record button press, an explicit notification action, or a meeting you started yourself on the web after choosing "Always start automatically" on this Mac. A notification with a Stop action always appears when a web start begins recording; if notifications are denied, web starts always ask first in the menu.
+- While you are signed in, the app checks in with your Minutia instance every few seconds, sending this Mac's name and a random device id so the web can tell it is available.
 
 ## License
 

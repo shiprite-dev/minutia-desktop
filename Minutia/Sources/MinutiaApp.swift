@@ -620,6 +620,9 @@ final class AppController: NSObject, ObservableObject {
     private var checkinInFlight = false
     private var checkinTimer: Timer?
     private var consentExpiryTimer: Timer?
+    private var startInFlight = false
+
+    private var canBeginRecording: Bool { !startInFlight && Self.canStartRecording(from: phase) }
 
     private override init() {
         super.init()
@@ -650,6 +653,8 @@ final class AppController: NSObject, ObservableObject {
         captureSession.onTranscriptionUnavailable = { [weak self] in
             self?.recordFeedback = "Transcription is not enabled for this account. Audio keeps recording and will be saved."
         }
+
+        authManager.beforeSignOut = { [weak self] in await self?.reportBeforeSignOut() }
 
         authManager.$sessionIdentity
             .removeDuplicates()
@@ -686,7 +691,7 @@ final class AppController: NSObject, ObservableObject {
         // A pending web-record consent is only actionable from a resting/recoverable phase.
         // Drop it the moment we leave one (recording started by any path, finalizing, or sign-out)
         // so a stale banner cannot linger past the meeting or a sign-out.
-        if !Self.canStartRecording(from: next) { pendingRecordConsent = nil }
+        if !Self.canStartRecording(from: next) { clearPendingConsent(reason: "busy") }
         // The floating prompt only belongs over a promptable phase; leaving one (recording started
         // from the menu or a deep link, finalizing, error, or sign-out) dismisses it.
         if !MeetingPrompt.canPrompt(phase: next) { dismissMeetingPrompt() }
@@ -769,7 +774,6 @@ final class AppController: NSObject, ObservableObject {
             checkinTimer?.invalidate()
             checkinTimer = nil
             if Self.shouldStopCaptureOnSignOut(phase: phase) {
-                report(.stopped, meetingId: recordingMeetingId)
                 // Keep the recording ids set until the finalize completes: a fast re-sign-in would
                 // otherwise let runRecovery see no active meeting and touch the still-finalizing
                 // capture dir concurrently with this stop. Clear them only once stop() returns.
@@ -786,7 +790,7 @@ final class AppController: NSObject, ObservableObject {
             }
             notepad.signOut()
             lastFailedStart = nil
-            pendingRecordConsent = nil
+            clearPendingConsent(reason: nil)
             apply(.signedOut)
             series = []
         }
@@ -998,7 +1002,7 @@ final class AppController: NSObject, ObservableObject {
     /// Single start path shared by the Record button, the detection banner, and the
     /// notification action.
     func startRecording() {
-        guard Self.canStartRecording(from: phase) else { return }
+        guard canBeginRecording else { return }
         guard let client = authManager.client() else { return }
         switch Self.recordPreflight(
             micStatus: AVCaptureDevice.authorizationStatus(for: .audio),
@@ -1020,19 +1024,19 @@ final class AppController: NSObject, ObservableObject {
         }
         guard let seriesId = selectedSeriesId else { return }
         let instance = client.instance
+        startInFlight = true
         Task {
+            defer { startInFlight = false }
+            var meetingId: UUID?
             do {
                 let meeting = try await client.startOrJoinMeeting(seriesId: seriesId)
-                let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
-                try captureSession.start(meetingId: meeting.id.uuidString, seriesId: seriesId, userId: userId, client: client)
-                guard await confirmSoleRecorder(meetingId: meeting.id.uuidString, client: client) else { return }
-                notepad.begin(meetingId: meeting.id.uuidString, instance: instance, userId: userId, client: client)
-                recordingMeetingId = meeting.id
-                recordingSeriesId = seriesId
-                recordingInstance = instance
-                resetEndDetectionState(origin: Self.detectionOrigin(for: lastConfidence))
-                apply(.recordStarted)
+                meetingId = meeting.id
+                try await launchCapture(
+                    meetingId: meeting.id.uuidString, seriesId: seriesId, announce: false, client: client)
+            } catch CaptureSession.CaptureError.alreadyRunning {
+                return
             } catch {
+                report(.failed, meetingId: meetingId, reason: "start_failed")
                 lastFailedStart = .series
                 apply(.failed("Could not start recording: \(error.localizedDescription)"))
             }
@@ -1047,40 +1051,50 @@ final class AppController: NSObject, ObservableObject {
     }
 
     private func startRecording(meetingId: String, claim: CheckinClaim?) {
-        let failureReported = { [self] (reason: String) in
-            if claim != nil { report(.failed, meetingId: UUID(uuidString: meetingId), reason: reason) }
-        }
-        guard Self.canStartRecording(from: phase), let client = authManager.client() else {
-            failureReported("busy")
+        let id = UUID(uuidString: meetingId)
+        let reportStartFailure = { [self] (reason: String) in report(.failed, meetingId: id, reason: reason) }
+        guard canBeginRecording, let client = authManager.client() else {
+            if claim != nil { reportStartFailure("busy") }
             return
         }
         if Self.micPreCheckFails(
             status: AVCaptureDevice.authorizationStatus(for: .audio),
             hasInputDevice: AVCaptureDevice.default(for: .audio) != nil) {
-            failureReported("mic_denied")
+            reportStartFailure("mic_denied")
             apply(.failed(CaptureSession.failureMessage(for: MicCapture.CaptureError.permissionDenied)))
             return
         }
-        let instance = client.instance
         let seriesId = claim.flatMap { UUID(uuidString: $0.seriesId) }
+        startInFlight = true
         Task {
+            defer { startInFlight = false }
             do {
-                let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
-                try captureSession.start(meetingId: meetingId, seriesId: seriesId, userId: userId, client: client)
-                guard await confirmSoleRecorder(meetingId: meetingId, client: client) else { return }
-                notepad.begin(meetingId: meetingId, instance: instance, userId: userId, client: client)
-                recordingMeetingId = UUID(uuidString: meetingId)
-                recordingSeriesId = seriesId
-                recordingInstance = instance
-                resetEndDetectionState(origin: Self.detectionOrigin(for: lastConfidence))
-                apply(.recordStarted)
-                if claim != nil { postRecordingStartedNotification() }
+                try await launchCapture(meetingId: meetingId, seriesId: seriesId, announce: claim != nil, client: client)
+            } catch CaptureSession.CaptureError.alreadyRunning {
+                return
             } catch {
-                failureReported("start_failed")
+                reportStartFailure("start_failed")
                 lastFailedStart = .meeting(meetingId)
                 apply(.failed("Could not start recording: \(error.localizedDescription)"))
             }
         }
+    }
+
+    private func launchCapture(meetingId: String, seriesId: UUID?, announce: Bool, client: MinutiaClient) async throws {
+        let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
+        try captureSession.start(meetingId: meetingId, seriesId: seriesId, userId: userId, client: client)
+        guard await confirmSoleRecorder(meetingId: meetingId, client: client) else { return }
+        guard captureSession.isRunning else {
+            report(.failed, meetingId: UUID(uuidString: meetingId), reason: "capture_failed")
+            return
+        }
+        notepad.begin(meetingId: meetingId, instance: client.instance, userId: userId, client: client)
+        recordingMeetingId = UUID(uuidString: meetingId)
+        recordingSeriesId = seriesId
+        recordingInstance = client.instance
+        resetEndDetectionState(origin: Self.detectionOrigin(for: lastConfidence))
+        apply(.recordStarted)
+        if announce { postRecordingStartedNotification() }
     }
 
     private func confirmSoleRecorder(meetingId: String, client: MinutiaClient) async -> Bool {
@@ -1096,12 +1110,33 @@ final class AppController: NSObject, ObservableObject {
     }
 
     private func report(_ event: MinutiaClient.RecordingEvent, meetingId: UUID?, reason: String? = nil) {
+        Task { await sendEvent(event, meetingId: meetingId, reason: reason) }
+    }
+
+    private func sendEvent(_ event: MinutiaClient.RecordingEvent, meetingId: UUID?, reason: String? = nil) async {
         guard let meetingId, let client = authManager.client() else { return }
-        let deviceId = DeviceIdentity.id(in: defaults)
-        Task {
-            _ = await client.recordingEvent(
-                meetingId: meetingId.uuidString, deviceId: deviceId,
-                deviceName: DeviceIdentity.name, event: event, reason: reason)
+        _ = await client.recordingEvent(
+            meetingId: meetingId.uuidString, deviceId: DeviceIdentity.id(in: defaults),
+            deviceName: DeviceIdentity.name, event: event, reason: reason)
+    }
+
+    private func reportBeforeSignOut() async {
+        let claim = pendingRecordConsent?.claim
+        let recording = Self.shouldStopCaptureOnSignOut(phase: phase) ? recordingMeetingId : nil
+        clearPendingConsent(reason: nil)
+        try? await withTimeout(seconds: 3) { [self] in
+            if let claim { await sendEvent(.failed, meetingId: UUID(uuidString: claim.meetingId), reason: "signed_out") }
+            await sendEvent(.stopped, meetingId: recording)
+        }
+    }
+
+    private func clearPendingConsent(reason: String?) {
+        consentExpiryTimer?.invalidate()
+        consentExpiryTimer = nil
+        guard let pending = pendingRecordConsent else { return }
+        pendingRecordConsent = nil
+        if let claim = pending.claim, let reason {
+            report(.failed, meetingId: UUID(uuidString: claim.meetingId), reason: reason)
         }
     }
 
@@ -1128,13 +1163,13 @@ final class AppController: NSObject, ObservableObject {
               CheckinPolicy.interval(for: phase) != nil,
               let client = authManager.client() else { return }
         checkinInFlight = true
-        let canClaim = CheckinPolicy.canClaim(
+        let canClaim = !startInFlight && CheckinPolicy.canClaim(
             phase: phase, screenLocked: screenLocked, idleSeconds: UserActivity.idleSeconds)
         let deviceId = DeviceIdentity.id(in: defaults)
         Task {
             let claim = await client.checkin(deviceId: deviceId, deviceName: DeviceIdentity.name, canClaim: canClaim)
             checkinInFlight = false
-            if let claim { handleClaim(claim) }
+            if let claim { await handleClaim(claim) }
             scheduleNextCheckin()
         }
     }
@@ -1151,12 +1186,22 @@ final class AppController: NSObject, ObservableObject {
         checkinTimer = timer
     }
 
-    private func handleClaim(_ claim: CheckinClaim) {
-        guard Self.canStartRecording(from: phase) else {
+    private func handleClaim(_ claim: CheckinClaim) async {
+        if let pending = pendingRecordConsent, pending.claim == claim { return }
+        guard canBeginRecording, pendingRecordConsent == nil else {
             report(.failed, meetingId: UUID(uuidString: claim.meetingId), reason: "busy")
             return
         }
-        switch WebStartPolicy.load(from: defaults).onClaim {
+        var action = WebStartPolicy.load(from: defaults).onClaim
+        if action == .startNow {
+            let status = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+            if status != .authorized && status != .provisional { action = .askFirst }
+            guard canBeginRecording, pendingRecordConsent == nil else {
+                report(.failed, meetingId: UUID(uuidString: claim.meetingId), reason: "busy")
+                return
+            }
+        }
+        switch action {
         case .startNow:
             startRecording(meetingId: claim.meetingId, claim: claim)
         case .askFirst:
@@ -1181,8 +1226,7 @@ final class AppController: NSObject, ObservableObject {
 
     private func expireWebStartConsent(_ claim: CheckinClaim) {
         guard pendingRecordConsent?.claim == claim else { return }
-        pendingRecordConsent = nil
-        report(.failed, meetingId: UUID(uuidString: claim.meetingId), reason: "no_response")
+        clearPendingConsent(reason: "no_response")
     }
 
     enum WebStartChoice {
@@ -1193,9 +1237,7 @@ final class AppController: NSObject, ObservableObject {
 
     func answerWebStart(_ choice: WebStartChoice) {
         guard let pending = pendingRecordConsent, let claim = pending.claim else { return }
-        pendingRecordConsent = nil
-        consentExpiryTimer?.invalidate()
-        consentExpiryTimer = nil
+        clearPendingConsent(reason: nil)
         let meetingId = UUID(uuidString: claim.meetingId)
         guard choice != .ignore else {
             report(.failed, meetingId: meetingId, reason: "declined")
@@ -1247,6 +1289,7 @@ final class AppController: NSObject, ObservableObject {
     /// notification. A duplicate request for the same meeting does not stack a second prompt.
     func promptRecordConsent(meetingId: String) {
         if let pending = pendingRecordConsent, pending.meetingId == meetingId { return }
+        clearPendingConsent(reason: "superseded")
         pendingRecordConsent = PendingRecordConsent(meetingId: meetingId, requestedAt: Date())
         NSApp.activate(ignoringOtherApps: true)
         let content = UNMutableNotificationContent()
@@ -1266,7 +1309,7 @@ final class AppController: NSObject, ObservableObject {
         if pending.claim != nil { answerWebStart(.once); return }
         pendingRecordConsent = nil
         guard Self.isRecordConsentValid(requestedAt: pending.requestedAt, now: Date()),
-              Self.canStartRecording(from: phase) else { return }
+              canBeginRecording else { return }
         startRecording(meetingId: pending.meetingId)
     }
 

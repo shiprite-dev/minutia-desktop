@@ -177,6 +177,7 @@ struct MinutiaClient {
 
     static func checkinRequest(instance: URL, token: String, deviceId: String, deviceName: String, canClaim: Bool) -> URLRequest {
         var request = bearerRequest(instance.appendingPathComponent("api/companion/checkin"), method: "POST", token: token)
+        request.timeoutInterval = 10
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try? JSONSerialization.data(withJSONObject: [
             "device_id": deviceId, "device_name": deviceName, "can_claim": canClaim,
@@ -187,10 +188,11 @@ struct MinutiaClient {
     static func decodeCheckin(_ data: Data) -> CheckinClaim? {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let claim = object["claim"] as? [String: Any],
-              let meetingId = claim["meeting_id"] as? String,
-              let seriesId = claim["series_id"] as? String
+              let meetingId = (claim["meeting_id"] as? String).flatMap(UUID.init(uuidString:)),
+              let seriesId = (claim["series_id"] as? String).flatMap(UUID.init(uuidString:))
         else { return nil }
-        return CheckinClaim(meetingId: meetingId.lowercased(), seriesId: seriesId)
+        return CheckinClaim(
+            meetingId: meetingId.uuidString.lowercased(), seriesId: seriesId.uuidString.lowercased())
     }
 
     static func recordingEventRequest(

@@ -39,7 +39,9 @@ final class CaptureSession: ObservableObject {
         let transcriptRequested: Bool
     }
 
-    enum CaptureError: Error { case notRunning, stalled, recordingUnfinished }
+    enum CaptureError: Error { case notRunning, stalled, recordingUnfinished, alreadyRunning, invalidMeetingId }
+
+    var isRunning: Bool { pipeline != nil }
 
     /// Ceiling for the stop-time network finalize (drain + upload + finalize + transcribe request).
     static let finalizeTimeout: TimeInterval = 60
@@ -68,11 +70,12 @@ final class CaptureSession: ObservableObject {
     /// capture directory lives under Application Support (durable across quit/crash) with a manifest
     /// so an interrupted meeting can be recovered on the next launch.
     func start(meetingId: String, seriesId: UUID?, userId: String?, client: MinutiaClient) throws {
-        guard pipeline == nil else { return }
+        guard pipeline == nil else { throw CaptureError.alreadyRunning }
+        guard let canonical = UUID(uuidString: meetingId) else { throw CaptureError.invalidMeetingId }
 
         // Canonicalize to the lowercase meeting id the DB row and the storage RLS policy use;
         // Swift's UUID.uuidString is uppercase, which the case-sensitive path check would deny.
-        let meetingId = meetingId.lowercased()
+        let meetingId = canonical.uuidString.lowercased()
 
         let dir = try CaptureStore.capturesRoot()
             .appendingPathComponent(meetingId, isDirectory: true)

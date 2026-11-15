@@ -425,8 +425,11 @@ final class AuthManager: ObservableObject {
         }
     }
 
+    var beforeSignOut: (() async -> Void)?
+
     func signOut() async {
         guard let supabase else { return }
+        await beforeSignOut?()
         try? await supabase.auth.signOut()
         setSession(email: nil)
         // A single-use token hash is scoped to the prior session; clearing it lets a fresh
