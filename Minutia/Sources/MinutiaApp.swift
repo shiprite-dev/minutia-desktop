@@ -598,6 +598,7 @@ final class AppController: NSObject, ObservableObject {
     /// The instance capture started against, captured at start so the recap URL survives an instance
     /// switch made while the meeting was recording.
     private var recordingInstance: URL?
+    private var earlyRecapMeetingId: UUID?
     private var lastFailedStart: FailedStart?
     /// The instance the detector's agenda provider is currently bound to. When it changes (an
     /// instance switch), the detector must be torn down and restarted so it stops polling the old
@@ -1141,10 +1142,13 @@ final class AppController: NSObject, ObservableObject {
         let instance = recordingInstance
         let early = Self.opensRecap(for: reason) && meetingId != nil && instance != nil
         if early, let meetingId, let instance {
+            earlyRecapMeetingId = meetingId
             Task {
-                try? await notepad.flushNow()
+                try? await withTimeout(seconds: 3) { [notepad] in try await notepad.flushNow() }
                 if let client = authManager.client() {
-                    await CaptureSession.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId.uuidString) }
+                    try? await withTimeout(seconds: 3) {
+                        await CaptureSession.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId.uuidString) }
+                    }
                 }
                 await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance, autoRecap: true)
             }
@@ -1415,7 +1419,9 @@ final class AppController: NSObject, ObservableObject {
                     NotepadStore.removeIfSynced(meetingId: meetingId, in: notesRoot)
                 }
                 apply(.finalized)
-                if let meetingUUID = UUID(uuidString: manifest.meetingId) {
+                let openedEarly = earlyRecapMeetingId.map { $0.uuidString.lowercased() == manifest.meetingId.lowercased() } ?? false
+                earlyRecapMeetingId = nil
+                if !openedEarly, let meetingUUID = UUID(uuidString: manifest.meetingId) {
                     await openRecap(
                         meetingId: meetingUUID,
                         seriesId: manifest.seriesId.flatMap { UUID(uuidString: $0) },
