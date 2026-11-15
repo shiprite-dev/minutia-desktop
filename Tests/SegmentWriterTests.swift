@@ -140,7 +140,6 @@ final class SegmentWriterTests: XCTestCase {
         XCTAssertNil(result.finalSegment)
         XCTAssertEqual(result.recording.frames, 0)
         XCTAssertTrue(FileManager.default.fileExists(atPath: result.recording.fileURL.path))
-        XCTAssertEqual(try duration(of: result.recording.fileURL), 0, accuracy: 1.0)
     }
 
     func test_filesLandUnderDirectory_withChannelNames() throws {

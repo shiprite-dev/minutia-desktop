@@ -1242,12 +1242,14 @@ final class AppController: NSObject, ObservableObject {
     enum RecoveryOutcome: Equatable {
         case recovered
         case transcriptionUnavailable
+        case unreadable
         case retryLater
     }
 
     nonisolated static func recoveryOutcome(for error: Error?) -> RecoveryOutcome {
         guard let error else { return .recovered }
         if case MinutiaClientError.featureUnavailable = error { return .transcriptionUnavailable }
+        if error as? CaptureRecovery.RecoveryError == .unreadableRecording { return .unreadable }
         return .retryLater
     }
 
@@ -1328,6 +1330,13 @@ final class AppController: NSObject, ObservableObject {
                     CaptureRecovery.saveManifest(updated, to: dir)
                     transcriptionUnavailable.append(manifest)
                 }
+            case .unreadable:
+                // An unreadable recording never becomes readable: stop retrying at once and keep the audio.
+                var updated = manifest
+                updated.recoveryAttempts = maxRecoveryAttempts
+                CaptureRecovery.saveManifest(updated, to: dir)
+                logger.error("Recovery: unreadable recording for meeting \(manifest.meetingId, privacy: .public)")
+                exhausted.append(manifest)
             case .retryLater:
                 // Persist the incremented attempt count so the bound survives relaunches. Keep the
                 // audio; when the count reaches the ceiling, notify the user exactly once.

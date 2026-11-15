@@ -68,6 +68,29 @@ enum CaptureRecovery {
     static let manifestName = "manifest.json"
     static let recordingName = "recording.m4a"
 
+    enum RecoveryError: Error, Equatable { case unreadableRecording }
+
+    /// nil when the file is missing, has no audio track, or has no positive finite duration.
+    static func readableAudioDuration(of url: URL) async -> Double? {
+        let asset = AVURLAsset(url: url)
+        guard let tracks = try? await asset.loadTracks(withMediaType: .audio), !tracks.isEmpty,
+              let duration = try? await asset.load(.duration) else { return nil }
+        let seconds = CMTimeGetSeconds(duration)
+        return seconds.isFinite && seconds > 0 ? seconds : nil
+    }
+
+    /// Segment pairs whose mic AND system files are both readable, sorted by seq ascending.
+    static func readableSegments(in directory: URL) async -> [SegmentWriter.ClosedSegment] {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+        var segments: [SegmentWriter.ClosedSegment] = []
+        for segment in names.compactMap({ recoveredSegment(in: directory, name: $0) }).sorted(by: { $0.seq < $1.seq }) {
+            guard await readableAudioDuration(of: segment.micURL) != nil,
+                  await readableAudioDuration(of: segment.sysURL) != nil else { continue }
+            segments.append(segment)
+        }
+        return segments
+    }
+
     /// Subdirectories of `root` that hold both a manifest and a recording, excluding the active
     /// meeting's own directory (matched case-insensitively, since a Swift UUID string is uppercase
     /// but the on-disk directory is the lowercased id). Pure and sorted for deterministic sweeps.
@@ -129,20 +152,16 @@ enum CaptureRecovery {
         directory: URL, manifest: CaptureManifest, client: MinutiaClient,
         flushNotes: @escaping @Sendable () async throws -> Void = {}
     ) async throws {
-        let fm = FileManager.default
+        let recordingURL = directory.appendingPathComponent(recordingName)
+        guard let duration = await readableAudioDuration(of: recordingURL) else { throw RecoveryError.unreadableRecording }
 
-        let names = (try? fm.contentsOfDirectory(atPath: directory.path)) ?? []
-        for name in names {
-            guard let segment = recoveredSegment(in: directory, name: name),
-                  fm.fileExists(atPath: segment.sysURL.path) else { continue }
+        for segment in await readableSegments(in: directory) {
             try? await client.uploadSegment(meetingId: manifest.meetingId, segment: segment)
             _ = try? await client.registerSegment(meetingId: manifest.meetingId, seq: segment.seq)
         }
 
-        let recordingURL = directory.appendingPathComponent(recordingName)
         let path = try await client.uploadRecording(meetingId: manifest.meetingId, fileURL: recordingURL)
-        let duration = (try? Self.duration(of: recordingURL)) ?? 0
-        let attrs = try? fm.attributesOfItem(atPath: recordingURL.path)
+        let attrs = try? FileManager.default.attributesOfItem(atPath: recordingURL.path)
         let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
         try await client.finalizeMeeting(meetingId: manifest.meetingId, audioPath: path, duration: duration, sizeBytes: size)
         _ = try await NotepadFinalize.flushThenTranscribe(
@@ -164,10 +183,5 @@ enum CaptureRecovery {
             micURL: directory.appendingPathComponent(name),
             sysURL: directory.appendingPathComponent("seg-\(seq)-them.m4a"),
             frames: 0)
-    }
-
-    private static func duration(of url: URL) throws -> Double {
-        let file = try AVAudioFile(forReading: url)
-        return Double(file.length) / file.processingFormat.sampleRate
     }
 }
