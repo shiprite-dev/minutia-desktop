@@ -1110,7 +1110,7 @@ final class AppController: NSObject, ObservableObject {
                 deviceName: DeviceIdentity.name, event: .started)
             guard result == .conflict, token == captureToken, case .recording = phase else { return }
             captureSession.discard()
-            notepad.signOut()
+            notepad.end()
             recordingMeetingId = nil
             recordingSeriesId = nil
             recordingInstance = nil
