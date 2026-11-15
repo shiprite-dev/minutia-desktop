@@ -171,10 +171,6 @@ struct MinutiaClient {
         bearerRequest(instance.appendingPathComponent("api/calendar/agenda"), method: "GET", token: token)
     }
 
-    static func heartbeatRequest(instance: URL, token: String) -> URLRequest {
-        bearerRequest(instance.appendingPathComponent("api/companion/heartbeat"), method: "POST", token: token)
-    }
-
     static func checkinRequest(instance: URL, token: String, deviceId: String, deviceName: String, canClaim: Bool) -> URLRequest {
         var request = bearerRequest(instance.appendingPathComponent("api/companion/checkin"), method: "POST", token: token)
         request.timeoutInterval = 10

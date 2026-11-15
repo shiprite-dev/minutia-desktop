@@ -241,14 +241,6 @@ final class MinutiaClientBuilderTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-access-token")
     }
 
-    func test_heartbeatRequest_hasContractPathAndHeaders() {
-        let request = MinutiaClient.heartbeatRequest(instance: instance, token: token)
-
-        XCTAssertEqual(request.url, URL(string: "https://minutia.example.com/api/companion/heartbeat"))
-        XCTAssertEqual(request.httpMethod, "POST")
-        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-access-token")
-    }
-
     func test_companionAuthorizeURL_percentEncodesDeviceName() {
         let url = MinutiaClient.companionAuthorizeURL(instance: instance, device: "Pratik's MacBook Pro")
 

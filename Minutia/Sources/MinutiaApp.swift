@@ -297,6 +297,7 @@ final class AppController: NSObject, ObservableObject {
     static let webRecordCategoryId = "app.minutia.webRecord"
     static let confirmWebRecordActionId = "app.minutia.webRecord.confirm"
     static let dismissWebRecordActionId = "app.minutia.webRecord.dismiss"
+    static let claimMeetingIdUserInfoKey = "app.minutia.claimMeetingId"
     static let webStartCategoryId = "app.minutia.webStart"
     static let webStartAlwaysActionId = "app.minutia.webStart.always"
     static let webStartOnceActionId = "app.minutia.webStart.once"
@@ -621,8 +622,11 @@ final class AppController: NSObject, ObservableObject {
     private var checkinTimer: Timer?
     private var consentExpiryTimer: Timer?
     private var startInFlight = false
+    private var startingMeetingId: String?
+    private var signingOut = false
+    private var captureToken = 0
 
-    private var canBeginRecording: Bool { !startInFlight && Self.canStartRecording(from: phase) }
+    private var canBeginRecording: Bool { !startInFlight && !signingOut && Self.canStartRecording(from: phase) }
 
     private override init() {
         super.init()
@@ -761,6 +765,7 @@ final class AppController: NSObject, ObservableObject {
 
     private func handleAuthChange(signedIn: Bool) {
         if signedIn {
+            signingOut = false
             apply(.signedIn)
             // apply() no-ops when an instance switch under the same email keeps the phase at .idle,
             // so rebind the detector explicitly: syncDetector re-points its agenda provider at the
@@ -1066,8 +1071,12 @@ final class AppController: NSObject, ObservableObject {
         }
         let seriesId = claim.flatMap { UUID(uuidString: $0.seriesId) }
         startInFlight = true
+        startingMeetingId = meetingId
         Task {
-            defer { startInFlight = false }
+            defer {
+                startInFlight = false
+                startingMeetingId = nil
+            }
             do {
                 try await launchCapture(meetingId: meetingId, seriesId: seriesId, announce: claim != nil, client: client)
             } catch CaptureSession.CaptureError.alreadyRunning {
@@ -1083,11 +1092,6 @@ final class AppController: NSObject, ObservableObject {
     private func launchCapture(meetingId: String, seriesId: UUID?, announce: Bool, client: MinutiaClient) async throws {
         let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
         try captureSession.start(meetingId: meetingId, seriesId: seriesId, userId: userId, client: client)
-        guard await confirmSoleRecorder(meetingId: meetingId, client: client) else { return }
-        guard captureSession.isRunning else {
-            report(.failed, meetingId: UUID(uuidString: meetingId), reason: "capture_failed")
-            return
-        }
         notepad.begin(meetingId: meetingId, instance: client.instance, userId: userId, client: client)
         recordingMeetingId = UUID(uuidString: meetingId)
         recordingSeriesId = seriesId
@@ -1095,18 +1099,27 @@ final class AppController: NSObject, ObservableObject {
         resetEndDetectionState(origin: Self.detectionOrigin(for: lastConfidence))
         apply(.recordStarted)
         if announce { postRecordingStartedNotification() }
+        captureToken += 1
+        verifySoleRecorder(meetingId: meetingId, token: captureToken, client: client)
     }
 
-    private func confirmSoleRecorder(meetingId: String, client: MinutiaClient) async -> Bool {
-        let result = await client.recordingEvent(
-            meetingId: meetingId, deviceId: DeviceIdentity.id(in: defaults),
-            deviceName: DeviceIdentity.name, event: .started)
-        guard result == .conflict else { return true }
-        captureSession.discard()
-        let message = "Already recording on another Mac"
-        recordFeedback = message
-        Self.postNotification(title: message, body: "This Mac did not start a second recording.")
-        return false
+    private func verifySoleRecorder(meetingId: String, token: Int, client: MinutiaClient) {
+        Task {
+            let result = await client.recordingEvent(
+                meetingId: meetingId, deviceId: DeviceIdentity.id(in: defaults),
+                deviceName: DeviceIdentity.name, event: .started)
+            guard result == .conflict, token == captureToken, case .recording = phase else { return }
+            captureSession.discard()
+            notepad.signOut()
+            recordingMeetingId = nil
+            recordingSeriesId = nil
+            recordingInstance = nil
+            apply(.recordStopped)
+            apply(.finalized)
+            let message = "Already recording on another Mac"
+            recordFeedback = message
+            Self.postNotification(title: message, body: "This Mac did not start a second recording.")
+        }
     }
 
     private func report(_ event: MinutiaClient.RecordingEvent, meetingId: UUID?, reason: String? = nil) {
@@ -1121,8 +1134,12 @@ final class AppController: NSObject, ObservableObject {
     }
 
     private func reportBeforeSignOut() async {
+        signingOut = true
+        checkinTimer?.invalidate()
+        checkinTimer = nil
         let claim = pendingRecordConsent?.claim
-        let recording = Self.shouldStopCaptureOnSignOut(phase: phase) ? recordingMeetingId : nil
+        var recording: UUID?
+        if case .recording = phase { recording = recordingMeetingId }
         clearPendingConsent(reason: nil)
         try? await withTimeout(seconds: 3) { [self] in
             if let claim { await sendEvent(.failed, meetingId: UUID(uuidString: claim.meetingId), reason: "signed_out") }
@@ -1168,8 +1185,8 @@ final class AppController: NSObject, ObservableObject {
         let deviceId = DeviceIdentity.id(in: defaults)
         Task {
             let claim = await client.checkin(deviceId: deviceId, deviceName: DeviceIdentity.name, canClaim: canClaim)
-            checkinInFlight = false
             if let claim { await handleClaim(claim) }
+            checkinInFlight = false
             scheduleNextCheckin()
         }
     }
@@ -1188,6 +1205,11 @@ final class AppController: NSObject, ObservableObject {
 
     private func handleClaim(_ claim: CheckinClaim) async {
         if let pending = pendingRecordConsent, pending.claim == claim { return }
+        if claim.meetingId == startingMeetingId || claim.meetingId == recordingMeetingId?.uuidString.lowercased() { return }
+        if signingOut {
+            report(.failed, meetingId: UUID(uuidString: claim.meetingId), reason: "signed_out")
+            return
+        }
         guard canBeginRecording, pendingRecordConsent == nil else {
             report(.failed, meetingId: UUID(uuidString: claim.meetingId), reason: "busy")
             return
@@ -1216,6 +1238,7 @@ final class AppController: NSObject, ObservableObject {
         content.title = "Record the meeting you just started?"
         content.body = "Minutia will start recording only after you choose."
         content.categoryIdentifier = Self.webStartCategoryId
+        content.userInfo = [Self.claimMeetingIdUserInfoKey: claim.meetingId]
         UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
         consentExpiryTimer?.invalidate()
@@ -1235,8 +1258,9 @@ final class AppController: NSObject, ObservableObject {
         case ignore
     }
 
-    func answerWebStart(_ choice: WebStartChoice) {
+    func answerWebStart(_ choice: WebStartChoice, forMeeting meetingId: String? = nil) {
         guard let pending = pendingRecordConsent, let claim = pending.claim else { return }
+        if let meetingId, meetingId != claim.meetingId { return }
         clearPendingConsent(reason: nil)
         let meetingId = UUID(uuidString: claim.meetingId)
         guard choice != .ignore else {
@@ -1748,6 +1772,7 @@ extension AppController: UNUserNotificationCenterDelegate {
     ) {
         let actionId = response.actionIdentifier
         let userInfo = response.notification.request.content.userInfo
+        let claimId = userInfo[Self.claimMeetingIdUserInfoKey] as? String
         Task { @MainActor in
             switch actionId {
             case Self.confirmWebRecordActionId:
@@ -1755,11 +1780,11 @@ extension AppController: UNUserNotificationCenterDelegate {
             case Self.dismissWebRecordActionId:
                 self.dismissPendingRecord()
             case Self.webStartAlwaysActionId:
-                self.answerWebStart(.always)
+                self.answerWebStart(.always, forMeeting: claimId)
             case Self.webStartOnceActionId:
-                self.answerWebStart(.once)
+                self.answerWebStart(.once, forMeeting: claimId)
             case Self.webStartIgnoreActionId:
-                self.answerWebStart(.ignore)
+                self.answerWebStart(.ignore, forMeeting: claimId)
             case Self.stopRecordingActionId:
                 self.stopRecording()
             case UNNotificationDefaultActionIdentifier:
