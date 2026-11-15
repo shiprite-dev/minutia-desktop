@@ -207,7 +207,6 @@ final class CaptureSession: ObservableObject {
             _ = try await NotepadFinalize.flushThenTranscribe(
                 flush: flushNotes,
                 requestTranscription: { try await client.requestTranscription(meetingId: meetingId, expectedSegments: expected) })
-            await Self.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId) }
             return (counts: counts, expected: expected, transcriptRequested: true)
         }
 
@@ -215,6 +214,7 @@ final class CaptureSession: ObservableObject {
         segmentsTotal = outcome.counts.enqueued
 
         Task { await client.warmSummary(meetingId: meetingId) }
+        Task { await Self.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId) } }
 
         if outcome.transcriptRequested {
             try? FileManager.default.removeItem(at: directory)
