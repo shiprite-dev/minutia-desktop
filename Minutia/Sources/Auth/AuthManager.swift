@@ -289,7 +289,6 @@ final class AuthManager: ObservableObject {
             // user lands on sign-in rather than a phantom signed-in state.
             let sessionEmail = (try? await client.auth.session)?.user.email
             setSession(email: Self.resolvedEmail(priorEmail: userEmail, sessionEmail: sessionEmail))
-            if sessionEmail != nil { fireHeartbeat() }
         } catch {
             // A failed (re)connect must not leave a stale client reporting connected, nor a
             // signed-in phase with no client behind it. Clearing the session drops the app to the
@@ -331,7 +330,6 @@ final class AuthManager: ObservableObject {
         guard let supabase else { throw AuthError.notConnected }
         let session = try await supabase.auth.signIn(email: email, password: password)
         setSession(email: session.user.email)
-        fireHeartbeat()
     }
 
     func signInWithGoogle() async throws {
@@ -340,7 +338,6 @@ final class AuthManager: ObservableObject {
         let session = try await supabase.auth.signInWithOAuth(provider: .google, redirectTo: Self.redirectURL)
         setSession(email: session.user.email)
         pendingAuth = nil
-        fireHeartbeat()
     }
 
     /// Abandon an in-flight browser magic-link sign-in so the "waiting on your browser" state can
@@ -388,7 +385,6 @@ final class AuthManager: ObservableObject {
                 setSession(email: session.user.email)
                 callbackError = nil
                 pendingAuth = nil
-                fireHeartbeat()
                 return .signedIn(session.user.email)
             } catch {
                 // A failed first click must leave the same link retryable, not deduped into a
@@ -406,7 +402,6 @@ final class AuthManager: ObservableObject {
             setSession(email: session.user.email)
             callbackError = nil
             pendingAuth = nil
-            fireHeartbeat()
             return .signedIn(session.user.email)
         } catch {
             Self.logger.error("OAuth callback failed: \(error.localizedDescription, privacy: .public)")
@@ -430,15 +425,11 @@ final class AuthManager: ObservableObject {
         }
     }
 
-    /// Fire-and-forget companion heartbeat; runs after every successful sign-in and on
-    /// every signed-in launch. Failures are silent by contract.
-    private func fireHeartbeat() {
-        guard let client = client() else { return }
-        Task { await client.heartbeat() }
-    }
+    var beforeSignOut: (() async -> Void)?
 
     func signOut() async {
         guard let supabase else { return }
+        await beforeSignOut?()
         try? await supabase.auth.signOut()
         setSession(email: nil)
         // A single-use token hash is scoped to the prior session; clearing it lets a fresh

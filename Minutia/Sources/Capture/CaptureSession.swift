@@ -39,7 +39,7 @@ final class CaptureSession: ObservableObject {
         let transcriptRequested: Bool
     }
 
-    enum CaptureError: Error { case notRunning, stalled, recordingUnfinished }
+    enum CaptureError: Error { case notRunning, stalled, recordingUnfinished, alreadyRunning, invalidMeetingId }
 
     /// Ceiling for the stop-time network finalize (drain + upload + finalize + transcribe request).
     static let finalizeTimeout: TimeInterval = 60
@@ -68,11 +68,12 @@ final class CaptureSession: ObservableObject {
     /// capture directory lives under Application Support (durable across quit/crash) with a manifest
     /// so an interrupted meeting can be recovered on the next launch.
     func start(meetingId: String, seriesId: UUID?, userId: String?, client: MinutiaClient) throws {
-        guard pipeline == nil else { return }
+        guard pipeline == nil else { throw CaptureError.alreadyRunning }
+        guard let canonical = UUID(uuidString: meetingId) else { throw CaptureError.invalidMeetingId }
 
         // Canonicalize to the lowercase meeting id the DB row and the storage RLS policy use;
         // Swift's UUID.uuidString is uppercase, which the case-sensitive path check would deny.
-        let meetingId = meetingId.lowercased()
+        let meetingId = canonical.uuidString.lowercased()
 
         let dir = try CaptureStore.capturesRoot()
             .appendingPathComponent(meetingId, isDirectory: true)
@@ -264,10 +265,21 @@ final class CaptureSession: ObservableObject {
     /// disk (real audio was written; startup recovery salvages it); otherwise the dir is deleted
     /// (mic denied at start left nothing worth keeping). Guarded so a double-fire is a no-op.
     private func handleFatal(_ error: Error, preserveForRecovery: Bool) {
-        guard let pipeline else { return }
+        guard tearDownWithoutFinalize(removeDirectory: !preserveForRecovery) else { return }
+        onFailure?(Self.failureMessage(for: error), preserveForRecovery)
+    }
+
+    /// Drops a capture that must leave nothing behind (the server refused a second recorder):
+    /// tears the pipeline down and deletes the capture directory without touching the network.
+    func discard() {
+        _ = tearDownWithoutFinalize(removeDirectory: true)
+    }
+
+    private func tearDownWithoutFinalize(removeDirectory: Bool) -> Bool {
+        guard let pipeline else { return false }
         pipeline.teardown()
         queue?.cancelAll()
-        if !preserveForRecovery, let directory {
+        if removeDirectory, let directory {
             try? FileManager.default.removeItem(at: directory)
         }
         self.pipeline = nil
@@ -283,7 +295,7 @@ final class CaptureSession: ObservableObject {
         segmentsTotal = 0
         reconnecting = false
         micUnavailable = false
-        onFailure?(Self.failureMessage(for: error), preserveForRecovery)
+        return true
     }
 
     /// Whether a mic-start failure should preserve the capture dir for recovery. The system-audio

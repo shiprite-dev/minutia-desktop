@@ -15,6 +15,7 @@ struct SettingsView: View {
     @State private var launchAtLogin = SettingsView.loginItemState(SMAppService.mainApp.status) != .disabled
     @State private var loginRequiresApproval = SettingsView.loginItemState(SMAppService.mainApp.status) == .requiresApproval
     @State private var loginItemError: String?
+    @AppStorage(WebStartPolicy.defaultsKey) private var webStartPolicy = WebStartPolicy.ask.rawValue
 
     init(controller: AppController, updater: UpdaterController) {
         _controller = ObservedObject(wrappedValue: controller)
@@ -74,6 +75,9 @@ struct SettingsView: View {
                     .onChange(of: launchAtLogin) { _, enabled in
                         setLaunchAtLogin(enabled)
                     }
+                Toggle("Start recording automatically when I start a meeting on the web", isOn: Binding(
+                    get: { webStartPolicy == WebStartPolicy.always.rawValue },
+                    set: { webStartPolicy = ($0 ? WebStartPolicy.always : .ask).rawValue }))
                 if loginRequiresApproval {
                     Link("Pending approval in System Settings > General > Login Items",
                          destination: URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension")!)

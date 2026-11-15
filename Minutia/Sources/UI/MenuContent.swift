@@ -212,19 +212,39 @@ private struct WebRecordConsentBanner: View {
                     .fontWeight(.medium)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            HStack(spacing: 8) {
-                Button {
-                    controller.confirmPendingRecord()
-                } label: {
-                    Text("Start recording")
-                        .frame(maxWidth: .infinity)
+            if controller.pendingRecordConsent?.claim != nil {
+                VStack(spacing: 6) {
+                    Button {
+                        controller.answerWebStart(.always)
+                    } label: {
+                        Text("Always start automatically").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    HStack(spacing: 8) {
+                        Button {
+                            controller.answerWebStart(.once)
+                        } label: {
+                            Text("Just this once").frame(maxWidth: .infinity)
+                        }
+                        Button("Ignore") { controller.answerWebStart(.ignore) }
+                    }
+                    .buttonStyle(.bordered)
                 }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.defaultAction)
-                Button("Ignore") {
-                    controller.dismissPendingRecord()
+            } else {
+                HStack(spacing: 8) {
+                    Button {
+                        controller.confirmPendingRecord()
+                    } label: {
+                        Text("Start recording")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    Button("Ignore") {
+                        controller.dismissPendingRecord()
+                    }
+                    .buttonStyle(.bordered)
                 }
-                .buttonStyle(.bordered)
             }
         }
         .padding(10)

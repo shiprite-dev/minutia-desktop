@@ -38,9 +38,26 @@ enum MinutiaClientError: Error, Equatable {
     case meetingNotWritable
 }
 
+struct CheckinClaim: Equatable {
+    let meetingId: String
+    let seriesId: String
+}
+
+enum RecordingResult: Equatable {
+    case ok
+    case conflict
+    case ignored
+}
+
 /// API contract layer: pure request builders (unit tested) plus thin async ops
 /// that wrap supabase-swift (PostgREST/Storage/RPC) and the Minutia BFF routes.
 struct MinutiaClient {
+    enum RecordingEvent: String {
+        case started
+        case failed
+        case stopped
+    }
+
     let instance: URL
     let supabase: SupabaseClient
     let tokenProvider: () async throws -> String
@@ -154,8 +171,49 @@ struct MinutiaClient {
         bearerRequest(instance.appendingPathComponent("api/calendar/agenda"), method: "GET", token: token)
     }
 
-    static func heartbeatRequest(instance: URL, token: String) -> URLRequest {
-        bearerRequest(instance.appendingPathComponent("api/companion/heartbeat"), method: "POST", token: token)
+    static func checkinRequest(instance: URL, token: String, deviceId: String, deviceName: String, canClaim: Bool) -> URLRequest {
+        var request = bearerRequest(instance.appendingPathComponent("api/companion/checkin"), method: "POST", token: token)
+        request.timeoutInterval = 10
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "device_id": deviceId, "device_name": deviceName, "can_claim": canClaim,
+        ] as [String: Any])
+        return request
+    }
+
+    static func decodeCheckin(_ data: Data) -> CheckinClaim? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let claim = object["claim"] as? [String: Any],
+              let meetingId = (claim["meeting_id"] as? String).flatMap(UUID.init(uuidString:)),
+              let seriesId = (claim["series_id"] as? String).flatMap(UUID.init(uuidString:))
+        else { return nil }
+        return CheckinClaim(
+            meetingId: meetingId.uuidString.lowercased(), seriesId: seriesId.uuidString.lowercased())
+    }
+
+    static func recordingEventRequest(
+        instance: URL, token: String, meetingId: String, deviceId: String, deviceName: String,
+        event: RecordingEvent, reason: String?
+    ) -> URLRequest {
+        var request = bearerRequest(instance.appendingPathComponent("api/companion/recording"), method: "POST", token: token)
+        request.timeoutInterval = 10
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        var body: [String: Any] = [
+            "meeting_id": meetingId.lowercased(), "device_id": deviceId,
+            "device_name": deviceName, "event": event.rawValue,
+        ]
+        if let reason { body["reason"] = reason }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        return request
+    }
+
+    static func decodeRecordingResult(_ data: Data) -> RecordingResult {
+        let raw = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["result"] as? String
+        switch raw {
+        case "ok": return .ok
+        case "conflict": return .conflict
+        default: return .ignored
+        }
     }
 
     /// Browser sign-in entry point: the instance mints a companion magic link that redirects back
@@ -381,15 +439,32 @@ struct MinutiaClient {
         return components.url ?? url
     }
 
-    /// Announces this companion instance to the web app. Fire-and-forget: failures are ignored so a
-    /// flaky network or a not-yet-deployed route never blocks sign-in or launch.
-    func heartbeat() async {
+    func checkin(deviceId: String, deviceName: String, canClaim: Bool) async -> CheckinClaim? {
         do {
             let token = try await tokenProvider()
-            let request = Self.heartbeatRequest(instance: instance, token: token)
-            _ = try await URLSession.shared.data(for: request)
+            let request = Self.checkinRequest(
+                instance: instance, token: token, deviceId: deviceId, deviceName: deviceName, canClaim: canClaim)
+            let (data, _) = try await URLSession.shared.data(for: request)
+            return Self.decodeCheckin(data)
         } catch {
-            Self.logger.debug("heartbeat skipped: \(error.localizedDescription, privacy: .public)")
+            Self.logger.debug("checkin skipped: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+    }
+
+    func recordingEvent(
+        meetingId: String, deviceId: String, deviceName: String, event: RecordingEvent, reason: String? = nil
+    ) async -> RecordingResult {
+        do {
+            let token = try await tokenProvider()
+            let request = Self.recordingEventRequest(
+                instance: instance, token: token, meetingId: meetingId, deviceId: deviceId,
+                deviceName: deviceName, event: event, reason: reason)
+            let (data, _) = try await URLSession.shared.data(for: request)
+            return Self.decodeRecordingResult(data)
+        } catch {
+            Self.logger.debug("recording event skipped: \(error.localizedDescription, privacy: .public)")
+            return .ignored
         }
     }
 
