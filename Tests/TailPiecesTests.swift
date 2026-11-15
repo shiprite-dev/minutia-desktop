@@ -66,8 +66,23 @@ final class TailPiecesTests: XCTestCase {
         XCTAssertEqual(seconds(pieces[0].frames), 25.2, accuracy: 0.2)
         XCTAssertEqual(pieces[1].offsetSeconds, seconds(pieces[0].frames), accuracy: 0.001)
         XCTAssertEqual(pieces[2].offsetSeconds, 55.2, accuracy: 0.2)
-        XCTAssertEqual(pieces.reduce(0) { $0 + $1.frames }, try XCTUnwrap(result.finalSegment).frames)
+        XCTAssertEqual(pieces.reduce(0) { $0 + $1.frames }, 95 * 48_000)
+        XCTAssertNil(result.finalSegment, "the pieces replace the tail window")
+        let windows = try FileManager.default.contentsOfDirectory(atPath: dir.path).filter { $0.hasPrefix("seg-") }
+        XCTAssertEqual(windows, [], "a retry must never re-send the whole tail over the first piece")
         try assertReadablePieces(pieces)
+    }
+
+    func test_aStopJustAfterACut_keepsTheWholeTailWindowRatherThanASlivered_lastPiece() throws {
+        let writer = try SegmentWriter(directory: dir)
+        try append(writer, speech(40.5))
+
+        let result = try writer.finish()
+
+        XCTAssertTrue(result.tailPieces.isEmpty)
+        XCTAssertEqual(seconds(try XCTUnwrap(result.finalSegment).frames), 40.5)
+        let pieceFiles = try FileManager.default.contentsOfDirectory(atPath: dir.path).filter { $0.hasPrefix("tail-") }
+        XCTAssertEqual(pieceFiles, [])
     }
 
     func test_aTailWithoutAPause_isCutEveryFortySeconds() throws {
