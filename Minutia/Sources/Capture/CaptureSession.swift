@@ -214,6 +214,7 @@ final class CaptureSession: ObservableObject {
         segmentsTotal = outcome.counts.enqueued
 
         Task { await client.warmSummary(meetingId: meetingId) }
+        Task { await Self.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId) } }
 
         if outcome.transcriptRequested {
             try? FileManager.default.removeItem(at: directory)
@@ -249,6 +250,11 @@ final class CaptureSession: ObservableObject {
 
     nonisolated static func shouldWatchdogFire(secondsSinceFrames: TimeInterval, threshold: TimeInterval) -> Bool {
         secondsSinceFrames >= threshold
+    }
+
+    /// Only series owners and facilitators may change a meeting's status, so a refusal must not fail the stop.
+    nonisolated static func endMeetingIfAllowed(_ end: () async throws -> Void) async {
+        try? await end()
     }
 
     /// Tears the pipeline down on a mid-capture fatal WITHOUT running the network finalize, resets

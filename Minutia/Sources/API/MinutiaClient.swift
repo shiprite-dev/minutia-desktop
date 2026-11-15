@@ -123,6 +123,24 @@ struct MinutiaClient {
         CompanionNotesUpdate(companion_notes_markdown: NotepadDraft.clamp(text))
     }
 
+    struct EndMeetingUpdate: Encodable {
+        let status: String
+        let completed_at: String
+    }
+
+    static func endMeetingUpdate(now: Date = Date()) -> EndMeetingUpdate {
+        EndMeetingUpdate(status: "completed", completed_at: ISO8601DateFormatter().string(from: now))
+    }
+
+    func endMeeting(meetingId: String) async throws {
+        try await supabase
+            .from("meetings")
+            .update(Self.endMeetingUpdate())
+            .eq("id", value: Self.meetingLookupId(meetingId))
+            .neq("status", value: "completed")
+            .execute()
+    }
+
     static func summaryWarmupRequest(instance: URL, meetingId: String, token: String) -> URLRequest {
         bearerRequest(
             instance.appendingPathComponent("api/meetings/\(meetingId.lowercased())/summary/stream"),
