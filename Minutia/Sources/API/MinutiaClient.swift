@@ -83,7 +83,7 @@ struct MinutiaClient {
         "\(meetingId.lowercased())/recording.m4a"
     }
 
-    static func registerSegmentRequest(instance: URL, meetingId: String, seq: Int, token: String) -> URLRequest {
+    static func registerSegmentRequest(instance: URL, meetingId: String, seq: Int, offsetSeconds: Double? = nil, token: String) -> URLRequest {
         let meetingId = meetingId.lowercased()
         var request = bearerRequest(
             instance.appendingPathComponent("api/meetings/\(meetingId)/segments/\(seq)/transcribe"),
@@ -96,13 +96,13 @@ struct MinutiaClient {
                 "me": segmentPath(meetingId: meetingId, seq: seq, channel: .me),
                 "them": segmentPath(meetingId: meetingId, seq: seq, channel: .them),
             ],
-            "offset_seconds": Double(seq) * SegmentWriter.segmentSeconds,
+            "offset_seconds": offsetSeconds ?? Double(seq) * SegmentWriter.segmentSeconds,
         ]
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         return request
     }
 
-    static func finalTranscribeRequest(instance: URL, meetingId: String, expectedSegments: Int?, token: String) -> URLRequest {
+    static func finalTranscribeRequest(instance: URL, meetingId: String, expectedSegments: Int?, deferExtraction: Bool = false, token: String) -> URLRequest {
         let meetingId = meetingId.lowercased()
         var request = bearerRequest(
             instance.appendingPathComponent("api/meetings/\(meetingId)/transcribe"),
@@ -110,7 +110,8 @@ struct MinutiaClient {
             token: token
         )
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body: [String: Int] = expectedSegments.map { ["expected_segments": $0] } ?? [:]
+        var body: [String: Any] = expectedSegments.map { ["expected_segments": $0] } ?? [:]
+        if deferExtraction { body["defer_extraction"] = true }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         return request
     }
@@ -248,9 +249,9 @@ struct MinutiaClient {
         }
     }
 
-    func registerSegment(meetingId: String, seq: Int) async throws -> Bool {
+    func registerSegment(meetingId: String, seq: Int, offsetSeconds: Double) async throws -> Bool {
         let token = try await tokenProvider()
-        let request = Self.registerSegmentRequest(instance: instance, meetingId: meetingId, seq: seq, token: token)
+        let request = Self.registerSegmentRequest(instance: instance, meetingId: meetingId, seq: seq, offsetSeconds: offsetSeconds, token: token)
         let (data, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
 
@@ -310,9 +311,9 @@ struct MinutiaClient {
         if response.value.isEmpty { throw MinutiaClientError.meetingNotWritable }
     }
 
-    func requestTranscription(meetingId: String, expectedSegments: Int?) async throws {
+    func requestTranscription(meetingId: String, expectedSegments: Int?, deferExtraction: Bool = false) async throws {
         let token = try await tokenProvider()
-        let request = Self.finalTranscribeRequest(instance: instance, meetingId: meetingId, expectedSegments: expectedSegments, token: token)
+        let request = Self.finalTranscribeRequest(instance: instance, meetingId: meetingId, expectedSegments: expectedSegments, deferExtraction: deferExtraction, token: token)
         let (data, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if !(200...299).contains(status) {
@@ -372,9 +373,12 @@ struct MinutiaClient {
     /// The web app's recap route for a meeting (src/app/(app)/series/[id]/meetings/[meetingId] on
     /// the server). The single builder for every place that opens a recap, so the shape and the
     /// lowercase-id rule cannot drift between call sites.
-    static func recapURL(instance: URL, seriesId: UUID, meetingId: UUID) -> URL {
-        instance.appendingPathComponent(
+    static func recapURL(instance: URL, seriesId: UUID, meetingId: UUID, autoRecap: Bool = false) -> URL {
+        let url = instance.appendingPathComponent(
             "series/\(seriesId.uuidString.lowercased())/meetings/\(meetingId.uuidString.lowercased())")
+        guard autoRecap, var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+        components.queryItems = [URLQueryItem(name: "recap", value: "auto")]
+        return components.url ?? url
     }
 
     /// Announces this companion instance to the web app. Fire-and-forget: failures are ignored so a

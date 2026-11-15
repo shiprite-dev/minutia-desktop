@@ -4,7 +4,7 @@ import Foundation
 /// names and signatures already match), so tests can stand in a stub without touching the network.
 protocol SegmentTransport {
     func uploadSegment(meetingId: String, segment: SegmentWriter.ClosedSegment) async throws
-    func registerSegment(meetingId: String, seq: Int) async throws -> Bool
+    func registerSegment(meetingId: String, seq: Int, offsetSeconds: Double) async throws -> Bool
 }
 
 extension MinutiaClient: SegmentTransport {}
@@ -125,7 +125,7 @@ actor UploadQueue {
                     await onProgress(uploaded)
                     await setReconnecting(false)
                 }
-                if try await transport.registerSegment(meetingId: meetingId, seq: segment.seq) {
+                if try await transport.registerSegment(meetingId: meetingId, seq: segment.seq, offsetSeconds: segment.offsetSeconds) {
                     registered += 1
                 }
                 return

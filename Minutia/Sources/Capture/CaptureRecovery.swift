@@ -157,7 +157,7 @@ enum CaptureRecovery {
 
         for segment in await readableSegments(in: directory) {
             try? await client.uploadSegment(meetingId: manifest.meetingId, segment: segment)
-            _ = try? await client.registerSegment(meetingId: manifest.meetingId, seq: segment.seq)
+            _ = try? await client.registerSegment(meetingId: manifest.meetingId, seq: segment.seq, offsetSeconds: segment.offsetSeconds)
         }
 
         let path = try await client.uploadRecording(meetingId: manifest.meetingId, fileURL: recordingURL)

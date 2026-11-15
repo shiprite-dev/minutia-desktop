@@ -598,6 +598,7 @@ final class AppController: NSObject, ObservableObject {
     /// The instance capture started against, captured at start so the recap URL survives an instance
     /// switch made while the meeting was recording.
     private var recordingInstance: URL?
+    private var earlyRecapMeetingId: UUID?
     private var lastFailedStart: FailedStart?
     /// The instance the detector's agenda provider is currently bound to. When it changes (an
     /// instance switch), the detector must be torn down and restarted so it stops polling the old
@@ -1139,14 +1140,27 @@ final class AppController: NSObject, ObservableObject {
         let meetingId = recordingMeetingId
         let seriesId = recordingSeriesId
         let instance = recordingInstance
+        let early = Self.opensRecap(for: reason) && meetingId != nil && instance != nil
+        earlyRecapMeetingId = early ? meetingId : nil
+        if early, let meetingId, let instance {
+            Task {
+                try? await withTimeout(seconds: 3) { [notepad] in try await notepad.flushNow() }
+                if let client = authManager.client() {
+                    try? await withTimeout(seconds: 3) {
+                        await CaptureSession.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId.uuidString) }
+                    }
+                }
+                await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance, autoRecap: true)
+            }
+        }
         Task {
             do {
-                _ = try await captureSession.stop(flushNotes: { [notepad] in try await notepad.flushNow() })
+                _ = try await captureSession.stop(flushNotes: { [notepad] in try await notepad.flushNow() }, recapOpened: early)
                 recordingMeetingId = nil
                 recordingSeriesId = nil
                 recordingInstance = nil
                 apply(.finalized)
-                if let meetingId, let instance, Self.opensRecap(for: reason) {
+                if !early, let meetingId, let instance, Self.opensRecap(for: reason) {
                     await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance)
                 }
             } catch {
@@ -1405,7 +1419,9 @@ final class AppController: NSObject, ObservableObject {
                     NotepadStore.removeIfSynced(meetingId: meetingId, in: notesRoot)
                 }
                 apply(.finalized)
-                if let meetingUUID = UUID(uuidString: manifest.meetingId) {
+                let openedEarly = earlyRecapMeetingId.map { $0.uuidString.lowercased() == manifest.meetingId.lowercased() } ?? false
+                earlyRecapMeetingId = nil
+                if !openedEarly, let meetingUUID = UUID(uuidString: manifest.meetingId) {
                     await openRecap(
                         meetingId: meetingUUID,
                         seriesId: manifest.seriesId.flatMap { UUID(uuidString: $0) },
@@ -1428,7 +1444,7 @@ final class AppController: NSObject, ObservableObject {
     /// id when unknown (a web-triggered record carries none) via the meetings table; if it still
     /// cannot be resolved, falls back to a notification rather than doing nothing. The URL is built
     /// from the instance capture started against, not the currently-connected one.
-    private func openRecap(meetingId: UUID, seriesId: UUID?, instance: URL) async {
+    private func openRecap(meetingId: UUID, seriesId: UUID?, instance: URL, autoRecap: Bool = false) async {
         var resolvedSeries = seriesId
         if resolvedSeries == nil, let client = authManager.client() {
             resolvedSeries = try? await client.meetingSeriesId(meetingId: meetingId.uuidString)
@@ -1440,7 +1456,7 @@ final class AppController: NSObject, ObservableObject {
             return
         }
         NSWorkspace.shared.open(
-            MinutiaClient.recapURL(instance: instance, seriesId: resolvedSeries, meetingId: meetingId))
+            MinutiaClient.recapURL(instance: instance, seriesId: resolvedSeries, meetingId: meetingId, autoRecap: autoRecap))
     }
 
     // MARK: - URL callback

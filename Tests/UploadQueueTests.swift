@@ -21,6 +21,7 @@ private final class StubTransport: SegmentTransport, @unchecked Sendable {
     private var _registerAttempts = 0
     private var _uploaded = 0
     private var _registered = 0
+    private var _offsets: [Int: Double] = [:]
 
     init(behavior: Behavior = Behavior()) { self.behavior = behavior }
 
@@ -28,6 +29,7 @@ private final class StubTransport: SegmentTransport, @unchecked Sendable {
     var registerAttempts: Int { lock.lock(); defer { lock.unlock() }; return _registerAttempts }
     var uploadedCount: Int { lock.lock(); defer { lock.unlock() }; return _uploaded }
     var registeredCount: Int { lock.lock(); defer { lock.unlock() }; return _registered }
+    var offsets: [Int: Double] { lock.lock(); defer { lock.unlock() }; return _offsets }
 
     func uploadSegment(meetingId: String, segment: SegmentWriter.ClosedSegment) async throws {
         lock.lock(); defer { lock.unlock() }
@@ -37,9 +39,10 @@ private final class StubTransport: SegmentTransport, @unchecked Sendable {
         _uploaded += 1
     }
 
-    func registerSegment(meetingId: String, seq: Int) async throws -> Bool {
+    func registerSegment(meetingId: String, seq: Int, offsetSeconds: Double) async throws -> Bool {
         lock.lock(); defer { lock.unlock() }
         _registerAttempts += 1
+        _offsets[seq] = offsetSeconds
         if behavior.registerThrowsFeatureUnavailable { throw MinutiaClientError.featureUnavailable }
         if behavior.registerAlwaysThrows { throw StubError() }
         if _registerAttempts <= behavior.registerFailures { throw StubError() }
@@ -86,6 +89,18 @@ final class UploadQueueBehaviorTests: XCTestCase {
     /// No sleeping in tests: retries resolve instantly.
     private func makeQueue(_ transport: StubTransport) -> UploadQueue {
         UploadQueue(transport: transport, meetingId: "m1", sleep: { _ in })
+    }
+
+    func test_aTailPiece_registersWithItsOwnStartTime() async {
+        let transport = StubTransport()
+        let queue = makeQueue(transport)
+        queue.enqueue(segment(0))
+        queue.enqueue(SegmentWriter.ClosedSegment(
+            seq: 1, micURL: URL(fileURLWithPath: "/tmp/tail-1-me.m4a"),
+            sysURL: URL(fileURLWithPath: "/tmp/tail-1-them.m4a"), frames: 48_000, startSeconds: 312.5))
+        _ = await queue.drainAndWait()
+
+        XCTAssertEqual(transport.offsets, [0: 0, 1: 312.5])
     }
 
     func test_happyPath_uploadsAndRegistersEachSegment() async {
