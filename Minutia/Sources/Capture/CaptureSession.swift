@@ -39,7 +39,7 @@ final class CaptureSession: ObservableObject {
         let transcriptRequested: Bool
     }
 
-    enum CaptureError: Error { case notRunning, stalled }
+    enum CaptureError: Error { case notRunning, stalled, recordingUnfinished }
 
     /// Ceiling for the stop-time network finalize (drain + upload + finalize + transcribe request).
     static let finalizeTimeout: TimeInterval = 30
@@ -177,8 +177,10 @@ final class CaptureSession: ObservableObject {
             self.micUnavailable = false
         }
 
-        let finished = pipeline.finishCapture()
-        if let finalSegment = finished?.finalSegment {
+        // Without a finished recording the server has nothing to transcribe; throwing keeps the
+        // directory so recovery uploads the readable fragmented file instead of deleting it.
+        guard let finished = pipeline.finishCapture() else { throw CaptureError.recordingUnfinished }
+        if let finalSegment = finished.finalSegment {
             queue.enqueue(finalSegment)
         }
 
@@ -187,15 +189,16 @@ final class CaptureSession: ObservableObject {
         // .finalizing forever. TimeoutError propagates to the controller, which shows .error (Retry).
         let outcome = try await withTimeout(seconds: Self.finalizeTimeout) {
             let counts = await queue.drainAndWait()
-            let expected = Self.expectedSegments(enqueued: counts.enqueued, registered: counts.registered)
+            let expected = Self.expectedSegments(
+                enqueued: counts.enqueued, registered: counts.registered,
+                segmentsDropped: finished.segmentsDropped)
 
-            if let recording = finished?.recording {
-                let path = try await client.uploadRecording(meetingId: meetingId, fileURL: recording.fileURL)
-                let duration = Double(recording.frames) / MixPlan.sampleRate
-                let attrs = try? FileManager.default.attributesOfItem(atPath: recording.fileURL.path)
-                let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
-                try await client.finalizeMeeting(meetingId: meetingId, audioPath: path, duration: duration, sizeBytes: size)
-            }
+            let recording = finished.recording
+            let path = try await client.uploadRecording(meetingId: meetingId, fileURL: recording.fileURL)
+            let duration = Double(recording.frames) / MixPlan.sampleRate
+            let attrs = try? FileManager.default.attributesOfItem(atPath: recording.fileURL.path)
+            let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+            try await client.finalizeMeeting(meetingId: meetingId, audioPath: path, duration: duration, sizeBytes: size)
 
             // A failed requestTranscription must never read as an accepted transcript: it rethrows so
             // the controller shows .failed (Retry re-runs refinalize) and the audio directory is kept
@@ -238,9 +241,10 @@ final class CaptureSession: ObservableObject {
 
     /// Only a fully registered set of fast-lane segments is announced; otherwise (none registered on
     /// a server that rejects segment registers, or some lost) the server transcribes the whole
-    /// recording instead of waiting on segments that never arrive.
-    nonisolated static func expectedSegments(enqueued: Int, registered: Int) -> Int? {
-        enqueued > 0 && registered == enqueued ? enqueued : nil
+    /// recording instead of waiting on segments that never arrive, or when the writer stopped producing
+    /// segments mid-recording.
+    nonisolated static func expectedSegments(enqueued: Int, registered: Int, segmentsDropped: Bool = false) -> Int? {
+        !segmentsDropped && enqueued > 0 && registered == enqueued ? enqueued : nil
     }
 
     nonisolated static func shouldWatchdogFire(secondsSinceFrames: TimeInterval, threshold: TimeInterval) -> Bool {
@@ -341,6 +345,7 @@ private final class CapturePipeline {
     private let writer: SegmentWriter
     private let tickQueue = DispatchQueue(label: "app.minutia.capture.tick", qos: .utility)
     private var timer: DispatchSourceTimer?
+    private var failed = false
     private var micScratch: [Float]
     private var sysScratch: [Float]
     private static let logger = Logger(subsystem: "app.minutia.desktop", category: "CapturePipeline")
@@ -402,31 +407,34 @@ private final class CapturePipeline {
 
     /// Stops the timer, tap, and mic, then closes the files. Returns the trailing partial segment
     /// (if any) and the full recording.
-    func finishCapture() -> (finalSegment: SegmentWriter.ClosedSegment?, recording: SegmentWriter.Recording)? {
+    func finishCapture() -> (finalSegment: SegmentWriter.ClosedSegment?, recording: SegmentWriter.Recording, segmentsDropped: Bool)? {
         timer?.cancel()
         timer = nil
         // cancel() does not wait for an in-flight handler; barrier on tickQueue so no tick() is
-        // running (or can start) before we stop the sources and close the writer. AVAudioFile is not
-        // thread-safe, so append() must never overlap finish().
+        // running (or can start) before we stop the sources and close the writer. SegmentWriter is
+        // not thread-safe, so append() must never overlap finish().
         tickQueue.sync {}
         tap.stop()
         mic.stop()
-        return try? writer.finish()
+        guard let result = try? writer.finish() else { return nil }
+        return (result.finalSegment, result.recording, writer.segmentsDropped)
     }
 
-    /// Lightweight stop for the fatal path: halts the timer, tap, and mic, then flushes the writer's
-    /// files (best-effort, so a preserved recording is as playable as possible) WITHOUT the network
-    /// finalize. Shares finishCapture's tick-queue barrier discipline.
+    /// Lightweight stop for the fatal path: halts the timer, tap, and mic WITHOUT the network finalize
+    /// and WITHOUT finishing the writer. The fragmented files on disk are already readable for startup
+    /// recovery, and finishing rewrites them, which can fail on a full disk. The writer is released with
+    /// the pipeline, never cancelled (cancelWriting deletes its output). Shares finishCapture's
+    /// tick-queue barrier discipline.
     func teardown() {
         timer?.cancel()
         timer = nil
         tickQueue.sync {}
         tap.stop()
         mic.stop()
-        _ = try? writer.finish()
     }
 
     private func tick() {
+        guard !failed else { return }
         let plan = MixPlan.plan(micAvailable: micBuffer.availableFrames, sysAvailable: sysBuffer.availableFrames)
         let micGot = micBuffer.pop(into: &micScratch, count: plan.micFrames)
         let sysGot = sysBuffer.pop(into: &sysScratch, count: plan.sysFrames)
@@ -458,6 +466,7 @@ private final class CapturePipeline {
         } catch {
             // Disk-full or any write failure: the audio already on disk is real, so preserve the
             // directory for startup recovery rather than silently dropping this and every later tick.
+            failed = true
             onFatal?(error, true)
             return
         }
