@@ -20,7 +20,8 @@ ENGLISH = EnglishTextNormalizer()
 MULTILINGUAL = BasicMultilingualTextNormalizer(remove_diacritics=False)
 HESITATIONS = re.compile(r"\b(mm-hmm|uh-huh|um+|uh+|hmm+|mm+|mhm|er|erm|ah|huh)\b", re.IGNORECASE)
 LOCAL = ["parakeet-v3", "parakeet-ultra", "parakeet-ja"]
-ENGINES = LOCAL + ["groq-turbo"]
+CLOUD = ["groq-turbo", "openrouter-parakeet-ultra"]
+ENGINES = LOCAL + CLOUD
 ENGLISH_CLASSES = ["read-clean", "read-other", "conversational", "conversational-echo", "meeting-full"]
 GATED = ["parakeet-v3", "parakeet-ultra"]
 RAM_BUDGET_MB, SPEED_FLOOR = 2048, 20.0
@@ -63,6 +64,7 @@ for engine, run in runs.items():
                "guardPasses": res["guardPasses"],
                "guardWindows": [dict(w, fails=w["start"] in res["guardFailingWindowStarts"]) for w in res["guardWindows"]], "error": res.get("error"),
                "hypothesis": res["text"], "errors": None,
+               "untimed": bool(res["segments"]) and all(s["start"] == s["end"] == 0 for s in res["segments"]),
                "hasTimings": all(math.isfinite(s["start"]) and math.isfinite(s["end"]) and s["end"] >= s["start"] >= 0
                                  for s in res["segments"])}
         if item["reference"] and not res.get("error"):
@@ -174,7 +176,13 @@ for engine, run in runs.items():
     if engine in prepared:
         p = prepared[engine]
         info.update({"modelDir": p["modelDir"], "modelSizeMB": round(p["modelBytes"] / 1_048_576), "downloadAndCompileSeconds": round(p["downloadSeconds"], 1)})
-    info["timestamps"] = "per-token (TokenTiming start/end/confidence), grouped into segments" if engine in LOCAL else "segment only requested (verbose_json); word granularity available"
+    timed_rows = [r for r in rows if r["engine"] == engine and r["segments"]]
+    if engine in LOCAL:
+        info["timestamps"] = "per-token (TokenTiming start/end/confidence), grouped into segments"
+    elif timed_rows and all(r["untimed"] for r in timed_rows):
+        info["timestamps"] = "none (text only); me/them interleaving would need local VAD timing"
+    else:
+        info["timestamps"] = "segment (verbose_json)"
     engines_info[engine] = info
 
 results = {"engines": engines_info, "slices": slices, "gates": gates, "ultraBecomesDefault": bool(ultra_default),
@@ -203,8 +211,29 @@ lines += ["", "Load in a new process is a Core ML cache miss when this process l
           "transcribes (the server echo filter's job), not a model quality number."]
 lines += ["", "## Silence, noise and guard", "", "| Engine | Item | No speech | Segments | Guard passes | Hypothesis |", "|---|---|---|---:|---|---|"]
 for r in rows:
-    if r["class"] in ("silence", "noise", "spliced", "ja"):
+    if r["class"] in ("silence", "noise", "spliced", "ja", "real-meeting-ja"):
         lines.append(f"| {r['engine']} | {r['id']} | {r['noSpeech']} | {r['segments']} | {r['guardPasses']} | {r['hypothesis'][:60].replace('|', ' ')} |")
+compare = [e for e in ENGINES if e in runs]
+if "openrouter-parakeet-ultra" in runs:
+    cols = [("Read EN WER", "read", "all"), ("AMI conv WER", "conversational", "all"), ("AMI me", "conversational", "me"),
+            ("AMI them", "conversational", "them"), ("Full meeting WER", "meeting-full", "all"), ("German WER", "de", "all"),
+            ("Japanese CER", "ja", "all"), ("Real meeting EN WER", "real-meeting-en", "all"),
+            ("Real meeting JA CER", "real-meeting-ja", "all")]
+    lines += ["", "## All engines side by side (hosted Ultra and Groq are informational)", "",
+              "| Engine | " + " | ".join(c[0] for c in cols) + " | Silence / noise | x realtime, full meeting (incl. upload) |",
+              "|---|" + "---:|" * len(cols) + "---|---:|"]
+    for engine in compare:
+        quiet = [r for r in rows if r["engine"] == engine and r["class"] in ("silence", "noise")]
+        quiet_text = "; ".join(r["hypothesis"][:30] or "no speech" for r in quiet) or "n/a"
+        lines.append(f"| {engine} | " + " | ".join(fmt(rate(engine, k, c)) for _, k, c in cols)
+                     + f" | {quiet_text} | {fmt((slices.get(f'{engine}|meeting-full|all') or {}).get('xRealtime'))} |")
+    lines += ["", "Real meetings are single mono mixes (the browser-recording case, not a substitute for the AMI me/them test). "
+              "Their references are the uploaders' manual captions, which drop false starts and fillers, so absolute error "
+              "rates are inflated about equally for every engine; read the ranking, not the level."]
+    hosted, local = rate("openrouter-parakeet-ultra", "conversational"), rate("parakeet-ultra", "conversational")
+    if hosted is not None and local is not None:
+        lines += ["", f"Hosted Ultra vs local Ultra on AMI conversational: {hosted} vs {local} "
+                      f"({'within' if abs(hosted - local) <= 1.0 else 'not within'} 1 WER point)."]
 lines += ["", "## Gates", "", "| Engine | " + " | ".join(next(iter(gates.values()), {}).keys()) + " |",
           "|---|" + "---|" * len(next(iter(gates.values()), {}))]
 for engine, g in gates.items():

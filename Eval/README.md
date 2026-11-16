@@ -6,11 +6,13 @@ on the same audio. It is a developer tool, never part of CI, and the normal app 
 ```bash
 Eval/fetch-fixtures.sh                     # once: sha256-pinned public audio, scoring venv, fixtures + manifest.json
 export GROQ_API_KEY=...                    # required for a passing gate; groq-turbo is skipped without it
+export OPENROUTER_API_KEY=...              # optional; hosted Parakeet Ultra (informational) is skipped without it
 Eval/run-eval.sh                           # build (Release), run every engine, score
 ENGINES="parakeet-v3" Eval/run-eval.sh     # subset
 ```
 
-Requires Xcode, XcodeGen 2.46+, `ffmpeg`/`ffprobe` (`brew install ffmpeg`) and Python 3.
+Requires Xcode, XcodeGen 2.46+, `ffmpeg`/`ffprobe` (`brew install ffmpeg`), Python 3, and `yt-dlp` or `uvx` (the
+real-meeting fixtures run `uvx yt-dlp@2026.10.26` when `yt-dlp` is not on the PATH).
 
 Everything lands in the gitignored `.eval/` folder at the repo root: `fixtures/`, `models/`, `tools/` (scoring
 venv and normalizer), `DerivedData/` and `results/` (one `transcribe-<engine>.json` per engine,
@@ -55,3 +57,4 @@ finite timings.
 | de, ja                 | 10 FLEURS German and 5 Japanese dev clips                                                                                                                                                      |
 | spliced                | 30 s English then 30 s Japanese; must trip the quality guard                                                                                                                                   |
 | silence, noise         | 60 s digital silence and 60 s pink noise at about -50 dBFS; must yield no speech                                                                                                               |
+| real-meeting-en, real-meeting-ja | informational: an 18 minute excerpt of a real English staff meeting and a 21 minute excerpt of a Japanese briefing with Q&A, both CC BY YouTube recordings, mono mixes (the browser-recording case); references are the uploaders' manual captions, never auto captions; the decoded audio is sha256 pinned |
