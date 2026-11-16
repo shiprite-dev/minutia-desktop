@@ -19,6 +19,9 @@ from normalizer import BasicMultilingualTextNormalizer, EnglishTextNormalizer  #
 ENGLISH = EnglishTextNormalizer()
 MULTILINGUAL = BasicMultilingualTextNormalizer(remove_diacritics=False)
 HESITATIONS = re.compile(r"\b(mm-hmm|uh-huh|um+|uh+|hmm+|mm+|mhm|er|erm|ah|huh)\b", re.IGNORECASE)
+EN_FILLERS = re.compile(r"\b(uh|um|mm|hmm|you know|i mean)\b")
+EN_REPEATS = re.compile(r"\b(\w+)(?: \1\b)+")
+JA_FILLERS = re.compile("あのー|ええと|えっと|なんか|えー|あの|まあ|その")
 LOCAL = ["parakeet-v3", "parakeet-ultra", "parakeet-ja"]
 CLOUD = ["groq-turbo", "openrouter-parakeet-ultra"]
 ENGINES = LOCAL + CLOUD
@@ -38,11 +41,22 @@ def cer_chars(text):
     return " ".join(c for c in text if unicodedata.category(c)[0] not in "PSZ")
 
 
-def errors(ref, hyp, lang):
+def strip_fillers(text, lang):
     if lang == "ja":
-        out = jiwer.process_characters(cer_chars(ref).replace(" ", ""), cer_chars(hyp).replace(" ", ""))
+        return JA_FILLERS.sub("", text)
+    return EN_REPEATS.sub(r"\1", " ".join(EN_FILLERS.sub(" ", text).split()))
+
+
+def errors(ref, hyp, lang, strip=False):
+    if lang == "ja":
+        r, h = (cer_chars(t).replace(" ", "") for t in (ref, hyp))
+        if strip:
+            r, h = strip_fillers(r, lang), strip_fillers(h, lang)
+        out = jiwer.process_characters(r, h)
     else:
         r, h = normalize(ref, lang), normalize(hyp, lang)
+        if strip:
+            r, h = strip_fillers(r, lang), strip_fillers(h, lang)
         if not r.strip():
             return None
         out = jiwer.process_words(r, h)
@@ -63,23 +77,35 @@ for engine, run in runs.items():
                "xRealtime": res["xRealtime"], "noSpeech": res["noSpeech"], "segments": len(res["segments"]),
                "guardPasses": res["guardPasses"],
                "guardWindows": [dict(w, fails=w["start"] in res["guardFailingWindowStarts"]) for w in res["guardWindows"]], "error": res.get("error"),
-               "hypothesis": res["text"], "errors": None,
+               "hypothesis": res["text"], "errors": None, "strippedErrors": None,
                "untimed": bool(res["segments"]) and all(s["start"] == s["end"] == 0 for s in res["segments"]),
                "hasTimings": all(math.isfinite(s["start"]) and math.isfinite(s["end"]) and s["end"] >= s["start"] >= 0
                                  for s in res["segments"])}
         if item["reference"] and not res.get("error"):
             row["errors"] = errors(item["reference"], res["text"], item["lang"])
+            if item["lang"] in ("en", "ja"):
+                row["strippedErrors"] = errors(item["reference"], res["text"], item["lang"], strip=True)
         rows.append(row)
 
 
+def counts(selected, key):
+    scored = [r[key] for r in selected if r[key]]
+    return {k: sum(e[k] for e in scored) for k in ("ref", "sub", "del", "ins")}
+
+
+def pct(n, ref):
+    return round(n / ref * 100, 2) if ref else None
+
+
 def aggregate(selected):
-    scored = [r["errors"] for r in selected if r["errors"]]
-    ref = sum(e["ref"] for e in scored)
-    edits = sum(e["sub"] + e["del"] + e["ins"] for e in scored)
+    c, s = counts(selected, "errors"), counts(selected, "strippedErrors")
+    ref = c["ref"]
     audio = sum(r["durationSeconds"] for r in selected if not r["error"])
     wall = sum(r["wallSeconds"] for r in selected if not r["error"])
     return {"items": len(selected), "errors": sum(1 for r in selected if r["error"]),
-            "errorRate": round(edits / ref * 100, 2) if ref else None, "refUnits": ref,
+            "errorRate": pct(c["sub"] + c["del"] + c["ins"], ref), "refUnits": ref,
+            "sub": pct(c["sub"], ref), "del": pct(c["del"], ref), "ins": pct(c["ins"], ref),
+            "strippedErrorRate": pct(s["sub"] + s["del"] + s["ins"], s["ref"]),
             "audioSeconds": round(audio, 1), "xRealtime": round(audio / wall, 1) if wall else None,
             "minItemXRealtime": round(min((r["xRealtime"] for r in selected if not r["error"]), default=0), 1)}
 
@@ -234,6 +260,25 @@ if "openrouter-parakeet-ultra" in runs:
     if hosted is not None and local is not None:
         lines += ["", f"Hosted Ultra vs local Ultra on AMI conversational: {hosted} vs {local} "
                       f"({'within' if abs(hosted - local) <= 1.0 else 'not within'} 1 WER point)."]
+bias = [("AMI conv", "conversational"), ("Real meeting EN", "real-meeting-en"), ("Real meeting JA", "real-meeting-ja")]
+lines += ["", "## Reference-bias check (informational)", "",
+          "Substitutions, deletions and insertions as % of reference units, then the rate with fillers and immediate word "
+          "repeats stripped from both sides after normalization (EN: uh, um, mm, hmm, you know, I mean, repeats; "
+          "JA: えー, ええと, えっと, あの, あのー, まあ, その, なんか). A gap of 1.0 or less after stripping is a tie.", "",
+          "| Engine | Fixture | Rate % | Sub | Del | Ins | Stripped % |", "|---|---|---:|---:|---:|---:|---:|"]
+for label, klass in bias:
+    for engine in compare:
+        s = slices.get(f"{engine}|{klass}|all")
+        if s and s["errorRate"] is not None:
+            lines.append(f"| {engine} | {label} | {s['errorRate']} | {fmt(s['sub'])} | {fmt(s['del'])} | {fmt(s['ins'])} | {fmt(s['strippedErrorRate'])} |")
+for label, klass in bias:
+    groq = (slices.get(f"groq-turbo|{klass}|all") or {}).get("strippedErrorRate")
+    for engine in compare:
+        other = (slices.get(f"{engine}|{klass}|all") or {}).get("strippedErrorRate")
+        if engine == "groq-turbo" or groq is None or other is None:
+            continue
+        verdict = "tie" if abs(groq - other) <= 1.0 else ("groq-turbo leads" if groq < other else f"{engine} leads")
+        lines += ["", f"{label}, stripped: groq-turbo {groq} vs {engine} {other}: {verdict}."]
 lines += ["", "## Gates", "", "| Engine | " + " | ".join(next(iter(gates.values()), {}).keys()) + " |",
           "|---|" + "---|" * len(next(iter(gates.values()), {}))]
 for engine, g in gates.items():
