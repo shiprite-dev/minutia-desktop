@@ -436,19 +436,20 @@ final class AppController: NSObject, ObservableObject {
     /// audio is saved (the entitlement is an account setting, not a recording fault); a timeout is
     /// honest that the audio is safe locally and recoverable via Retry, since the durable directory
     /// outlives the timed-out network step.
+    nonisolated private static let deviceTranscriptFailure = "This meeting could not be transcribed on this Mac. The recording is kept on this Mac."
+
     nonisolated static func finalizeFailureMessage(for error: Error, host: String?) -> String {
         if case MinutiaClientError.featureUnavailable = error {
             return "Transcription is not enabled for this account on \(host ?? "the server"). Your audio is saved. Ask your workspace admin to enable AI features."
         }
         switch error as? CaptureSession.CaptureError {
         case .transcriptNotSent?: return "Could not send the transcript. Retry to send it again."
-        case .localTranscriptionTimedOut?: return "Transcribing on this Mac took too long. The recording is saved on this Mac."
+        case .localTranscriptionTimedOut?, .transcriptTooLarge?: return Self.deviceTranscriptFailure
         case .nothingRecorded?: return "Nothing was recorded, so there is no transcript to send."
-        case .transcriptTooLarge?: return "This meeting's transcript is too large to send. The recording is saved on this Mac."
         default: break
         }
         if case CaptureRecovery.RecoveryError.transcriptNotFinished = error {
-            return "The transcript for this meeting is not finished. The recording is saved on this Mac."
+            return deviceTranscriptFailure
         }
         if error is TimeoutError {
             return "Finishing the recording timed out. Your audio is saved locally; Retry to finish uploading."
@@ -1112,7 +1113,11 @@ final class AppController: NSObject, ObservableObject {
             } catch {
                 report(.failed, meetingId: meetingId, reason: "start_failed")
                 lastFailedStart = .series
-                apply(.failed("Could not start recording: \(error.localizedDescription)"))
+                if case CaptureSession.CaptureError.transcriptionBlocked = error {
+                    apply(.failed(CaptureSession.failureMessage(for: error)))
+                } else {
+                    apply(.failed("Could not start recording: \(error.localizedDescription)"))
+                }
             }
         }
     }
@@ -1155,7 +1160,11 @@ final class AppController: NSObject, ObservableObject {
             } catch {
                 reportStartFailure("start_failed")
                 lastFailedStart = .meeting(meetingId)
-                apply(.failed("Could not start recording: \(error.localizedDescription)"))
+                if case CaptureSession.CaptureError.transcriptionBlocked = error {
+                    apply(.failed(CaptureSession.failureMessage(for: error)))
+                } else {
+                    apply(.failed("Could not start recording: \(error.localizedDescription)"))
+                }
             }
         }
     }

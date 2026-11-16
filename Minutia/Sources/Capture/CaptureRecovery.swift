@@ -86,18 +86,17 @@ enum CaptureRecovery {
 
     static let transcriptName = "transcript.json"
 
-    /// Sends a device meeting's finished `transcript.json` again: marks the meeting waiting for this
-    /// Mac, submits with the stop's backoff, and deletes the directory only after a 2xx. Throws
-    /// `transcriptNotFinished` (no request made, directory kept) when there is no transcript.
+    /// Sends a device meeting's finished `transcript.json` again without marking the meeting pending
+    /// (a completed meeting replays as 200). Throws `transcriptNotFinished` (no request made,
+    /// directory kept) when there is no transcript.
     static func resubmitDeviceTranscript(
         directory: URL, meetingId: String, transport: any DeviceTranscriptTransport,
         sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }
     ) async throws {
         guard let data = try? Data(contentsOf: directory.appendingPathComponent(transcriptName)),
-              let transcript = try? JSONDecoder().decode(DeviceTranscript.self, from: data) else {
+              (try? JSONDecoder().decode(DeviceTranscript.self, from: data)) != nil else {
             throw RecoveryError.transcriptNotFinished
         }
-        try? await transport.markAwaitingDeviceTranscript(meetingId: meetingId, durationSeconds: transcript.durationSeconds)
         do {
             try await CaptureSession.submitDeviceTranscript(meetingId: meetingId, body: data, transport: transport, sleep: sleep)
         } catch {

@@ -126,6 +126,7 @@ actor LocalTranscriber {
         activeJobs += 1
         jobs.append(Task {
             _ = await previous?.result
+            if Task.isCancelled { await self.jobFinished(); throw CancellationError() }
             do {
                 let labeled = try await self.run(segment)
                 await self.jobFinished()
@@ -138,7 +139,13 @@ actor LocalTranscriber {
     }
 
     /// Cancels every pending job and the load, and drops the engine.
-    func cancel() {}
+    func cancel() {
+        let pending = intakeLock.withLock { defer { jobs = [] }; return jobs }
+        pending.forEach { $0.cancel() }
+        loadTask?.cancel(); loadTask = nil
+        unloadTask?.cancel(); unloadTask = nil
+        engine = nil
+    }
 
     /// Queues the tail, waits for the engine and every job, and returns the meeting transcript.
     /// Reports `.preparingModel` while the engine is still loading and `.transcribing` as jobs finish.

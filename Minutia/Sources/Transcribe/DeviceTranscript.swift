@@ -48,6 +48,7 @@ struct DeviceTranscript: Codable, Equatable, Sendable {
     static let maxBodyBytes = 2_097_152
     static let maxSegments = 20_000
     static let maxTotalText = 600_000
+    static let maxDurationSeconds = 21_600.0
 
     /// Merges adjacent same-speaker segments (meeting-clock order, merged text at most
     /// `maxSegmentText`) until the encoded body, the segment count and the total text fit the server
@@ -55,7 +56,7 @@ struct DeviceTranscript: Codable, Equatable, Sendable {
     func fitted() -> DeviceTranscript? {
         var current = self
         while !current.fits {
-            guard current.segments.reduce(0, { $0 + $1.text.count }) <= Self.maxTotalText else { return nil }
+            guard current.segments.reduce(0, { $0 + $1.text.utf16.count }) <= Self.maxTotalText else { return nil }
             let merged = current.mergedPairs()
             guard merged.count < current.segments.count else { return nil }
             current = DeviceTranscript(
@@ -66,7 +67,7 @@ struct DeviceTranscript: Codable, Equatable, Sendable {
 
     private var fits: Bool {
         segments.count <= Self.maxSegments
-            && segments.reduce(0) { $0 + $1.text.count } <= Self.maxTotalText
+            && segments.reduce(0) { $0 + $1.text.utf16.count } <= Self.maxTotalText
             && ((try? encoded().count) ?? .max) <= Self.maxBodyBytes
     }
 
@@ -75,8 +76,8 @@ struct DeviceTranscript: Codable, Equatable, Sendable {
         var lastMergedHere = false
         for segment in segments {
             if let previous = out.last, !lastMergedHere, previous.speaker == segment.speaker,
-               previous.text.count + 1 + segment.text.count <= Self.maxSegmentText {
-                let weights = (Double(previous.text.count), Double(segment.text.count))
+               previous.text.utf16.count + 1 + segment.text.utf16.count <= Self.maxSegmentText {
+                let weights = (Double(previous.text.utf16.count), Double(segment.text.utf16.count))
                 let confidence = previous.confidence.flatMap { a in
                     segment.confidence.map { b in Self.rounded((a * weights.0 + b * weights.1) / (weights.0 + weights.1)) }
                 }
@@ -98,6 +99,7 @@ struct DeviceTranscript: Codable, Equatable, Sendable {
     /// `0...durationSeconds`, splits text over `maxSegmentText` at word boundaries, and sets the
     /// outcome: speech with at least one segment, else no_speech with none.
     static func build(source: Source, language: String, durationSeconds: Double, segments: [Segment]) -> DeviceTranscript {
+        let durationSeconds = min(durationSeconds, maxDurationSeconds)
         let kept = segments.enumerated().flatMap { index, segment -> [(index: Int, segment: Segment)] in
             let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return [] }
@@ -126,20 +128,27 @@ struct DeviceTranscript: Codable, Equatable, Sendable {
     private static func split(_ text: String, start: Double, end: Double) -> [(text: String, start: Double, end: Double)] {
         var pieces: [String] = []
         var rest = Substring(text)
-        while rest.count > maxSegmentText {
-            let window = rest.prefix(maxSegmentText + 1)
-            let cut = window.lastIndex(of: " ").flatMap { window.distance(from: window.startIndex, to: $0) > 0 ? $0 : nil }
-                ?? rest.index(rest.startIndex, offsetBy: maxSegmentText)
+        while rest.utf16.count > maxSegmentText {
+            var units = 0
+            var prefixEnd = rest.startIndex
+            for i in rest.indices {
+                let next = units + String(rest[i]).utf16.count
+                if next > maxSegmentText { break }
+                units = next
+                prefixEnd = rest.index(after: i)
+            }
+            let window = rest[..<prefixEnd]
+            let cut = window.lastIndex(of: " ").flatMap { $0 > window.startIndex ? $0 : nil } ?? prefixEnd
             pieces.append(String(rest[..<cut]))
             rest = rest[cut...].drop { $0 == " " }
         }
         pieces.append(String(rest))
         pieces = pieces.filter { !$0.isEmpty }
-        let total = Double(pieces.reduce(0) { $0 + $1.count })
+        let total = Double(pieces.reduce(0) { $0 + $1.utf16.count })
         var consumed = 0.0
         return pieces.enumerated().map { index, piece in
             let from = index == 0 ? start : start + (end - start) * consumed / total
-            consumed += Double(piece.count)
+            consumed += Double(piece.utf16.count)
             let to = index == pieces.count - 1 ? end : start + (end - start) * consumed / total
             return (piece, from, to)
         }
