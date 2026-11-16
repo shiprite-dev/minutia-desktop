@@ -180,6 +180,33 @@ final class LocalTranscriberTests: XCTestCase {
         } catch {}
     }
 
+    func test_cancel_cancelsThePendingJobs_failsFinish_andDropsTheEngine() async throws {
+        let engine = ScriptedEngine(DeviceFixtures.fixtureEngine, hanging: ["seg-0-me.m4a"])
+        let local = transcriber(engine, gate: LoadGate(open: true))
+        await local.startLoading()
+        local.enqueue(DeviceFixtures.segment(0, in: dir))
+        let outcome = OutcomeBox()
+        Task {
+            do {
+                _ = try await local.finish(tail: [DeviceFixtures.segment(1, in: dir, start: 300)], durationSeconds: 400)
+                outcome.set(nil)
+            } catch {
+                outcome.set(error)
+            }
+        }
+        let wedged = await eventually { engine.calls.contains("seg-0-me.m4a") }
+        XCTAssertTrue(wedged)
+
+        await local.cancel()
+        let settled = await eventually(timeout: 2) { outcome.settled }
+        XCTAssertTrue(settled, "finish ends once its jobs are cancelled")
+        XCTAssertNotNil(outcome.error, "a cancelled finish never returns a transcript")
+        XCTAssertEqual(engine.cancelled, ["seg-0-me.m4a"])
+        XCTAssertFalse(engine.calls.contains("seg-1-me.m4a"), "a queued job never starts after cancel; got \(engine.calls)")
+        let loaded = await local.isEngineLoaded
+        XCTAssertFalse(loaded, "cancel drops the engine")
+    }
+
     func test_aModelLoadFailure_failsFinish() async {
         let local = transcriber(ScriptedEngine(DeviceFixtures.fixtureEngine), gate: LoadGate(open: true),
                                 loadFailure: CocoaError(.fileReadCorruptFile))

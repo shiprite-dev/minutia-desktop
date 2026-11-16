@@ -10,6 +10,7 @@ final class ScriptedEngine: SpeechEngine, @unchecked Sendable {
     private let failing: Set<String>
     private let hanging: Set<String>
     private var _calls: [String] = []
+    private var _cancelled: [String] = []
 
     /// `hanging` files never finish (until cancelled), like a wedged Core ML call.
     init(_ results: [String: [SpeechSegment]] = [:], failing: Set<String> = [], hanging: Set<String> = []) {
@@ -19,13 +20,20 @@ final class ScriptedEngine: SpeechEngine, @unchecked Sendable {
     }
 
     var calls: [String] { lock.withLock { _calls } }
+    /// Hanging calls that were cancelled.
+    var cancelled: [String] { lock.withLock { _cancelled } }
 
     func transcribe(_ audio: SpeechAudio) async throws -> SpeechResult {
         guard case .file(let url) = audio else { throw CocoaError(.fileReadUnsupportedScheme) }
         let name = url.lastPathComponent
         lock.withLock { _calls.append(name) }
         if failing.contains(name) { throw CocoaError(.fileReadCorruptFile) }
-        if hanging.contains(name) { try await Task.sleep(nanoseconds: 3_600_000_000_000) }
+        if hanging.contains(name) {
+            do { try await Task.sleep(nanoseconds: 3_600_000_000_000) } catch {
+                lock.withLock { _cancelled.append(name) }
+                throw error
+            }
+        }
         return SpeechResult(modelId: modelId, segments: results[name] ?? [])
     }
 }
@@ -68,7 +76,8 @@ final class LoadGate: @unchecked Sendable {
 }
 
 /// Records every device-transport call in order. `submitStatuses` is consumed one per submit; when
-/// it runs out the last status repeats. `failure` makes every call throw it instead.
+/// it runs out the last status repeats. `failure` makes every call throw it instead. `onMark` runs
+/// the moment the mark is called, before `markDelay`.
 final class RecordingTransport: DeviceTranscriptTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var _log: [String] = []
@@ -76,13 +85,16 @@ final class RecordingTransport: DeviceTranscriptTransport, @unchecked Sendable {
     private var statuses: [Int]
     private let failure: Error?
     private let markDelay: TimeInterval
+    private let onMark: @Sendable () -> Void
     let warmed = XCTestExpectation(description: "summary warmed")
     let ended = XCTestExpectation(description: "meeting ended")
 
-    init(submitStatuses: [Int] = [200], failure: Error? = nil, markDelay: TimeInterval = 0) {
+    init(submitStatuses: [Int] = [200], failure: Error? = nil, markDelay: TimeInterval = 0,
+         onMark: @escaping @Sendable () -> Void = {}) {
         statuses = submitStatuses
         self.failure = failure
         self.markDelay = markDelay
+        self.onMark = onMark
     }
 
     var log: [String] { lock.withLock { _log } }
@@ -92,6 +104,7 @@ final class RecordingTransport: DeviceTranscriptTransport, @unchecked Sendable {
     private func record(_ entry: String) { lock.withLock { _log.append(entry) } }
 
     func markAwaitingDeviceTranscript(meetingId: String, durationSeconds: Double) async throws {
+        onMark()
         if markDelay > 0 { try? await Task.sleep(nanoseconds: UInt64(markDelay * 1_000_000_000)) }
         record("mark")
         if let failure { throw failure }

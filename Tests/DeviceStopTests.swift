@@ -53,10 +53,18 @@ final class DeviceStopTests: XCTestCase {
         XCTAssertFalse(dirExists, "a 2xx deletes the capture directory")
     }
 
-    func test_deviceStop_marksTheMeetingBeforeTheSubmitCanClaimIt() async throws {
-        let transport = RecordingTransport(markDelay: 0.3)
+    /// A mark sent before the transcript exists strands the meeting as pending on this device when
+    /// transcription then fails; a mark landing after the submit would reopen a completed meeting.
+    func test_deviceStop_marksTheMeetingOnlyAfterTheTranscriptIsWritten_immediatelyBeforeTheSubmit() async throws {
+        let transcriptPath = dir.appendingPathComponent(CaptureRecovery.transcriptName).path
+        let sawTranscript = OutcomeBox()
+        let transport = RecordingTransport(markDelay: 0.3, onMark: {
+            sawTranscript.set(FileManager.default.fileExists(atPath: transcriptPath) ? nil : CocoaError(.fileNoSuchFile))
+        })
         _ = try await finish(await startedTranscriber(), transport)
-        XCTAssertEqual(transport.log.first, "mark", "a pending mark landing after the submit would reopen a completed meeting; got \(transport.log)")
+        XCTAssertEqual(Array(transport.log.prefix(2)), ["mark", "submit"], "got \(transport.log)")
+        XCTAssertTrue(sawTranscript.settled)
+        XCTAssertNil(sawTranscript.error, "transcript.json must be on disk when the mark is sent")
     }
 
     func test_deviceStop_warmsTheSummaryAfterTheSubmit_andEndsTheMeeting() async throws {
@@ -99,7 +107,8 @@ final class DeviceStopTests: XCTestCase {
 
         let preparing = await eventually { steps.steps.contains(.preparingModel) }
         XCTAssertTrue(preparing, "the finishing state names the model preparation step; got \(steps.steps)")
-        XCTAssertEqual(transport.submits, 0, "nothing is submitted before the model has transcribed")
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(transport.log, [], "nothing reaches the server, not even the mark, before the model has transcribed")
         XCTAssertTrue(dirExists)
 
         gate.open()
@@ -302,8 +311,77 @@ final class DeviceStopTests: XCTestCase {
         guard case .localTranscriptionTimedOut? = outcome.error as? CaptureSession.CaptureError else {
             return XCTFail("got \(String(describing: outcome.error))")
         }
-        XCTAssertEqual(transport.submits, 0)
+        XCTAssertEqual(transport.log, [], "a timed-out stop leaves the server meeting untouched, never stranded as pending")
         XCTAssertTrue(dirExists)
+    }
+
+    /// A timed-out stop must not leave the wedged call running and ~600 MB of model resident.
+    func test_aTimedOutStop_cancelsTheWedgedEngineCall_andUnloadsTheModel() async throws {
+        let engine = ScriptedEngine(DeviceFixtures.fixtureEngine, hanging: ["seg-1-me.m4a"])
+        let local = await startedTranscriber(engine)
+        let outcome = OutcomeBox()
+        Task {
+            do {
+                _ = try await CaptureSession.finishOnDevice(
+                    meetingId: DeviceFixtures.meetingId, directory: dir,
+                    tail: [DeviceFixtures.segment(1, in: dir, start: 300)], durationSeconds: DeviceFixtures.fixtureDuration,
+                    transcriber: local, transport: RecordingTransport(), recapOpened: false, transcribeTimeout: 0.5, sleep: { _ in })
+                outcome.set(nil)
+            } catch {
+                outcome.set(error)
+            }
+        }
+        let settled = await eventually(timeout: 5) { outcome.settled }
+        XCTAssertTrue(settled)
+        let cancelled = await eventually { engine.cancelled == ["seg-1-me.m4a"] }
+        XCTAssertTrue(cancelled, "the wedged engine call is cancelled; got \(engine.cancelled)")
+        let unloaded = await eventually { await local.isEngineLoaded == false }
+        XCTAssertTrue(unloaded, "the timed-out transcriber drops its engine")
+    }
+
+    func test_boundedTranscription_cancelsItsTimer_onceTheWorkFinishes() async throws {
+        let timerCancelled = OutcomeBox()
+        let transcript = try await CaptureSession.transcribeBounded(seconds: 60, timer: { _ in
+            do { try await Task.sleep(nanoseconds: 5_000_000_000) } catch {
+                timerCancelled.set(nil)
+                throw error
+            }
+        }) {
+            DeviceTranscript.build(source: DeviceFixtures.source, language: "en", durationSeconds: 1, segments: [])
+        }
+        XCTAssertEqual(transcript.outcome, "no_speech")
+        let cancelled = await eventually(timeout: 2) { timerCancelled.settled }
+        XCTAssertTrue(cancelled, "the timeout timer must not outlive the work")
+    }
+
+    func test_anEngineFailure_failsTheStop_withoutAnyRequest_andKeepsTheDirectory() async throws {
+        let transport = RecordingTransport()
+        do {
+            _ = try await finish(await startedTranscriber(ScriptedEngine(DeviceFixtures.fixtureEngine, failing: ["seg-1-them.m4a"])), transport)
+            XCTFail("a failed engine must fail the stop")
+        } catch {}
+        XCTAssertEqual(transport.log, [], "no mark, no submit")
+        XCTAssertTrue(dirExists)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent(CaptureRecovery.transcriptName).path))
+    }
+
+    /// A step from a device stop that already ended must never paint the next meeting's finishing view.
+    @MainActor
+    func test_aStepFromAnEndedStop_neverUpdatesTheFinishingStep() async {
+        let session = CaptureSession()
+        let first = session.finishingStepReporter()
+        await first(.preparingModel)
+        XCTAssertEqual(session.finishingStep, .preparingModel, "the live stop reports its step")
+        session.endFinishing()
+        XCTAssertNil(session.finishingStep)
+        await first(.transcribing(completed: 1, total: 2))
+        XCTAssertNil(session.finishingStep, "a late step from the ended stop is dropped")
+
+        let second = session.finishingStepReporter()
+        await second(.submitting)
+        XCTAssertEqual(session.finishingStep, .submitting)
+        await first(.transcribing(completed: 2, total: 2))
+        XCTAssertEqual(session.finishingStep, .submitting, "the ended stop cannot overwrite the current one")
     }
 
     func test_aTranscriptThatCannotFit_failsAsTooLarge_withoutSubmitting() async throws {
@@ -325,7 +403,7 @@ final class DeviceStopTests: XCTestCase {
         } catch {
             guard case .transcriptTooLarge? = error as? CaptureSession.CaptureError else { return XCTFail("got \(error)") }
         }
-        XCTAssertEqual(transport.submits, 0)
+        XCTAssertEqual(transport.log, [], "a transcript that cannot fit never marks the meeting pending")
         XCTAssertTrue(dirExists)
     }
 

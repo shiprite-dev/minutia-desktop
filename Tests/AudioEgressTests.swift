@@ -20,12 +20,14 @@ final class AudioEgressTests: XCTestCase {
         try? FileManager.default.removeItem(at: dir)
     }
 
-    private func unreachableClient() -> MinutiaClient {
-        MinutiaClient(
-            instance: instance,
-            supabase: SupabaseClient(supabaseURL: instance, supabaseKey: "anon-key"),
-            tokenProvider: { "token" })
-    }
+    /// One client for the suite: each SupabaseClient parks a cooperative thread on a Keychain read
+    /// in the unsigned test host, and enough of them starve every later async test.
+    private static let client = MinutiaClient(
+        instance: URL(string: "http://127.0.0.1:1")!,
+        supabase: SupabaseClient(supabaseURL: URL(string: "http://127.0.0.1:1")!, supabaseKey: "anon-key"),
+        tokenProvider: { "token" })
+
+    private func unreachableClient() -> MinutiaClient { Self.client }
 
     private func manifest(_ mode: TranscriptionMode, deviceOnly: Bool) -> CaptureManifest {
         CaptureManifest(
@@ -137,5 +139,22 @@ final class AudioEgressTests: XCTestCase {
         }
         XCTAssertTrue(CaptureSession.failureMessage(for: CaptureSession.CaptureError.transcriptionBlocked(.modelNotReady))
             .contains(TranscriptionReason.modelNotReady.settingsText))
+    }
+
+    /// A device decision with no transcriber (an egress-forbidden-only entry, or a model id the
+    /// engine does not know) would record a meeting that can never be transcribed. The session
+    /// refuses it before anything is created; the invalid id proves the order.
+    func test_captureSessionStart_refusesADeviceDecisionWithoutATranscriber_beforeCreatingAnything() {
+        for deviceOnly in [false, true] {
+            let session = CaptureSession()
+            XCTAssertThrowsError(try session.start(
+                meetingId: "not-a-uuid", seriesId: nil, userId: "u1", client: unreachableClient(),
+                decision: .device, deviceOnly: deviceOnly, language: "en", transcriber: nil)) { error in
+                guard case .transcriptionBlocked(let reason)? = error as? CaptureSession.CaptureError else {
+                    return XCTFail("deviceOnly=\(deviceOnly): expected transcriptionBlocked, got \(error)")
+                }
+                XCTAssertEqual(reason, .modelNotReady)
+            }
+        }
     }
 }

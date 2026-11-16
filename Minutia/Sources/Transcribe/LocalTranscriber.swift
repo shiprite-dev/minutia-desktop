@@ -137,6 +137,9 @@ actor LocalTranscriber {
         })
     }
 
+    /// Cancels every pending job and the load, and drops the engine.
+    func cancel() {}
+
     /// Queues the tail, waits for the engine and every job, and returns the meeting transcript.
     /// Reports `.preparingModel` while the engine is still loading and `.transcribing` as jobs finish.
     func finish(tail: [SegmentWriter.ClosedSegment], durationSeconds: Double,

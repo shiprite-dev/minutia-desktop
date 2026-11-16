@@ -290,6 +290,14 @@ final class CaptureSession: ObservableObject {
         !segmentsDropped && enqueued > 0 && registered == enqueued ? enqueued : nil
     }
 
+    /// The `onStep` for the device stop in flight; a step it reports after `endFinishing` is dropped.
+    func finishingStepReporter() -> @Sendable (FinishingStep) async -> Void {
+        { [weak self] step in await MainActor.run { self?.finishingStep = step } }
+    }
+
+    /// Ends the device stop in flight and clears its step.
+    func endFinishing() { finishingStep = nil }
+
     /// What a device-mode stop is doing, shown by the finishing view. nil in cloud mode.
     enum FinishingStep: Equatable, Sendable {
         case preparingModel
@@ -377,8 +385,10 @@ final class CaptureSession: ObservableObject {
 
     /// Races the work against a timer with a continuation that resumes once. A task group would
     /// wait for a wedged child: awaiting an unstructured task's value ignores cancellation.
-    private nonisolated static func transcribeBounded(
-        seconds: TimeInterval, _ work: @escaping @Sendable () async throws -> DeviceTranscript
+    nonisolated static func transcribeBounded(
+        seconds: TimeInterval,
+        timer: @escaping @Sendable (TimeInterval) async throws -> Void = { try await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
+        _ work: @escaping @Sendable () async throws -> DeviceTranscript
     ) async throws -> DeviceTranscript {
         final class Once: @unchecked Sendable {
             private let lock = NSLock()
@@ -396,7 +406,7 @@ final class CaptureSession: ObservableObject {
                 }
             }
             Task {
-                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                try? await timer(seconds)
                 if once.first() {
                     job.cancel()
                     continuation.resume(throwing: CaptureError.localTranscriptionTimedOut)

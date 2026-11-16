@@ -180,6 +180,72 @@ final class DeviceTranscriptTests: XCTestCase {
         XCTAssertEqual(fitted.durationSeconds, 21_600)
     }
 
+    // MARK: The server counts UTF-16 code units (Zod .max, String.length)
+
+    func test_build_splitsEmojiTextByUTF16Units_keepingEveryWord() {
+        let words = (0..<400).map { _ in "\u{1F600}\u{1F600}\u{1F600}\u{1F600}" }
+        let text = words.joined(separator: " ")
+        XCTAssertLessThanOrEqual(text.count, DeviceTranscript.maxSegmentText, "precondition: under the limit in graphemes")
+        XCTAssertGreaterThan(text.utf16.count, DeviceTranscript.maxSegmentText, "precondition: over the limit in UTF-16")
+        let transcript = DeviceTranscript.build(source: DeviceFixtures.source, language: "en", durationSeconds: 60, segments: [
+            .init(speaker: "me", start: 1, end: 50, text: text, confidence: 0.9),
+        ])
+        XCTAssertTrue(transcript.segments.allSatisfy { (1...DeviceTranscript.maxSegmentText).contains($0.text.utf16.count) },
+                      "got \(transcript.segments.map(\.text.utf16.count))")
+        XCTAssertEqual(transcript.segments.flatMap { $0.text.split(separator: " ").map(String.init) }, words)
+    }
+
+    func test_fitted_isNil_whenDecomposedTextExceedsTheTotalLimitInUTF16Units() {
+        let decomposed = String(repeating: "e\u{0301}", count: 1_000)
+        let segments = (0..<301).map { i in
+            DeviceTranscript.Segment(speaker: i % 2 == 0 ? "me" : "them", start: Double(i), end: Double(i) + 0.5, text: decomposed, confidence: 0.9)
+        }
+        let transcript = DeviceTranscript(source: DeviceFixtures.source, language: "en", durationSeconds: 400, outcome: "speech", segments: segments)
+        XCTAssertLessThanOrEqual(segments.reduce(0) { $0 + $1.text.count }, DeviceTranscript.maxTotalText, "precondition: under in graphemes")
+        XCTAssertGreaterThan(segments.reduce(0) { $0 + $1.text.utf16.count }, DeviceTranscript.maxTotalText, "precondition: over in UTF-16")
+        XCTAssertNil(transcript.fitted(), "602,000 UTF-16 units is a body the server rejects")
+    }
+
+    func test_fitted_neverMergesASegmentPastTheTextLimitInUTF16Units() throws {
+        let big = String(repeating: "\u{1F600}", count: 700)
+        var segments: [DeviceTranscript.Segment] = [
+            .init(speaker: "them", start: 0, end: 1, text: big, confidence: 0.9),
+            .init(speaker: "them", start: 1, end: 2, text: big, confidence: 0.9),
+        ]
+        segments += (0..<19_999).map { i in
+            let start = 2 + Double(i) * 0.5
+            return .init(speaker: (i / 2) % 2 == 0 ? "me" : "them", start: start, end: start + 0.4, text: "ok", confidence: 0.9)
+        }
+        let transcript = DeviceTranscript(source: DeviceFixtures.source, language: "en", durationSeconds: 21_600, outcome: "speech", segments: segments)
+        XCTAssertGreaterThan(transcript.segments.count, DeviceTranscript.maxSegments, "precondition: merging is needed")
+
+        let fitted = try XCTUnwrap(transcript.fitted())
+        XCTAssertLessThanOrEqual(fitted.segments.count, DeviceTranscript.maxSegments)
+        let over = fitted.segments.filter { $0.text.utf16.count > DeviceTranscript.maxSegmentText }
+        XCTAssertEqual(over.count, 0, "merged texts of \(over.map(\.text.utf16.count)) UTF-16 units fail the server's .max(2000)")
+    }
+
+    // MARK: Server range checks
+
+    func test_build_clampsTheDurationToTheServerMaximum_andEveryTimeWithIt() throws {
+        let transcript = DeviceTranscript.build(source: DeviceFixtures.source, language: "en", durationSeconds: 25_000, segments: [
+            .init(speaker: "me", start: 21_590, end: 21_640, text: "Runs past six hours.", confidence: 0.9),
+            .init(speaker: "them", start: 22_000, end: 22_010, text: "Past the cap.", confidence: 0.9),
+        ])
+        XCTAssertEqual(transcript.durationSeconds, 21_600)
+        XCTAssertEqual(try DeviceFixtures.jsonObject(transcript.encoded())["duration_seconds"] as? Double, 21_600)
+        XCTAssertTrue(transcript.segments.allSatisfy { $0.start <= $0.end && $0.end <= 21_600 }, "\(transcript.segments)")
+    }
+
+    /// The server requires `language` and accepts only `^[a-z]{2}$`; the router sends device work
+    /// only for manifest languages, so this keeps every one submittable.
+    func test_everyOnDeviceLanguage_isACodeTheServerAccepts() throws {
+        let pattern = try NSRegularExpression(pattern: "^[a-z]{2}$")
+        for language in ModelManifest.pinned.entries.flatMap(\.languages) {
+            XCTAssertNotNil(pattern.firstMatch(in: language, range: NSRange(language.startIndex..., in: language)), language)
+        }
+    }
+
     func test_fitted_isNil_whenTheWordsAloneExceedTheTextLimit() {
         let long = String(repeating: "x", count: 1_999)
         let segments = (0..<301).map { i in

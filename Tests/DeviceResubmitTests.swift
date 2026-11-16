@@ -51,12 +51,14 @@ final class DeviceResubmitTests: XCTestCase {
         XCTAssertEqual(CaptureRecovery.transcriptName, "transcript.json")
     }
 
-    func test_resubmit_marksTheMeetingFirst_thenSendsTheSavedBodyUnchanged_thenDeletesTheDirectory() async throws {
+    /// The stop's POST may have landed with its response lost. A pending mark here would reopen
+    /// that completed meeting past the server's replay fence, so resubmit only POSTs.
+    func test_resubmit_sendsTheSavedBodyUnchanged_withoutReopeningTheMeeting_thenDeletesTheDirectory() async throws {
         let saved = try writeTranscript()
         let transport = RecordingTransport()
         let error = await resubmit(transport)
         XCTAssertNil(error)
-        XCTAssertEqual(transport.log, ["mark", "submit"])
+        XCTAssertEqual(transport.log, ["submit"], "a resubmit never marks the meeting pending")
         XCTAssertEqual(transport.bodies, [saved], "Retry sends the payload written at stop, not a rebuilt one")
         XCTAssertFalse(dirExists, "a 2xx deletes the capture directory")
     }
@@ -128,12 +130,12 @@ final class DeviceResubmitTests: XCTestCase {
         let rows: [(Error, String)] = [
             (CaptureSession.CaptureError.transcriptNotSent, "Could not send the transcript. Retry to send it again."),
             (CaptureRecovery.RecoveryError.transcriptNotFinished,
-             "The transcript for this meeting is not finished. The recording is saved on this Mac."),
+             "This meeting could not be transcribed on this Mac. The recording is kept on this Mac."),
             (CaptureSession.CaptureError.localTranscriptionTimedOut,
-             "Transcribing on this Mac took too long. The recording is saved on this Mac."),
+             "This meeting could not be transcribed on this Mac. The recording is kept on this Mac."),
             (CaptureSession.CaptureError.nothingRecorded, "Nothing was recorded, so there is no transcript to send."),
             (CaptureSession.CaptureError.transcriptTooLarge,
-             "This meeting's transcript is too large to send. The recording is saved on this Mac."),
+             "This meeting could not be transcribed on this Mac. The recording is kept on this Mac."),
         ]
         for (error, copy) in rows {
             let message = AppController.finalizeFailureMessage(for: error, host: "minutia.example.com")
