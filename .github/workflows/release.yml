@@ -67,8 +67,11 @@ jobs:
         run: |
           set -euo pipefail
           SHORT="${GITHUB_REF_NAME#v}"
+          [[ "$SHORT" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || { echo "Tag must be vMAJOR.MINOR.PATCH"; exit 1; }
+          # Sparkle orders updates by CFBundleVersion, so derive it from the version to keep it increasing.
+          BUILD=$(( BASH_REMATCH[1] * 10000 + BASH_REMATCH[2] * 100 + BASH_REMATCH[3] ))
           echo "short=$SHORT" >> "$GITHUB_OUTPUT"
-          echo "build=${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "build=$BUILD" >> "$GITHUB_OUTPUT"
 
       - name: Import Developer ID certificate
         env:
