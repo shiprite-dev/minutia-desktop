@@ -40,6 +40,7 @@ actor LocalTranscriber {
     private let intakeLock = NSLock()
     nonisolated(unsafe) private var jobs: [Task<[DeviceTranscript.Segment], Error>] = []
     nonisolated(unsafe) private var activeJobs = 0
+    nonisolated(unsafe) private var cancelled = false
 
     var isEngineLoaded: Bool { engine != nil }
 
@@ -122,6 +123,7 @@ actor LocalTranscriber {
     nonisolated func enqueue(_ segment: SegmentWriter.ClosedSegment) {
         intakeLock.lock()
         defer { intakeLock.unlock() }
+        guard !cancelled else { return }
         let previous = jobs.last
         activeJobs += 1
         jobs.append(Task {
@@ -140,7 +142,7 @@ actor LocalTranscriber {
 
     /// Cancels every pending job and the load, and drops the engine.
     func cancel() {
-        let pending = intakeLock.withLock { defer { jobs = [] }; return jobs }
+        let pending = intakeLock.withLock { defer { jobs = []; cancelled = true }; return jobs }
         pending.forEach { $0.cancel() }
         loadTask?.cancel(); loadTask = nil
         unloadTask?.cancel(); unloadTask = nil
@@ -151,6 +153,7 @@ actor LocalTranscriber {
     /// Reports `.preparingModel` while the engine is still loading and `.transcribing` as jobs finish.
     func finish(tail: [SegmentWriter.ClosedSegment], durationSeconds: Double,
                 onStep: @escaping @Sendable (CaptureSession.FinishingStep) async -> Void = { _ in }) async throws -> DeviceTranscript {
+        if intakeLock.withLock({ cancelled }) { throw CancellationError() }
         tail.forEach(enqueue)
         let all = intakeLock.withLock { jobs }
         await onStep(engine == nil ? .preparingModel : .transcribing(completed: 0, total: all.count))
