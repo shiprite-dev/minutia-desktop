@@ -869,6 +869,75 @@ final class ModelStoreTests: XCTestCase {
         XCTAssertEqual(store.status, .ready(revision: "en-rev-1"))
     }
 
+    // MARK: Sign-out
+
+    func test_afterSignOut_aNetworkOrDiskChange_neverDownloads() async {
+        let manifest = Fixture.manifest()
+        let transfer = FakeTransfer(manifest: manifest)
+        let network = ChangingHost(expensive: true)
+        let offline = makeStore(manifest: manifest, transfer: transfer, host: network)
+        await offline.prepare(language: "en")
+        XCTAssertEqual(offline.status, .blocked(.expensiveNetwork), "precondition")
+
+        await offline.recordingDidStop(resume: false)
+        network.expensive = false
+        network.change()
+        await offline.conditionsDidChange()
+        _ = await eventually(timeout: 0.3) { !transfer.requests.isEmpty }
+
+        XCTAssertTrue(transfer.requests.isEmpty, "a signed-out store never downloads on a path change: \(transfer.requests)")
+        XCTAssertNotEqual(offline.status, .ready(revision: "en-rev-1"))
+
+        let upgraded = Fixture.manifest(enRevision: "en-rev-2")
+        let required = 2 * en(upgraded).totalBytes + 1_000_000_000
+        let diskTransfer = FakeTransfer(manifest: upgraded)
+        let disk = ChangingHost(freeBytes: required - 1)
+        let full = makeStore(manifest: upgraded, transfer: diskTransfer, host: disk)
+        await full.prepare(language: "en")
+        XCTAssertEqual(full.status, .blocked(.lowDisk(requiredBytes: required, freeBytes: required - 1)), "precondition")
+
+        await full.recordingDidStop(resume: false)
+        disk.freeBytes = required
+        disk.change()
+        await full.conditionsDidChange()
+        _ = await eventually(timeout: 0.3) { !diskTransfer.requests.isEmpty }
+
+        XCTAssertTrue(diskTransfer.requests.isEmpty, "a signed-out store never downloads when space frees up: \(diskTransfer.requests)")
+        XCTAssertNotEqual(full.status, .ready(revision: "en-rev-2"))
+    }
+
+    func test_afterSignOut_theNextSignInStillPrepares() async {
+        let manifest = Fixture.manifest()
+        let transfer = FakeTransfer(manifest: manifest)
+        let host = ChangingHost(expensive: true)
+        let store = makeStore(manifest: manifest, transfer: transfer, host: host)
+        await store.prepare(language: "en")
+        await store.recordingDidStop(resume: false)
+        host.expensive = false
+        await store.conditionsDidChange()
+        XCTAssertTrue(transfer.requests.isEmpty, "precondition: nothing downloads while signed out")
+
+        await store.prepare(language: "en")
+
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"))
+        XCTAssertEqual(Set(transfer.requests.map(\.url)), Set(en().files.map { en().url(for: $0) }))
+    }
+
+    func test_signOutMidDownload_cancelsTheTransfer_andNeverReachesReady() async {
+        let manifest = Fixture.manifest()
+        let weight = url("Encoder.mlmodelc/weights/weight.bin", in: en(manifest))
+        let transfer = FakeTransfer(manifest: manifest, gate: (weight, 20))
+        let store = makeStore(manifest: manifest, transfer: transfer)
+
+        let download = Task { await store.prepare(language: "en") }
+        await transfer.waitUntilGateReached()
+        await store.recordingDidStop(resume: false)
+        await download.value
+
+        XCTAssertEqual(transfer.cancellations, 1, "the in-flight transfer is cancelled on sign-out")
+        XCTAssertNotEqual(store.status, .ready(revision: "en-rev-1"))
+        XCTAssertNil(store.routableEntry(forLanguage: "en"))
+    }
 }
 
 private final class LockedFlags: @unchecked Sendable {
