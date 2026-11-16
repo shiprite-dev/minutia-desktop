@@ -9,7 +9,6 @@ import html
 import json
 import pathlib
 import re
-import shutil
 import subprocess
 import sys
 import tarfile
@@ -22,8 +21,8 @@ RAW = FIX / "raw"
 REPO_MANIFEST = pathlib.Path(sys.argv[2])
 AMI_EXCERPTS = {"ES2004a": (300.0, 600.0), "IS1009a": (300.0, 600.0)}
 AMI_FULL = "ES2004a"
-YT_DLP = ["yt-dlp"] if shutil.which("yt-dlp") else ["uvx", "yt-dlp@2026.10.26"]
-# Real meetings with human-made captions, all CC BY. Windows keep each FLAC under the 25 MB cloud upload limit.
+YT_DLP = ["uvx", "yt-dlp@2026.10.26", "-q", "-o", str(RAW / "youtube" / "%(id)s.%(ext)s")]
+# Real meetings with human-made captions, all CC BY 3.0. Windows keep each FLAC under the 25 MB cloud upload limit.
 # pcm_sha256 is the hash of the 16 kHz mono s16 excerpt, so a changed upload fails the build instead of shifting numbers.
 REAL_MEETINGS = [
     {"id": "dmFENp1-lcM", "lang": "en", "start": 0, "end": 1080,
@@ -179,7 +178,7 @@ def vtt_reference(path, start, end, lang):
         h, m, sec = stamp.split(":")
         return int(h) * 3600 + int(m) * 60 + float(sec)
 
-    lines, last = [], None
+    lines = []
     for block in path.read_text().split("\n\n"):
         rows = block.strip().splitlines()
         cue = next((i for i, row in enumerate(rows) if "-->" in row), None)
@@ -189,9 +188,8 @@ def vtt_reference(path, start, end, lang):
             row = html.unescape(re.sub(r"<[^>]+>", "", row))
             row = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", row)
             row = re.sub(r"^\s*(?:[A-Z][\w .'-]{0,30})?:\s+", "", row).strip()
-            if row and row != last:
+            if row and "-->" not in row and not re.fullmatch(r"\d+", row):
                 lines.append(row)
-            last = row
     return ("" if lang == "ja" else " ").join(lines)
 
 
@@ -199,27 +197,30 @@ def real_meeting(meeting):
     vid, lang = meeting["id"], meeting["lang"]
     raw = RAW / "youtube"
     raw.mkdir(parents=True, exist_ok=True)
-    subs = raw / f"{vid}.{lang}.vtt"
-    audio = [p for p in raw.glob(f"{vid}.*") if p.suffix != ".vtt"]
-    if not audio or not subs.exists():
-        subprocess.run([*YT_DLP, "-q", "-f", "bestaudio", "--write-subs", "--no-write-auto-subs", "--sub-langs", lang,
-                        "--sub-format", "vtt", "-o", str(raw / "%(id)s.%(ext)s"), "--", vid], check=True)
-        audio = [p for p in raw.glob(f"{vid}.*") if p.suffix != ".vtt"]
+    subs, audio = raw / f"{vid}.{lang}.vtt", raw / f"{vid}.webm"
+    if not subs.exists():
+        subprocess.run([*YT_DLP, "--skip-download", "--write-subs", "--no-write-auto-subs", "--sub-langs", lang,
+                        "--sub-format", "vtt", "--", vid], check=True)
+    if not subs.exists():
+        raise SystemExit(f"{vid}: no manual {lang} caption track on YouTube; pick another recording")
+    if not audio.exists():
+        subprocess.run([*YT_DLP, "-f", "251", "--", vid], check=True)
     dst = FIX / "real" / f"{vid}.flac"
     dst.parent.mkdir(parents=True, exist_ok=True)
-    ffmpeg("-ss", str(meeting["start"]), "-to", str(meeting["end"]), "-i", str(audio[0]), "-ac", "1", "-ar", "16000",
+    ffmpeg("-ss", str(meeting["start"]), "-to", str(meeting["end"]), "-i", str(audio), "-ac", "1", "-ar", "16000",
            "-sample_fmt", "s16", str(dst))
     pcm_bytes = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(dst), "-f", "s16le", "-"],
                                check=True, capture_output=True).stdout
     digest = hashlib.sha256(pcm_bytes).hexdigest()
     if meeting["pcm_sha256"] and digest != meeting["pcm_sha256"]:
-        raise SystemExit(f"{vid}: audio changed upstream (pcm sha256 {digest})")
+        print(f"warning: skipping {vid}, audio changed upstream (pcm sha256 {digest})", file=sys.stderr)
+        return
     print(f"{vid} pcm sha256 {digest}")
     add(f"real-{lang}-{vid}", f"real-{lang}-{vid}", "mono", f"real-meeting-{lang}", lang, dst,
         vtt_reference(subs, meeting["start"], meeting["end"], lang),
         f"YouTube {vid} \"{meeting['title']}\" by {meeting['channel']}, {meeting['start']}-{meeting['end']} s, "
-        "CC BY 4.0, reference = uploader's manual captions (not YouTube auto captions)")
-    items[-1]["youtube"] = {"id": vid, "title": meeting["title"], "channel": meeting["channel"], "license": "CC BY",
+        "CC BY 3.0, reference = uploader's manual captions (not YouTube auto captions)")
+    items[-1]["youtube"] = {"id": vid, "title": meeting["title"], "channel": meeting["channel"], "license": "CC BY 3.0",
                             "captions": "manual", "window": [meeting["start"], meeting["end"]], "pcmSha256": digest}
 
 

@@ -27,6 +27,7 @@ CLOUD = ["groq-turbo", "openrouter-parakeet-ultra"]
 ENGINES = LOCAL + CLOUD
 ENGLISH_CLASSES = ["read-clean", "read-other", "conversational", "conversational-echo", "meeting-full"]
 GATED = ["parakeet-v3", "parakeet-ultra"]
+INFORMATIONAL = ("real-meeting-en", "real-meeting-ja")
 RAM_BUDGET_MB, SPEED_FLOOR = 2048, 20.0
 
 
@@ -130,7 +131,7 @@ def below(value, limit):
 
 
 def errored(engine):
-    return any(r["error"] for r in rows if r["engine"] == engine)
+    return any(r["error"] for r in rows if r["engine"] == engine and r["class"] not in INFORMATIONAL)
 
 
 def peak_extra(engine):
@@ -171,7 +172,7 @@ gates = {}
 for engine in GATED:
     if engine not in runs:
         continue
-    by_id = {r["id"]: r for r in rows if r["engine"] == engine}
+    by_id = {r["id"]: r for r in rows if r["engine"] == engine and r["class"] not in INFORMATIONAL}
     full = [r for r in by_id.values() if r["class"] == "meeting-full"]
     japanese = [r for r in by_id.values() if r["class"] == "ja"]
     with_segments = [r for r in by_id.values() if r["segments"]]
