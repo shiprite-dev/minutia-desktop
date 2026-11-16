@@ -469,9 +469,12 @@ final class AppController: NSObject, ObservableObject {
     enum ModelStoreCue: Equatable { case pause, resume, release }
 
     nonisolated static func modelStoreCue(from previous: AppPhase, to next: AppPhase, signedIn: Bool) -> ModelStoreCue? {
-        if next == .recording { return .pause }
-        if previous == .recording { return .resume }
-        return nil
+        switch (previous, next) {
+        case (_, .recording): return .pause
+        case (_, .signedOut): return .release
+        case (.finalizing, .idle), (.error, .idle): return signedIn ? .resume : .release
+        default: return nil
+        }
     }
 
     /// Quitting must prompt when there is unfinished durable work: a recording in flight (or
@@ -760,12 +763,13 @@ final class AppController: NSObject, ObservableObject {
     private func apply(_ event: AppEvent) {
         let next = phase.next(event)
         guard next != phase else { return }
-        let wasRecording = phase == .recording
+        let previous = phase
         phase = next
-        if next == .recording {
-            modelStore.recordingDidStart()
-        } else if wasRecording {
-            Task { await modelStore.recordingDidStop() }
+        switch Self.modelStoreCue(from: previous, to: next, signedIn: authManager.sessionIdentity.email != nil) {
+        case .pause: modelStore.recordingDidStart()
+        case .resume: Task { await modelStore.recordingDidStop() }
+        case .release: Task { await modelStore.recordingDidStop(resume: false) }
+        case nil: break
         }
         // A pending web-record consent is only actionable from a resting/recoverable phase.
         // Drop it the moment we leave one (recording started by any path, finalizing, or sign-out)

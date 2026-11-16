@@ -21,8 +21,9 @@ struct HTTPModelTransfer: ModelTransfer {
         defer { try? handle.close() }
         var size = appending ? Int64(try handle.seekToEnd()) : 0
         var buffer = Data()
-        buffer.reserveCapacity(1 << 20)
+        buffer.reserveCapacity(chunkSize)
         func flush() throws {
+            guard !buffer.isEmpty else { return }
             try handle.write(contentsOf: buffer)
             size += Int64(buffer.count)
             buffer.removeAll(keepingCapacity: true)
@@ -31,7 +32,7 @@ struct HTTPModelTransfer: ModelTransfer {
         do {
             for try await byte in bytes {
                 buffer.append(byte)
-                if buffer.count >= 1 << 20 { try flush() }
+                if buffer.count >= chunkSize { try flush() }
             }
         } catch {
             try? flush()

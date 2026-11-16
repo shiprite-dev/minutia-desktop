@@ -45,7 +45,8 @@ enum ModelBlockReason: Equatable, Sendable {
         case .expensiveNetwork: "Waiting for a non-metered network to download the on-device model."
         case .lowDisk(let required, let free):
             "Not enough free disk space for the on-device model: \(Self.gigabytes(required)) needed, \(Self.gigabytes(free)) free."
-        case .recording, .warmingAfterRecording: "The on-device model will download after your recording ends."
+        case .recording: "The on-device model will download after your recording ends."
+        case .warmingAfterRecording: "The on-device model will finish getting ready after your recording ends."
         }
     }
 
@@ -95,6 +96,7 @@ final class ModelStore: ObservableObject {
         self.host = host
         self.warmer = warmer
         self.defaults = defaults
+        host.observeConditions { [weak self] in Task { @MainActor in await self?.conditionsDidChange() } }
     }
 
     /// `root/<revision>/<repoFolder>`, the directory handed to `ParakeetEngine.load`.
@@ -138,10 +140,18 @@ final class ModelStore: ObservableObject {
 
     func recordingDidStop(resume: Bool = true) async {
         recording = false
-        if let lastLanguage { await prepare(language: lastLanguage) }
+        if resume, let lastLanguage { await prepare(language: lastLanguage) }
     }
 
-    func conditionsDidChange() async {}
+    func conditionsDidChange() async {
+        guard !recording, let lastLanguage, case .blocked(let reason) = status else { return }
+        switch reason {
+        case .expensiveNetwork where !host.isNetworkExpensiveOrConstrained(): break
+        case .lowDisk(let required, _) where host.freeDiskBytes(at: root) >= required: break
+        default: return
+        }
+        await prepare(language: lastLanguage)
+    }
 
     private struct VerificationFailed: LocalizedError {
         var errorDescription: String? { "A downloaded model file failed verification." }
@@ -180,7 +190,7 @@ final class ModelStore: ObservableObject {
         defer { warmTask = nil }
         var failure: Error?
         do { try await task.value } catch { failure = error }
-        if recording || task.isCancelled { return status = .blocked(.recording) }
+        if recording || task.isCancelled { return status = .blocked(.warmingAfterRecording) }
         if let failure {
             defaults.removeObject(forKey: healthKey(entry))
             defaults.removeObject(forKey: warmKey(entry))
