@@ -10,6 +10,10 @@ packages:
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
     from: 2.9.0
+  FluidAudio:
+    url: https://github.com/FluidInference/FluidAudio
+    exactVersion: 0.18.2
+    traits: []
 targets:
   Minutia:
     type: application
@@ -18,6 +22,7 @@ targets:
     dependencies:
       - package: Supabase
       - package: Sparkle
+      - package: FluidAudio
     entitlements:
       path: Minutia/Minutia.entitlements
       properties:
@@ -56,9 +61,22 @@ targets:
     sources: [Tests]
     dependencies:
       - target: Minutia
+  minutia-eval:
+    type: tool
+    platform: macOS
+    sources: [Minutia/Sources/Transcribe, Eval/Sources]
+    dependencies:
+      - package: FluidAudio
+    settings:
+      base:
+        SWIFT_VERSION: "5.0"
+        PRODUCT_NAME: minutia-eval
 schemes:
   Minutia:
     build:
       targets: { Minutia: all }
     test:
       targets: [MinutiaTests]
+  minutia-eval:
+    build:
+      targets: { minutia-eval: all }

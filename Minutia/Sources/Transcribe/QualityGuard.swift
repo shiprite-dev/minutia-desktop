@@ -1,0 +1,43 @@
+import Foundation
+
+/// Flags audio the local model is likely decoding in a language it does not know, by mean token
+/// confidence per 30 s window against a per-model floor (`ParakeetEngine.Model.guardFloor`).
+/// A recording fails when at least `maxFailingShare` of the judged windows fail, or when two judged
+/// windows in a row fail; a lone failed window in a long meeting is tolerated. Characters per speech
+/// second do not separate English from Japanese in the eval calibration (Japanese decodes to 9 to 15,
+/// English 6 to 23), so they are reported but not gated on.
+enum QualityGuard {
+    static let windowSeconds = 30.0
+    static let minSpeechSeconds = 3.0
+    static let maxFailingShare = 0.25
+
+    struct Window: Codable, Equatable, Sendable {
+        let start: Double
+        let speechSeconds: Double
+        let meanConfidence: Double
+        let charsPerSpeechSecond: Double
+
+        var evaluated: Bool { speechSeconds >= QualityGuard.minSpeechSeconds }
+        func fails(floor: Double) -> Bool { evaluated && meanConfidence < floor }
+    }
+
+    static func windows(_ segments: [SpeechSegment]) -> [Window] {
+        Dictionary(grouping: segments) { ($0.start / windowSeconds).rounded(.down) }
+            .sorted { $0.key < $1.key }
+            .compactMap { index, group in
+                let speech = group.reduce(0) { $0 + max($1.end - $1.start, 0) }
+                guard speech > 0 else { return nil }
+                let chars = group.reduce(0) { $0 + $1.text.count }
+                let confidence = group.reduce(0) { $0 + $1.confidence * max($1.end - $1.start, 0) } / speech
+                return Window(start: index * windowSeconds, speechSeconds: speech,
+                              meanConfidence: confidence, charsPerSpeechSecond: Double(chars) / speech)
+            }
+    }
+
+    static func passes(_ windows: [Window], floor: Double) -> Bool {
+        let fails = windows.filter(\.evaluated).map { $0.fails(floor: floor) }
+        guard !fails.isEmpty else { return true }
+        let consecutive = zip(fails, fails.dropFirst()).contains { $0 && $1 }
+        return !consecutive && Double(fails.filter { $0 }.count) / Double(fails.count) < maxFailingShare
+    }
+}
