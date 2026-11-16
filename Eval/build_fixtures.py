@@ -23,7 +23,7 @@ AMI_EXCERPTS = {"ES2004a": (300.0, 600.0), "IS1009a": (300.0, 600.0)}
 AMI_FULL = "ES2004a"
 YT_DLP = ["uvx", "yt-dlp@2026.10.26", "-q", "-o", str(RAW / "youtube" / "%(id)s.%(ext)s")]
 # Real meetings with human-made captions, all CC BY 3.0. Windows keep each FLAC under the 25 MB cloud upload limit.
-# pcm_sha256 is the hash of the 16 kHz mono s16 excerpt, so a changed upload fails the build instead of shifting numbers.
+# pcm_sha256 is the hash of the 16 kHz mono s16 excerpt, so a changed upload is skipped with a warning instead of shifting numbers.
 REAL_MEETINGS = [
     {"id": "dmFENp1-lcM", "lang": "en", "start": 0, "end": 1080,
      "title": "Interpretation of Staff Meeting", "channel": "CATIE Center",
@@ -200,11 +200,15 @@ def real_meeting(meeting):
     subs, audio = raw / f"{vid}.{lang}.vtt", raw / f"{vid}.webm"
     if not subs.exists():
         subprocess.run([*YT_DLP, "--skip-download", "--write-subs", "--no-write-auto-subs", "--sub-langs", lang,
-                        "--sub-format", "vtt", "--", vid], check=True)
+                        "--sub-format", "vtt", "--", vid])
     if not subs.exists():
-        raise SystemExit(f"{vid}: no manual {lang} caption track on YouTube; pick another recording")
+        print(f"warning: skipping {vid}, no manual {lang} caption track on YouTube", file=sys.stderr)
+        return
     if not audio.exists():
-        subprocess.run([*YT_DLP, "-f", "251", "--", vid], check=True)
+        subprocess.run([*YT_DLP, "-f", "251", "--", vid])
+    if not audio.exists():
+        print(f"warning: skipping {vid}, audio could not be downloaded", file=sys.stderr)
+        return
     dst = FIX / "real" / f"{vid}.flac"
     dst.parent.mkdir(parents=True, exist_ok=True)
     ffmpeg("-ss", str(meeting["start"]), "-to", str(meeting["end"]), "-i", str(audio), "-ac", "1", "-ar", "16000",

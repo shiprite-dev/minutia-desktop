@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Downloads the public CC BY 4.0 sources (sha256 pinned), sets up the scoring venv and builds the fixtures.
+# Downloads the public CC BY sources (sha256 pinned), sets up the scoring venv and builds the fixtures.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
