@@ -466,6 +466,14 @@ final class AppController: NSObject, ObservableObject {
         }
     }
 
+    enum ModelStoreCue: Equatable { case pause, resume, release }
+
+    nonisolated static func modelStoreCue(from previous: AppPhase, to next: AppPhase, signedIn: Bool) -> ModelStoreCue? {
+        if next == .recording { return .pause }
+        if previous == .recording { return .resume }
+        return nil
+    }
+
     /// Quitting must prompt when there is unfinished durable work: a recording in flight (or
     /// finalizing its upload), or a startup recovery sweep still rescuing a prior recording. Leaving
     /// without finishing would defer the upload to the next-launch recovery at best.

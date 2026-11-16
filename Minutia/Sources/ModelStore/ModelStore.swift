@@ -18,6 +18,7 @@ protocol ModelHost: Sendable {
     var osBuild: String { get }
     func isNetworkExpensiveOrConstrained() -> Bool
     func freeDiskBytes(at url: URL) -> Int64
+    func observeConditions(_ handler: @escaping @Sendable () -> Void)
 }
 
 /// Loads an entry's engine from its directory and runs one short transcription. Must stop and throw
@@ -33,6 +34,7 @@ enum ModelBlockReason: Equatable, Sendable {
     case expensiveNetwork
     case lowDisk(requiredBytes: Int64, freeBytes: Int64)
     case recording
+    case warmingAfterRecording
 
     /// Shown in Settings under the on-device model row.
     var settingsText: String {
@@ -43,7 +45,7 @@ enum ModelBlockReason: Equatable, Sendable {
         case .expensiveNetwork: "Waiting for a non-metered network to download the on-device model."
         case .lowDisk(let required, let free):
             "Not enough free disk space for the on-device model: \(Self.gigabytes(required)) needed, \(Self.gigabytes(free)) free."
-        case .recording: "The on-device model will download after your recording ends."
+        case .recording, .warmingAfterRecording: "The on-device model will download after your recording ends."
         }
     }
 
@@ -134,10 +136,12 @@ final class ModelStore: ObservableObject {
         warmTask?.cancel()
     }
 
-    func recordingDidStop() async {
+    func recordingDidStop(resume: Bool = true) async {
         recording = false
         if let lastLanguage { await prepare(language: lastLanguage) }
     }
+
+    func conditionsDidChange() async {}
 
     private struct VerificationFailed: LocalizedError {
         var errorDescription: String? { "A downloaded model file failed verification." }

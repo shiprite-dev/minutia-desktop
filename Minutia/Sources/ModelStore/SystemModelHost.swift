@@ -27,6 +27,8 @@ final class SystemModelHost: ModelHost, @unchecked Sendable {
         return values?.volumeAvailableCapacityForImportantUsage ?? 0
     }
 
+    func observeConditions(_ handler: @escaping @Sendable () -> Void) {}
+
     private static func sysctlInt(_ name: String) -> Int32 {
         var value: Int32 = 0
         var size = MemoryLayout<Int32>.size

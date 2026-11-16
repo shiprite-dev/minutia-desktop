@@ -159,4 +159,37 @@ final class ControllerGuardsTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - Model store cue
+
+    func test_modelStoreCue_pausesTheModelWheneverARecordingStarts() {
+        for previous: AppPhase in [.idle, .detected(app: "Zoom"), .error("boom")] {
+            XCTAssertEqual(AppController.modelStoreCue(from: previous, to: .recording, signedIn: true), .pause, "\(previous)")
+        }
+    }
+
+    func test_modelStoreCue_staysPausedWhileTheMeetingUploads() {
+        XCTAssertNil(AppController.modelStoreCue(from: .recording, to: .finalizing, signedIn: true))
+        XCTAssertNil(AppController.modelStoreCue(from: .error("upload failed"), to: .finalizing, signedIn: true))
+        XCTAssertNil(AppController.modelStoreCue(from: .recording, to: .error("mic lost"), signedIn: true))
+        XCTAssertNil(AppController.modelStoreCue(from: .finalizing, to: .error("upload failed"), signedIn: true))
+    }
+
+    func test_modelStoreCue_resumesWhenTheUploadFinishes_orTheFailureIsDismissed() {
+        XCTAssertEqual(AppController.modelStoreCue(from: .finalizing, to: .idle, signedIn: true), .resume)
+        XCTAssertEqual(AppController.modelStoreCue(from: .error("upload failed"), to: .idle, signedIn: true), .resume)
+    }
+
+    func test_modelStoreCue_releasesWithoutPreparing_onSignOut() {
+        for previous: AppPhase in [.recording, .finalizing, .idle, .error("boom")] {
+            XCTAssertEqual(AppController.modelStoreCue(from: previous, to: .signedOut, signedIn: false), .release, "\(previous)")
+        }
+        XCTAssertEqual(AppController.modelStoreCue(from: .finalizing, to: .idle, signedIn: false), .release)
+    }
+
+    func test_modelStoreCue_isSilentForTransitionsThatDoNotTouchARecording() {
+        XCTAssertNil(AppController.modelStoreCue(from: .signedOut, to: .idle, signedIn: true))
+        XCTAssertNil(AppController.modelStoreCue(from: .idle, to: .detected(app: "Zoom"), signedIn: true))
+        XCTAssertNil(AppController.modelStoreCue(from: .detected(app: "Zoom"), to: .idle, signedIn: true))
+    }
 }
