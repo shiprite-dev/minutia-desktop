@@ -432,6 +432,14 @@ final class ModelStoreTests: XCTestCase {
         XCTAssertEqual(relaunched.routableEntry(forLanguage: "en")?.revision, "en-rev-1")
     }
 
+    func test_healthyRevisions_listsOnlyVerifiedAndWarmedEntries_acrossRelaunch() async {
+        XCTAssertEqual(makeStore().healthyRevisions, [])
+        _ = await readyEnglishStore()
+
+        XCTAssertEqual(makeStore().healthyRevisions, ["en-rev-1"])
+        XCTAssertEqual(makeStore(manifest: Fixture.manifest(enRevision: "en-rev-2")).healthyRevisions, [])
+    }
+
     func test_health_isPerRevision() async {
         _ = await readyEnglishStore()
 

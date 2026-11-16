@@ -36,9 +36,13 @@ struct CaptureManifest: Codable, Equatable {
     /// True once the terminal "transcription unavailable" notification has been posted for this
     /// directory, so it is not re-posted on every later launch or auth transition. Decodes false.
     var notified: Bool
+    let transcriptionMode: TranscriptionMode
+    let deviceOnly: Bool
+    let language: String?
 
     init(meetingId: String, seriesId: String?, instanceURL: URL, userId: String?, createdAt: Date,
-         recoveryAttempts: Int = 0, notified: Bool = false) {
+         recoveryAttempts: Int = 0, notified: Bool = false, transcriptionMode: TranscriptionMode = .cloud,
+         deviceOnly: Bool = false, language: String? = nil) {
         self.meetingId = meetingId
         self.seriesId = seriesId
         self.instanceURL = instanceURL
@@ -46,6 +50,9 @@ struct CaptureManifest: Codable, Equatable {
         self.createdAt = createdAt
         self.recoveryAttempts = recoveryAttempts
         self.notified = notified
+        self.transcriptionMode = transcriptionMode
+        self.deviceOnly = deviceOnly
+        self.language = language
     }
 
     init(from decoder: Decoder) throws {
@@ -57,6 +64,9 @@ struct CaptureManifest: Codable, Equatable {
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         recoveryAttempts = try c.decodeIfPresent(Int.self, forKey: .recoveryAttempts) ?? 0
         notified = try c.decodeIfPresent(Bool.self, forKey: .notified) ?? false
+        transcriptionMode = .cloud
+        deviceOnly = false
+        language = nil
     }
 }
 

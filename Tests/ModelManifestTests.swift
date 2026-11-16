@@ -13,6 +13,10 @@ final class ModelManifestTests: XCTestCase {
         XCTAssertEqual(manifest.entry(forLanguage: "ja")?.guardFloor, 0)
     }
 
+    func test_pinnedManifest_marksOnlyTheJapaneseModelAsEgressForbiddenOnly() {
+        XCTAssertEqual(manifest.entries.filter(\.egressForbiddenOnly).map(\.id), ["parakeet-ja"])
+    }
+
     func test_pinnedRevisions_matchWhatParakeetEnginePinsFluidAudioTo() {
         for entry in manifest.entries {
             let model = ParakeetEngine.Model(rawValue: entry.id)

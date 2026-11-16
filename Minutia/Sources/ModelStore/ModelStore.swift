@@ -126,6 +126,8 @@ final class ModelStore: ObservableObject {
         return entry
     }
 
+    var healthyRevisions: Set<String> { [] }
+
     func recordingDidStart() {
         recording = true
         running?.task.cancel()

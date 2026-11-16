@@ -21,6 +21,8 @@ struct ModelManifest: Sendable {
         let languages: Set<String>
         let minimumOS: OperatingSystemVersion
         let guardFloor: Double
+        /// Used only when audio may not leave the Mac; Automatic never routes to it.
+        var egressForbiddenOnly = false
 
         var totalBytes: Int64 { files.reduce(0) { $0 + $1.size } }
 
