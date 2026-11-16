@@ -173,6 +173,12 @@ final class MinutiaClientBuilderTests: XCTestCase {
         XCTAssertEqual(request.url, URL(string: "https://minutia.example.com/api/meetings/\(lowerUUID)/transcribe"))
     }
 
+    func test_finalTranscribeRequest_waitsLongerThanTheServerTranscribes() {
+        let request = MinutiaClient.finalTranscribeRequest(instance: instance, meetingId: upperUUID, expectedSegments: nil, token: token)
+
+        XCTAssertGreaterThan(request.timeoutInterval, 300)
+    }
+
     func test_summaryWarmupRequest_lowercasesRoute() {
         let request = MinutiaClient.summaryWarmupRequest(instance: instance, meetingId: upperUUID, token: token)
 
