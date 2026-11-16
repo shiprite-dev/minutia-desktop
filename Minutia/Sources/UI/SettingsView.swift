@@ -245,7 +245,6 @@ private struct ModelStatusText: View {
         case .idle: "The on-device model has not been set up yet."
         case .blocked(let reason): reason.settingsText
         case .downloading: store.status.menuLabel ?? "Downloading the on-device model."
-        case .verifying: "Verifying the on-device model."
         case .warming: "Preparing the on-device model."
         case .ready: "The on-device model is ready."
         case .failed(let message): message

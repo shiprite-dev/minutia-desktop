@@ -56,7 +56,6 @@ enum ModelStatus: Equatable, Sendable {
     case idle
     case blocked(ModelBlockReason)
     case downloading(received: Int64, total: Int64)
-    case verifying
     case warming
     case ready(revision: String)
     case failed(String)
@@ -107,11 +106,18 @@ final class ModelStore: ObservableObject {
     /// after sign-in and whenever the meeting language changes.
     func prepare(language: String) async {
         lastLanguage = language
-        while let running { await running.value }
-        let task = Task { await run(language) }
-        running = task
+        if let current = running {
+            await current.task.value
+            if current.language == lastLanguage, !current.task.isCancelled { return }
+            return await prepare(language: language)
+        }
+        let id = UUID()
+        let task = Task {
+            await run(language)
+            if running?.id == id { running = nil }
+        }
+        running = (id, language, task)
         await task.value
-        running = nil
     }
 
     func routableEntry(forLanguage language: String) -> ModelManifest.Entry? {
@@ -121,6 +127,7 @@ final class ModelStore: ObservableObject {
 
     func recordingDidStart() {
         recording = true
+        running?.task.cancel()
         warmTask?.cancel()
     }
 
@@ -135,7 +142,7 @@ final class ModelStore: ObservableObject {
 
     private var lastLanguage: String?
     private var recording = false
-    private var running: Task<Void, Never>?
+    private var running: (id: UUID, language: String, task: Task<Void, Never>)?
     private var warmTask: Task<Void, Error>?
 
     private func healthKey(_ entry: ModelManifest.Entry) -> String { "ModelStore.healthy.\(entry.revision)" }
@@ -152,6 +159,7 @@ final class ModelStore: ObservableObject {
             return
         }
         if !healthy, !(await install(entry)) { return }
+        if recording { return status = .blocked(.recording) }
         let marker = "\(host.appBuild)|\(host.osBuild)"
         if healthy, defaults.string(forKey: warmKey(entry)) == marker {
             status = .ready(revision: entry.revision)
@@ -163,10 +171,14 @@ final class ModelStore: ObservableObject {
         let task = Task(priority: .utility) { try await warmer.warmUp(entry, at: directory) }
         warmTask = task
         defer { warmTask = nil }
-        do { try await task.value } catch is CancellationError { return } catch {
-            return status = .failed("The on-device model could not be loaded: \(error.localizedDescription)")
+        var failure: Error?
+        do { try await task.value } catch { failure = error }
+        if recording || task.isCancelled { return status = .blocked(.recording) }
+        if let failure {
+            defaults.removeObject(forKey: healthKey(entry))
+            defaults.removeObject(forKey: warmKey(entry))
+            return status = .failed("The on-device model could not be loaded: \(failure.localizedDescription)")
         }
-        if task.isCancelled { return }
         defaults.set(true, forKey: healthKey(entry))
         defaults.set(marker, forKey: warmKey(entry))
         status = .ready(revision: entry.revision)
@@ -192,6 +204,7 @@ final class ModelStore: ObservableObject {
             try excluded.setResourceValues(values)
             var done: Int64 = 0
             for file in entry.files {
+                if recording { status = .blocked(.recording); return false }
                 let final = directory.appendingPathComponent(file.path)
                 let partial = URL(fileURLWithPath: final.path + ".partial")
                 if Self.size(of: final) == file.size, try await Self.sha256(of: final) == file.sha256 {
@@ -208,7 +221,6 @@ final class ModelStore: ObservableObject {
                         Task { @MainActor in self?.advance(to: base + received, of: total) }
                     }
                 }
-                status = .verifying
                 guard try await Self.sha256(of: partial) == file.sha256 else {
                     try? fm.removeItem(at: partial)
                     throw VerificationFailed()
@@ -221,6 +233,10 @@ final class ModelStore: ObservableObject {
             try Data((entry.revision + "\n").utf8).write(to: directory.appendingPathComponent(".fluidaudio-revision"))
             return true
         } catch {
+            if !(error is VerificationFailed), recording || Task.isCancelled || error is CancellationError {
+                status = .blocked(.recording)
+                return false
+            }
             status = .failed("The on-device model could not be downloaded: \(error.localizedDescription)")
             return false
         }
