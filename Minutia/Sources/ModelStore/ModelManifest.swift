@@ -1,5 +1,11 @@
 import Foundation
 
+extension OperatingSystemVersion {
+    func isAtLeast(_ other: OperatingSystemVersion) -> Bool {
+        (majorVersion, minorVersion, patchVersion) >= (other.majorVersion, other.minorVersion, other.patchVersion)
+    }
+}
+
 /// Compiled-in list of on-device speech models. Each entry is pinned to a Hugging Face commit; its files
 /// install to `models/<revision>/<repoFolder>/` because FluidAudio resolves `<directory>/<repoFolder>`.
 struct ModelManifest: Sendable {
@@ -21,6 +27,8 @@ struct ModelManifest: Sendable {
         let languages: Set<String>
         let minimumOS: OperatingSystemVersion
         let guardFloor: Double
+        /// Used only when audio may not leave the Mac; Automatic never routes to it.
+        var egressForbiddenOnly = false
 
         var totalBytes: Int64 { files.reduce(0) { $0 + $1.size } }
 
@@ -96,7 +104,8 @@ struct ModelManifest: Sendable {
             ],
             languages: ["ja"],
             minimumOS: OperatingSystemVersion(majorVersion: 14, minorVersion: 4, patchVersion: 0),
-            guardFloor: 0
+            guardFloor: 0,
+            egressForbiddenOnly: true
         ),
     ])
 }

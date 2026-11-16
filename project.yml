@@ -64,7 +64,7 @@ targets:
   minutia-eval:
     type: tool
     platform: macOS
-    sources: [Minutia/Sources/Transcribe, Eval/Sources]
+    sources: [Minutia/Sources/Transcribe, Minutia/Sources/ModelStore/ModelManifest.swift, Eval/Sources]
     dependencies:
       - package: FluidAudio
     settings:

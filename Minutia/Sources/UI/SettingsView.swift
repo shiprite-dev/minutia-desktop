@@ -15,6 +15,7 @@ struct SettingsView: View {
     @State private var launchAtLogin = SettingsView.loginItemState(SMAppService.mainApp.status) != .disabled
     @State private var loginRequiresApproval = SettingsView.loginItemState(SMAppService.mainApp.status) == .requiresApproval
     @State private var loginItemError: String?
+    @AppStorage(TranscriptionSetting.defaultsKey) private var transcriptionSetting: TranscriptionSetting = .automatic
     @AppStorage(WebStartPolicy.defaultsKey) private var webStartPolicy = WebStartPolicy.ask.rawValue
 
     init(controller: AppController, updater: UpdaterController) {
@@ -97,6 +98,12 @@ struct SettingsView: View {
             }
 
             Section("Transcription") {
+                if TranscriptionRouter.isDeviceRoutingEnabled(.standard) {
+                    Picker("Transcription", selection: $transcriptionSetting) {
+                        ForEach(TranscriptionSetting.allCases, id: \.self) { Text($0.title) }
+                    }
+                    TranscriptionReasonText(controller: controller, setting: transcriptionSetting)
+                }
                 ModelStatusText(store: controller.modelStore)
             }
 
@@ -227,6 +234,25 @@ struct SettingsView: View {
         let state = SettingsView.loginItemState(SMAppService.mainApp.status)
         launchAtLogin = state != .disabled
         loginRequiresApproval = state == .requiresApproval
+    }
+}
+
+private struct TranscriptionReasonText: View {
+    let controller: AppController
+    let setting: TranscriptionSetting
+    @ObservedObject private var store: ModelStore
+
+    init(controller: AppController, setting: TranscriptionSetting) {
+        self.controller = controller
+        self.setting = setting
+        _store = ObservedObject(wrappedValue: controller.modelStore)
+    }
+
+    var body: some View {
+        Text(controller.transcriptionDecision(setting: setting).summary)
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 

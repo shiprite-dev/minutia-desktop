@@ -36,9 +36,13 @@ struct CaptureManifest: Codable, Equatable {
     /// True once the terminal "transcription unavailable" notification has been posted for this
     /// directory, so it is not re-posted on every later launch or auth transition. Decodes false.
     var notified: Bool
+    let transcriptionMode: TranscriptionMode
+    let deviceOnly: Bool
+    let language: String?
 
     init(meetingId: String, seriesId: String?, instanceURL: URL, userId: String?, createdAt: Date,
-         recoveryAttempts: Int = 0, notified: Bool = false) {
+         recoveryAttempts: Int = 0, notified: Bool = false, transcriptionMode: TranscriptionMode = .cloud,
+         deviceOnly: Bool = false, language: String? = nil) {
         self.meetingId = meetingId
         self.seriesId = seriesId
         self.instanceURL = instanceURL
@@ -46,6 +50,9 @@ struct CaptureManifest: Codable, Equatable {
         self.createdAt = createdAt
         self.recoveryAttempts = recoveryAttempts
         self.notified = notified
+        self.transcriptionMode = transcriptionMode
+        self.deviceOnly = deviceOnly
+        self.language = language
     }
 
     init(from decoder: Decoder) throws {
@@ -57,7 +64,14 @@ struct CaptureManifest: Codable, Equatable {
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         recoveryAttempts = try c.decodeIfPresent(Int.self, forKey: .recoveryAttempts) ?? 0
         notified = try c.decodeIfPresent(Bool.self, forKey: .notified) ?? false
+        transcriptionMode = c.contains(.transcriptionMode)
+            ? (try? c.decode(TranscriptionMode.self, forKey: .transcriptionMode)) ?? .device
+            : .cloud
+        deviceOnly = try c.decodeIfPresent(Bool.self, forKey: .deviceOnly) ?? false
+        language = try c.decodeIfPresent(String.self, forKey: .language)
     }
+
+    var audioMayLeaveMac: Bool { transcriptionMode == .cloud && !deviceOnly }
 }
 
 /// Startup salvage for capture directories left behind by a quit, crash, or fatal mid-recording.
@@ -68,7 +82,7 @@ enum CaptureRecovery {
     static let manifestName = "manifest.json"
     static let recordingName = "recording.m4a"
 
-    enum RecoveryError: Error, Equatable { case unreadableRecording }
+    enum RecoveryError: Error, Equatable { case unreadableRecording, audioStaysOnThisMac }
 
     /// nil when the file is missing, has no audio track, or has no positive finite duration.
     static func readableAudioDuration(of url: URL) async -> Double? {
@@ -132,6 +146,7 @@ enum CaptureRecovery {
     nonisolated static func shouldRecover(
         manifest: CaptureManifest, connectedInstance: URL, connectedUserId: String?
     ) -> Bool {
+        guard manifest.audioMayLeaveMac else { return false }
         let manifestInstance = InstanceConfig.normalize(manifest.instanceURL.absoluteString) ?? manifest.instanceURL
         let connected = InstanceConfig.normalize(connectedInstance.absoluteString) ?? connectedInstance
         guard manifestInstance == connected else { return false }
@@ -152,6 +167,7 @@ enum CaptureRecovery {
         directory: URL, manifest: CaptureManifest, client: MinutiaClient,
         flushNotes: @escaping @Sendable () async throws -> Void = {}
     ) async throws {
+        guard manifest.audioMayLeaveMac else { throw RecoveryError.audioStaysOnThisMac }
         let recordingURL = directory.appendingPathComponent(recordingName)
         guard let duration = await readableAudioDuration(of: recordingURL) else { throw RecoveryError.unreadableRecording }
 
