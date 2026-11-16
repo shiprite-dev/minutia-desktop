@@ -74,13 +74,37 @@ final class DeviceResubmitTests: XCTestCase {
         XCTAssertFalse(dirExists)
     }
 
-    func test_resubmit_aRejectedSubmit_keepsTheDirectory_andSurfacesTranscriptNotSent() async throws {
+    func test_resubmit_anUnavailableServer_keepsTheDirectory_andSurfacesTranscriptNotSent() async throws {
         _ = try writeTranscript()
-        let transport = RecordingTransport(submitStatuses: [400])
+        let transport = RecordingTransport(submitStatuses: [503])
         let error = await resubmit(transport)
         guard case .transcriptNotSent? = error as? CaptureSession.CaptureError else { return XCTFail("got \(String(describing: error))") }
         XCTAssertTrue(dirExists)
         XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent(CaptureRecovery.transcriptName).path))
+    }
+
+    func test_resubmit_aPermanentRejection_keepsTheDirectory_andSurfacesTranscriptRejected() async throws {
+        _ = try writeTranscript()
+        let transport = RecordingTransport(submitStatuses: [422])
+        let error = await resubmit(transport)
+        guard case .transcriptRejected? = error as? CaptureSession.CaptureError else { return XCTFail("got \(String(describing: error))") }
+        XCTAssertEqual(transport.submits, 1)
+        XCTAssertTrue(dirExists)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent(CaptureRecovery.transcriptName).path))
+    }
+
+    /// The sweep pins a rejected transcript at the attempt ceiling at once instead of resending the
+    /// same bytes on every launch.
+    func test_recoveryOutcome_aRejectedTranscript_isTerminal_notRetriedEveryLaunch() {
+        XCTAssertEqual(AppController.recoveryOutcome(for: CaptureSession.CaptureError.transcriptRejected), .unreadable)
+    }
+
+    func test_recoveryNotification_forADeviceMeeting_saysItWasSent_neverUploading() {
+        let device = AppController.recoveryNotificationBody(transcriptionMode: .device)
+        XCTAssertEqual(device, "A meeting transcribed on this Mac has been sent.")
+        XCTAssertFalse(device.lowercased().contains("upload"), device)
+        XCTAssertEqual(AppController.recoveryNotificationBody(transcriptionMode: .cloud),
+                       "A meeting that didn't finish uploading has been recovered. The recap is being prepared.")
     }
 
     func test_resubmit_withNoFinishedTranscript_failsWithoutAnyRequest_andKeepsTheAudio() async {
@@ -129,6 +153,8 @@ final class DeviceResubmitTests: XCTestCase {
     func test_deviceFailureCopy_saysWhatHappened_andNeverMentionsUploading() {
         let rows: [(Error, String)] = [
             (CaptureSession.CaptureError.transcriptNotSent, "Could not send the transcript. Retry to send it again."),
+            (CaptureSession.CaptureError.transcriptRejected,
+             "This meeting could not be transcribed on this Mac. The recording is kept on this Mac."),
             (CaptureRecovery.RecoveryError.transcriptNotFinished,
              "This meeting could not be transcribed on this Mac. The recording is kept on this Mac."),
             (CaptureSession.CaptureError.localTranscriptionTimedOut,

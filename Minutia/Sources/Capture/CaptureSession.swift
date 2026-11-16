@@ -41,7 +41,7 @@ final class CaptureSession: ObservableObject {
     }
 
     enum CaptureError: Error { case notRunning, stalled, recordingUnfinished, alreadyRunning, invalidMeetingId, transcriptionBlocked(TranscriptionReason),
-        transcriptNotSent, localTranscriptionTimedOut, nothingRecorded, transcriptTooLarge }
+        transcriptNotSent, transcriptRejected, localTranscriptionTimedOut, nothingRecorded, transcriptTooLarge }
 
     /// Ceiling for the stop-time network finalize (drain + upload + finalize + transcribe request).
     static let finalizeTimeout: TimeInterval = 60
@@ -202,12 +202,11 @@ final class CaptureSession: ObservableObject {
         if !audioMayLeaveMac, let transcriber {
             guard let finished = pipeline.finishCapture() else { throw CaptureError.recordingUnfinished }
             let tail = finished.tailPieces.isEmpty ? [finished.finalSegment].compactMap { $0 } : finished.tailPieces
-            try? await flushNotes()
             return try await Self.finishOnDevice(
                 meetingId: meetingId, directory: directory, tail: tail,
                 durationSeconds: Double(finished.recording.frames) / MixPlan.sampleRate,
                 transcriber: transcriber, transport: client, recapOpened: recapOpened,
-                onStep: finishingStepReporter())
+                flushNotes: flushNotes, onStep: finishingStepReporter())
         }
 
         // Without a finished recording the server has nothing to transcribe; throwing keeps the
@@ -349,8 +348,10 @@ final class CaptureSession: ObservableObject {
         transcriber: LocalTranscriber, transport: any DeviceTranscriptTransport, recapOpened: Bool,
         transcribeTimeout: TimeInterval? = nil,
         sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
+        flushNotes: @escaping @Sendable () async throws -> Void = {},
         onStep: @escaping @Sendable (FinishingStep) async -> Void = { _ in }
     ) async throws -> StopResult {
+        try? await flushNotes()
         guard durationSeconds > 0 else { throw CaptureError.nothingRecorded }
         let transcript: DeviceTranscript
         do {
@@ -377,6 +378,12 @@ final class CaptureSession: ObservableObject {
         if !recapOpened { Task { await transport.warmSummary(meetingId: meetingId) } }
         Task { await endMeetingIfAllowed { try await transport.endMeeting(meetingId: meetingId) } }
         return StopResult(expectedSegments: nil, transcriptRequested: true)
+    }
+
+    /// How long Quit waits for a stop already in flight.
+    nonisolated static func quitDeadline(audioMayLeaveMac: Bool, elapsedSeconds: TimeInterval,
+                                         finalizeTimeout: TimeInterval = CaptureSession.finalizeTimeout) -> TimeInterval {
+        finalizeTimeout + 5
     }
 
     /// Ceiling on local transcription at stop; past it the stop fails with a retryable error.

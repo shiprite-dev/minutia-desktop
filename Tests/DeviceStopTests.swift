@@ -253,8 +253,9 @@ final class DeviceStopTests: XCTestCase {
 
     // MARK: Review fixes
 
-    func test_aFailedSubmit_surfacesAsTranscriptNotSent() async throws {
-        for transport in [RecordingTransport(submitStatuses: [400]), RecordingTransport(failure: URLError(.cannotConnectToHost))] {
+    func test_aSubmitThatMaySucceedLater_surfacesAsTranscriptNotSent() async throws {
+        for transport in [RecordingTransport(submitStatuses: [503]), RecordingTransport(submitStatuses: [403]),
+                          RecordingTransport(failure: URLError(.cannotConnectToHost))] {
             do {
                 _ = try await finish(await startedTranscriber(), transport)
                 XCTFail("must throw")
@@ -264,6 +265,133 @@ final class DeviceStopTests: XCTestCase {
                 }
             }
             XCTAssertTrue(dirExists)
+        }
+    }
+
+    /// Resending the same bytes can never turn a 400, 413 or 422 into a success, so Retry is not offered.
+    func test_aPermanentlyRejectedTranscript_surfacesAsRejected_keepingTheDirectory() async throws {
+        for status in [400, 413, 422] {
+            let transport = RecordingTransport(submitStatuses: [status])
+            do {
+                _ = try await finish(await startedTranscriber(), transport)
+                XCTFail("\(status): must throw")
+            } catch {
+                guard case .transcriptRejected? = error as? CaptureSession.CaptureError else {
+                    return XCTFail("\(status): got \(error)")
+                }
+            }
+            XCTAssertEqual(transport.submits, 1, "\(status)")
+            XCTAssertTrue(dirExists, "\(status)")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("recording.m4a").path), "\(status)")
+        }
+    }
+
+    func test_submit_aPermanentRejection_throwsTranscriptRejected_withoutRetrying() async {
+        for status in [400, 404, 413, 422] {
+            let (transport, sleeps, error) = await submit([status])
+            guard case .transcriptRejected? = error as? CaptureSession.CaptureError else {
+                return XCTFail("\(status): got \(String(describing: error))")
+            }
+            XCTAssertEqual(transport.submits, 1, "\(status)")
+            XCTAssertEqual(sleeps.waits, [], "\(status)")
+        }
+    }
+
+    /// 401 and 409 keep retrying; 403, 408, 429 and 503 are not retried but are not a verdict on the transcript.
+    func test_submit_authClaimThrottleAndUnavailable_areNeverReportedAsRejected() async {
+        for status in [401, 403, 408, 409, 429, 503] {
+            let (_, _, error) = await submit([status])
+            XCTAssertNotNil(error, "\(status)")
+            if case .transcriptRejected? = error as? CaptureSession.CaptureError { XCTFail("\(status) is not a permanent rejection") }
+        }
+    }
+
+    // MARK: Finishing step from the first moment
+
+    private func loadedTranscriber(_ engine: ScriptedEngine) async -> LocalTranscriber {
+        let local = LocalTranscriber(source: DeviceFixtures.source, language: "en", loadEngine: LoadGate(open: true).loader(engine))
+        await local.startLoading()
+        _ = await eventually { await local.isEngineLoaded }
+        local.enqueue(DeviceFixtures.segment(0, in: dir))
+        return local
+    }
+
+    /// With the engine already loaded and a job still running, the finishing view names the work at
+    /// once instead of falling back to the cloud "Uploading" copy until the first job lands.
+    func test_finish_withALoadedEngineAndABacklog_reportsTranscribingZeroOfAll_beforeAnyJobFinishes() async throws {
+        let local = await loadedTranscriber(ScriptedEngine(DeviceFixtures.fixtureEngine, hanging: ["seg-0-me.m4a"]))
+        let steps = StepLog()
+        let finishing = Task {
+            try await local.finish(tail: [DeviceFixtures.segment(1, in: dir, start: 300)], durationSeconds: DeviceFixtures.fixtureDuration,
+                                   onStep: { steps.record($0) })
+        }
+        let reported = await eventually { !steps.steps.isEmpty }
+        await local.cancel()
+        _ = await finishing.result
+        XCTAssertTrue(reported, "a step is reported before the first job finishes")
+        XCTAssertEqual(steps.steps.first, .transcribing(completed: 0, total: 2), "got \(steps.steps)")
+    }
+
+    func test_finish_withNoEngine_reportsPreparingTheModelFirst() async throws {
+        let gate = LoadGate()
+        let local = await startedTranscriber(gate: gate)
+        let steps = StepLog()
+        let finishing = Task {
+            try await local.finish(tail: [], durationSeconds: DeviceFixtures.fixtureDuration, onStep: { steps.record($0) })
+        }
+        let reported = await eventually { !steps.steps.isEmpty }
+        gate.open()
+        _ = try await finishing.value
+        XCTAssertTrue(reported)
+        XCTAssertEqual(steps.steps.first, .preparingModel, "got \(steps.steps)")
+    }
+
+    /// A slow notes flush must not leave the finishing view on the cloud copy: the step is reported
+    /// while the flush is still in flight, and the notes still land before the meeting is marked.
+    func test_aDeviceStop_reportsItsStepWhileTheNotesFlushIsStillRunning_andMarksOnlyAfterTheNotesLand() async throws {
+        let local = await loadedTranscriber(ScriptedEngine(DeviceFixtures.fixtureEngine))
+        let notesGate = LoadGate()
+        let holdNotes = notesGate.loader(ScriptedEngine())
+        let notesLanded = OutcomeBox()
+        let markedAfterNotes = OutcomeBox()
+        let transport = RecordingTransport(onMark: { markedAfterNotes.set(notesLanded.settled ? nil : CocoaError(.featureUnsupported)) })
+        let steps = StepLog()
+        let stopping = Task {
+            try await CaptureSession.finishOnDevice(
+                meetingId: DeviceFixtures.meetingId, directory: self.dir,
+                tail: [DeviceFixtures.segment(1, in: self.dir, start: 300)], durationSeconds: DeviceFixtures.fixtureDuration,
+                transcriber: local, transport: transport, recapOpened: true, sleep: { _ in },
+                flushNotes: { _ = try await holdNotes(); notesLanded.set(nil) },
+                onStep: { steps.record($0) })
+        }
+        let flushing = await eventually { notesGate.loads == 1 }
+        let reported = await eventually { !steps.steps.isEmpty }
+        XCTAssertTrue(flushing, "the notes flush started")
+        XCTAssertTrue(reported, "a step is shown while the notes flush is still running; got \(steps.steps)")
+        XCTAssertEqual(transport.log, [], "nothing is marked or sent before the notes land")
+
+        notesGate.open()
+        let result = try await stopping.value
+        XCTAssertTrue(result.transcriptRequested)
+        XCTAssertTrue(markedAfterNotes.settled)
+        XCTAssertNil(markedAfterNotes.error, "the meeting is marked only after the notes land")
+        XCTAssertEqual(steps.steps.last, .submitting)
+    }
+
+    // MARK: Quit
+
+    /// Quit during a device stop waits as long as the stop itself may take, so the transcript is
+    /// written before the app exits; a cloud stop keeps the finalize window.
+    func test_quitDeadline_coversLocalTranscription_onlyWhenTheAudioStaysOnThisMac() {
+        XCTAssertEqual(CaptureSession.quitDeadline(audioMayLeaveMac: true, elapsedSeconds: 3_600), 65)
+        XCTAssertEqual(CaptureSession.quitDeadline(audioMayLeaveMac: false, elapsedSeconds: 600), 245)
+        XCTAssertEqual(CaptureSession.quitDeadline(audioMayLeaveMac: false, elapsedSeconds: 3_600), 425)
+        XCTAssertEqual(CaptureSession.quitDeadline(audioMayLeaveMac: false, elapsedSeconds: 3_600, finalizeTimeout: 10), 375)
+        for elapsed in [0.0, 1_800, 7_200, 21_600] {
+            XCTAssertGreaterThan(
+                CaptureSession.quitDeadline(audioMayLeaveMac: false, elapsedSeconds: elapsed),
+                CaptureSession.localTranscriptionTimeout(durationSeconds: elapsed) + CaptureSession.finalizeTimeout,
+                "\(elapsed)s: quit must outlast the slowest device stop")
         }
     }
 

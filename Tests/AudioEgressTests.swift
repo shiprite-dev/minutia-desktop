@@ -144,6 +144,28 @@ final class AudioEgressTests: XCTestCase {
     /// A device decision with no transcriber (an egress-forbidden-only entry, or a model id the
     /// engine does not know) would record a meeting that can never be transcribed. The session
     /// refuses it before anything is created; the invalid id proves the order.
+    /// A cloud decision recorded under On this Mac only writes a manifest whose audio may not leave
+    /// the Mac; without a transcriber its stop would fall into the upload path. The invalid id proves
+    /// the refusal comes before anything is created.
+    func test_captureSessionStart_refusesACloudDecisionMarkedDeviceOnly_withoutATranscriber_beforeCreatingAnything() {
+        let session = CaptureSession()
+        XCTAssertThrowsError(try session.start(
+            meetingId: "not-a-uuid", seriesId: nil, userId: "u1", client: unreachableClient(),
+            decision: .cloud(.userChoseCloud), deviceOnly: true, language: "en", transcriber: nil)) { error in
+            guard case .transcriptionBlocked(let reason)? = error as? CaptureSession.CaptureError else {
+                return XCTFail("expected transcriptionBlocked, got \(error)")
+            }
+            XCTAssertEqual(reason, .modelNotReady)
+        }
+        XCTAssertThrowsError(try session.start(
+            meetingId: "not-a-uuid", seriesId: nil, userId: "u1", client: unreachableClient(),
+            decision: .cloud(.userChoseCloud), deviceOnly: false, language: "en", transcriber: nil)) { error in
+            guard case .invalidMeetingId? = error as? CaptureSession.CaptureError else {
+                return XCTFail("a cloud recording that may upload needs no transcriber, got \(error)")
+            }
+        }
+    }
+
     func test_captureSessionStart_refusesADeviceDecisionWithoutATranscriber_beforeCreatingAnything() {
         for deviceOnly in [false, true] {
             let session = CaptureSession()

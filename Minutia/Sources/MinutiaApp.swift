@@ -1558,7 +1558,8 @@ final class AppController: NSObject, ObservableObject {
     }
 
     private func waitWhileFinalizing() async {
-        let deadline = Date().addingTimeInterval(CaptureSession.finalizeTimeout + 5)
+        let deadline = Date().addingTimeInterval(CaptureSession.quitDeadline(
+            audioMayLeaveMac: captureSession.audioMayLeaveMac, elapsedSeconds: captureSession.elapsed))
         while case .finalizing = phase, Date() < deadline {
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
@@ -1719,6 +1720,10 @@ final class AppController: NSObject, ObservableObject {
         return (recovered, transcriptionUnavailable, exhausted)
     }
 
+    nonisolated static func recoveryNotificationBody(transcriptionMode: TranscriptionMode) -> String {
+        "A meeting that didn't finish uploading has been recovered. The recap is being prepared."
+    }
+
     /// Posts the "Recovered your recording" notification, carrying the recap URL in userInfo so the
     /// default tap action opens it. Resolves the series id (nil in the manifest for web-triggered
     /// records) before building the URL from the manifest's own instance.
@@ -1729,7 +1734,7 @@ final class AppController: NSObject, ObservableObject {
         }
         let content = UNMutableNotificationContent()
         content.title = "Recovered your recording"
-        content.body = "A meeting that didn't finish uploading has been recovered. The recap is being prepared."
+        content.body = Self.recoveryNotificationBody(transcriptionMode: manifest.transcriptionMode)
         if let seriesId, let meetingId = UUID(uuidString: manifest.meetingId) {
             let url = MinutiaClient.recapURL(
                 instance: manifest.instanceURL, seriesId: seriesId, meetingId: meetingId)
