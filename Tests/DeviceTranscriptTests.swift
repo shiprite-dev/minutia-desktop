@@ -125,4 +125,67 @@ final class DeviceTranscriptTests: XCTestCase {
             engine: "fluidaudio", engineVersion: "0.18.2", model: "parakeet-ultra",
             modelRevision: "95eaa59a39d4394f047a4dc5cce480388a60d1b6", appVersion: "0.3.0", compute: "ane"))
     }
+
+    // MARK: Server limits (web repo src/lib/transcription/device.ts)
+
+    func test_limits_matchTheServerSchema() {
+        XCTAssertEqual(DeviceTranscript.maxBodyBytes, 2 * 1024 * 1024)
+        XCTAssertEqual(DeviceTranscript.maxSegments, 20_000)
+        XCTAssertEqual(DeviceTranscript.maxTotalText, 600_000)
+        XCTAssertEqual(DeviceTranscript.maxSegmentText, 2_000)
+    }
+
+    func test_build_roundsTimesAndConfidenceToTwoDecimals() throws {
+        let transcript = DeviceTranscript.build(source: DeviceFixtures.source, language: "en", durationSeconds: 100, segments: [
+            .init(speaker: "me", start: 1.23456, end: 2.98765, text: "Rounded.", confidence: 0.876543),
+        ])
+        let segment = try XCTUnwrap((try DeviceFixtures.jsonObject(transcript.encoded())["segments"] as? [NSDictionary])?.first)
+        XCTAssertEqual(segment["start"] as? Double, 1.23)
+        XCTAssertEqual(segment["end"] as? Double, 2.99)
+        XCTAssertEqual(segment["confidence"] as? Double, 0.88)
+        let raw = try XCTUnwrap(String(data: transcript.encoded(), encoding: .utf8))
+        XCTAssertFalse(raw.contains("1.23456") || raw.contains("0.876543"), raw)
+    }
+
+    func test_fitted_leavesATranscriptThatAlreadyFitsUnchanged() throws {
+        let fixture = try JSONDecoder().decode(DeviceTranscript.self, from: fixtureData())
+        XCTAssertEqual(fixture.fitted(), fixture)
+    }
+
+    private func words(_ segments: [DeviceTranscript.Segment], _ speaker: String) -> [Substring] {
+        segments.filter { $0.speaker == speaker }.flatMap { $0.text.split(separator: " ") }
+    }
+
+    /// Six hours of short alternating turns: 43,200 segments overflow the count and the 2 MB body,
+    /// while the words themselves fit. Merging same-speaker runs must bring every limit under.
+    func test_fitted_aDenseSixHourMeeting_mergesSameSpeakerRunsUntilEveryLimitFits() throws {
+        let segments = (0..<43_200).map { i -> DeviceTranscript.Segment in
+            let start = Double(i) * 0.5
+            return .init(speaker: (i / 6) % 2 == 0 ? "me" : "them", start: start, end: start + 0.4,
+                         text: "Yes, agreed.", confidence: 0.91)
+        }
+        let dense = DeviceTranscript.build(source: DeviceFixtures.source, language: "en", durationSeconds: 21_600, segments: segments)
+        XCTAssertGreaterThan(dense.segments.count, DeviceTranscript.maxSegments, "precondition: over the count before merging")
+        XCTAssertGreaterThan(try dense.encoded().count, DeviceTranscript.maxBodyBytes, "precondition: over 2 MB before merging")
+
+        let fitted = try XCTUnwrap(dense.fitted(), "same-speaker runs can always be merged under the limits here")
+        XCTAssertLessThanOrEqual(fitted.segments.count, DeviceTranscript.maxSegments)
+        XCTAssertLessThanOrEqual(try fitted.encoded().count, DeviceTranscript.maxBodyBytes)
+        XCTAssertLessThanOrEqual(fitted.segments.reduce(0) { $0 + $1.text.count }, DeviceTranscript.maxTotalText)
+        XCTAssertTrue(fitted.segments.allSatisfy { (1...DeviceTranscript.maxSegmentText).contains($0.text.count) })
+        XCTAssertEqual(words(fitted.segments, "me"), words(dense.segments, "me"), "no word is lost or reordered")
+        XCTAssertEqual(words(fitted.segments, "them"), words(dense.segments, "them"))
+        XCTAssertEqual(fitted.segments.map(\.start), fitted.segments.map(\.start).sorted())
+        XCTAssertEqual(fitted.outcome, "speech")
+        XCTAssertEqual(fitted.durationSeconds, 21_600)
+    }
+
+    func test_fitted_isNil_whenTheWordsAloneExceedTheTextLimit() {
+        let long = String(repeating: "x", count: 1_999)
+        let segments = (0..<301).map { i in
+            DeviceTranscript.Segment(speaker: i % 2 == 0 ? "me" : "them", start: Double(i), end: Double(i) + 0.5, text: long, confidence: 0.9)
+        }
+        let transcript = DeviceTranscript.build(source: DeviceFixtures.source, language: "en", durationSeconds: 400, segments: segments)
+        XCTAssertNil(transcript.fitted(), "602k characters cannot be merged under 600k; the stop must fail, not send a rejected body")
+    }
 }

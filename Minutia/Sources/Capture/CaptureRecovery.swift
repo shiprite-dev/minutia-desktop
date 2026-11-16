@@ -82,7 +82,19 @@ enum CaptureRecovery {
     static let manifestName = "manifest.json"
     static let recordingName = "recording.m4a"
 
-    enum RecoveryError: Error, Equatable { case unreadableRecording, audioStaysOnThisMac }
+    enum RecoveryError: Error, Equatable { case unreadableRecording, audioStaysOnThisMac, transcriptNotFinished }
+
+    static let transcriptName = "transcript.json"
+
+    /// Sends a device meeting's finished `transcript.json` again: marks the meeting waiting for this
+    /// Mac, submits with the stop's backoff, and deletes the directory only after a 2xx. Throws
+    /// `transcriptNotFinished` (no request made, directory kept) when there is no transcript.
+    static func resubmitDeviceTranscript(
+        directory: URL, meetingId: String, transport: any DeviceTranscriptTransport,
+        sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }
+    ) async throws {
+        throw CocoaError(.featureUnsupported)
+    }
 
     /// nil when the file is missing, has no audio track, or has no positive finite duration.
     static func readableAudioDuration(of url: URL) async -> Double? {

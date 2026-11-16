@@ -8,11 +8,14 @@ final class ScriptedEngine: SpeechEngine, @unchecked Sendable {
     private let lock = NSLock()
     private let results: [String: [SpeechSegment]]
     private let failing: Set<String>
+    private let hanging: Set<String>
     private var _calls: [String] = []
 
-    init(_ results: [String: [SpeechSegment]] = [:], failing: Set<String> = []) {
+    /// `hanging` files never finish (until cancelled), like a wedged Core ML call.
+    init(_ results: [String: [SpeechSegment]] = [:], failing: Set<String> = [], hanging: Set<String> = []) {
         self.results = results
         self.failing = failing
+        self.hanging = hanging
     }
 
     var calls: [String] { lock.withLock { _calls } }
@@ -22,6 +25,7 @@ final class ScriptedEngine: SpeechEngine, @unchecked Sendable {
         let name = url.lastPathComponent
         lock.withLock { _calls.append(name) }
         if failing.contains(name) { throw CocoaError(.fileReadCorruptFile) }
+        if hanging.contains(name) { try await Task.sleep(nanoseconds: 3_600_000_000_000) }
         return SpeechResult(modelId: modelId, segments: results[name] ?? [])
     }
 }
@@ -137,10 +141,10 @@ enum DeviceFixtures {
         SpeechSegment(start: start, end: end, text: text, confidence: confidence)
     }
 
-    static func segment(_ seq: Int, in dir: URL, start: Double? = nil) -> SegmentWriter.ClosedSegment {
+    static func segment(_ seq: Int, in dir: URL, start: Double? = nil, frames: Int64 = 48_000) -> SegmentWriter.ClosedSegment {
         SegmentWriter.ClosedSegment(
             seq: seq, micURL: dir.appendingPathComponent("seg-\(seq)-me.m4a"),
-            sysURL: dir.appendingPathComponent("seg-\(seq)-them.m4a"), frames: 48_000, startSeconds: start)
+            sysURL: dir.appendingPathComponent("seg-\(seq)-them.m4a"), frames: frames, startSeconds: start)
     }
 
     /// The engine output behind `Tests/Fixtures/device-transcript.v1.json`: segment 0 at the

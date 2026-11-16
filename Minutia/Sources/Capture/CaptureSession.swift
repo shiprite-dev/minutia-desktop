@@ -40,7 +40,8 @@ final class CaptureSession: ObservableObject {
         let transcriptRequested: Bool
     }
 
-    enum CaptureError: Error { case notRunning, stalled, recordingUnfinished, alreadyRunning, invalidMeetingId, transcriptionBlocked(TranscriptionReason) }
+    enum CaptureError: Error { case notRunning, stalled, recordingUnfinished, alreadyRunning, invalidMeetingId, transcriptionBlocked(TranscriptionReason),
+        transcriptNotSent, localTranscriptionTimedOut, nothingRecorded, transcriptTooLarge }
 
     /// Ceiling for the stop-time network finalize (drain + upload + finalize + transcribe request).
     static let finalizeTimeout: TimeInterval = 60
@@ -340,6 +341,7 @@ final class CaptureSession: ObservableObject {
     nonisolated static func finishOnDevice(
         meetingId: String, directory: URL, tail: [SegmentWriter.ClosedSegment], durationSeconds: Double,
         transcriber: LocalTranscriber, transport: any DeviceTranscriptTransport, recapOpened: Bool,
+        transcribeTimeout: TimeInterval? = nil,
         sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
         onStep: @escaping @Sendable (FinishingStep) async -> Void = { _ in }
     ) async throws -> StopResult {
@@ -357,6 +359,9 @@ final class CaptureSession: ObservableObject {
         Task { await endMeetingIfAllowed { try await transport.endMeeting(meetingId: meetingId) } }
         return StopResult(expectedSegments: nil, transcriptRequested: true)
     }
+
+    /// Ceiling on local transcription at stop; past it the stop fails with a retryable error.
+    nonisolated static func localTranscriptionTimeout(durationSeconds: Double) -> TimeInterval { 0 }
 
     nonisolated static func shouldWatchdogFire(secondsSinceFrames: TimeInterval, threshold: TimeInterval) -> Bool {
         secondsSinceFrames >= threshold

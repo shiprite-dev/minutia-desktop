@@ -6,6 +6,8 @@ import Foundation
 /// after the last job.
 actor LocalTranscriber {
     static let idleUnloadSeconds: TimeInterval = 60
+    /// FluidAudio's `ASRConstants.minimumAudioDurationSeconds`: shorter audio throws `invalidAudioData`.
+    static let minimumSegmentSeconds: Double = 0
 
     /// Contents of `seg-N.transcript.json`: both channels, labeled and on the meeting clock.
     struct SegmentTranscript: Codable, Equatable {

@@ -51,7 +51,7 @@ final class LocalTranscriberTests: XCTestCase {
 
         let file = dir.appendingPathComponent("seg-4.transcript.json")
         let written = await eventually { FileManager.default.fileExists(atPath: file.path) }
-        XCTAssertTrue(written, "the job persists its result so an interrupted meeting can resume (MIN-216)")
+        XCTAssertTrue(written, "the job persists its result so an interrupted meeting can resume from it")
         guard written else { return }
         let saved = try JSONDecoder().decode(LocalTranscriber.SegmentTranscript.self, from: Data(contentsOf: file))
         XCTAssertEqual(saved.seq, 4)
@@ -103,7 +103,8 @@ final class LocalTranscriberTests: XCTestCase {
         XCTAssertFalse(steps.steps.contains(.preparingModel), "got \(steps.steps)")
     }
 
-    func test_theEngineUnloads_afterTheIdleWindowFollowingTheLastJob_andReloadsForTheNext() async throws {
+    /// Segments close every five minutes; unloading in the gaps would reload the model for each one.
+    func test_theEngineStaysLoadedBetweenSegmentsWhileRecording() async throws {
         let gate = LoadGate(open: true)
         let engine = ScriptedEngine(DeviceFixtures.fixtureEngine)
         let local = transcriber(engine, gate: gate, idle: 0.2)
@@ -111,15 +112,51 @@ final class LocalTranscriberTests: XCTestCase {
         local.enqueue(DeviceFixtures.segment(0, in: dir))
         let ranFirst = await eventually { engine.calls.count == 2 }
         XCTAssertTrue(ranFirst)
-        let stillLoaded = await local.isEngineLoaded
-        XCTAssertTrue(stillLoaded, "the engine stays loaded inside the idle window")
-        let unloaded = await eventually { await local.isEngineLoaded == false }
-        XCTAssertTrue(unloaded, "the engine unloads after the idle window")
+        try await Task.sleep(nanoseconds: 700_000_000)
+        let loaded = await local.isEngineLoaded
+        XCTAssertTrue(loaded, "no unload while the meeting is still recording, even past the idle window")
 
         local.enqueue(DeviceFixtures.segment(1, in: dir, start: 300))
         let ranSecond = await eventually { engine.calls.count == 4 }
-        XCTAssertTrue(ranSecond, "a later job reloads the engine")
-        XCTAssertEqual(gate.loads, 2)
+        XCTAssertTrue(ranSecond)
+        XCTAssertEqual(gate.loads, 1, "one load for the whole meeting")
+    }
+
+    func test_theEngineUnloads_theIdleWindowAfterFinish() async throws {
+        let local = transcriber(ScriptedEngine(DeviceFixtures.fixtureEngine), gate: LoadGate(open: true), idle: 0.3)
+        await local.startLoading()
+        local.enqueue(DeviceFixtures.segment(0, in: dir))
+        _ = try await local.finish(tail: [DeviceFixtures.segment(1, in: dir, start: 300)], durationSeconds: DeviceFixtures.fixtureDuration)
+        let loadedRightAfter = await local.isEngineLoaded
+        XCTAssertTrue(loadedRightAfter, "the engine stays inside the idle window after finish")
+        let unloaded = await eventually { await local.isEngineLoaded == false }
+        XCTAssertTrue(unloaded, "the engine unloads once the idle window after finish passes")
+    }
+
+    func test_theShortestTranscribableSegment_matchesFluidAudiosMinimum() {
+        XCTAssertEqual(LocalTranscriber.minimumSegmentSeconds, 0.3)
+    }
+
+    /// FluidAudio throws invalidAudioData under 0.3 s; a tiny tail must not fail the whole meeting.
+    func test_aSegmentShorterThanTheEngineMinimum_isSkipped_withoutFailingFinish() async throws {
+        let engine = ScriptedEngine(DeviceFixtures.fixtureEngine, failing: ["seg-1-me.m4a", "seg-1-them.m4a"])
+        let local = transcriber(engine, gate: LoadGate(open: true))
+        await local.startLoading()
+        local.enqueue(DeviceFixtures.segment(0, in: dir))
+        let shortTail = DeviceFixtures.segment(1, in: dir, start: 300, frames: 14_399)
+        let transcript = try await local.finish(tail: [shortTail], durationSeconds: 300.3)
+        XCTAssertFalse(engine.calls.contains("seg-1-me.m4a"), "a sub-minimum segment never reaches the engine; got \(engine.calls)")
+        XCTAssertFalse(engine.calls.contains("seg-1-them.m4a"))
+        XCTAssertEqual(transcript.segments.map(\.text),
+                       ["Let us start with the open items.", "The vendor contract is still blocked."])
+    }
+
+    func test_aSegmentAtExactlyTheMinimum_isTranscribed() async throws {
+        let engine = ScriptedEngine(DeviceFixtures.fixtureEngine)
+        let local = transcriber(engine, gate: LoadGate(open: true))
+        await local.startLoading()
+        _ = try await local.finish(tail: [DeviceFixtures.segment(1, in: dir, start: 300, frames: 14_400)], durationSeconds: 300.3)
+        XCTAssertEqual(Set(engine.calls), ["seg-1-me.m4a", "seg-1-them.m4a"])
     }
 
     func test_aSilentMeeting_finishesAsNoSpeech_withZeroSegments() async throws {

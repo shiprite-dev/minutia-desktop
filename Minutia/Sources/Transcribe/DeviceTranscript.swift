@@ -45,6 +45,14 @@ struct DeviceTranscript: Codable, Equatable, Sendable {
 
     static let maxSegmentText = 2000
     static let endSlackSeconds = 5.0
+    static let maxBodyBytes = 0
+    static let maxSegments = 0
+    static let maxTotalText = 0
+
+    /// Merges adjacent same-speaker segments (meeting-clock order, merged text at most
+    /// `maxSegmentText`) until the encoded body, the segment count and the total text fit the server
+    /// limits. Unchanged when it already fits; nil when it cannot fit.
+    func fitted() -> DeviceTranscript? { self }
 
     /// Sorts by start (me before them on a tie), drops empty text, clamps times into
     /// `0...durationSeconds`, splits text over `maxSegmentText` at word boundaries, and sets the

@@ -241,4 +241,121 @@ final class DeviceStopTests: XCTestCase {
                            "\(setting): a stored On this Mac only must never be stuck refusing with the picker hidden")
         }
     }
+
+    // MARK: Review fixes
+
+    func test_aFailedSubmit_surfacesAsTranscriptNotSent() async throws {
+        for transport in [RecordingTransport(submitStatuses: [400]), RecordingTransport(failure: URLError(.cannotConnectToHost))] {
+            do {
+                _ = try await finish(await startedTranscriber(), transport)
+                XCTFail("must throw")
+            } catch {
+                guard case .transcriptNotSent? = error as? CaptureSession.CaptureError else {
+                    return XCTFail("device copy needs its own error, got \(error)")
+                }
+            }
+            XCTAssertTrue(dirExists)
+        }
+    }
+
+    /// The server rejects duration_seconds 0, so a stop with no frames makes no request at all.
+    func test_aStopWithNoRecordedFrames_failsClearly_withoutAnyRequest() async throws {
+        let transport = RecordingTransport()
+        do {
+            _ = try await CaptureSession.finishOnDevice(
+                meetingId: DeviceFixtures.meetingId, directory: dir, tail: [], durationSeconds: 0,
+                transcriber: await startedTranscriber(), transport: transport, recapOpened: false, sleep: { _ in })
+            XCTFail("a zero-length recording must not be submitted")
+        } catch {
+            guard case .nothingRecorded? = error as? CaptureSession.CaptureError else { return XCTFail("got \(error)") }
+        }
+        XCTAssertEqual(transport.log, [])
+        XCTAssertTrue(dirExists)
+    }
+
+    func test_localTranscriptionTimeout_scalesWithTheMeeting_withAThreeMinuteFloor() {
+        XCTAssertEqual(CaptureSession.localTranscriptionTimeout(durationSeconds: 0), 180)
+        XCTAssertEqual(CaptureSession.localTranscriptionTimeout(durationSeconds: 1_800), 180)
+        XCTAssertEqual(CaptureSession.localTranscriptionTimeout(durationSeconds: 3_600), 360)
+        XCTAssertEqual(CaptureSession.localTranscriptionTimeout(durationSeconds: 21_600), 2_160)
+    }
+
+    /// A wedged engine ends in a retryable error, never an endless finishing spinner.
+    func test_aWedgedEngine_endsInATimedOutError_withinTheBound_keepingTheDirectory() async throws {
+        let engine = ScriptedEngine(DeviceFixtures.fixtureEngine, hanging: ["seg-1-me.m4a"])
+        let local = await startedTranscriber(engine)
+        let transport = RecordingTransport()
+        let outcome = OutcomeBox()
+        Task {
+            do {
+                _ = try await CaptureSession.finishOnDevice(
+                    meetingId: DeviceFixtures.meetingId, directory: dir,
+                    tail: [DeviceFixtures.segment(1, in: dir, start: 300)], durationSeconds: DeviceFixtures.fixtureDuration,
+                    transcriber: local, transport: transport, recapOpened: false, transcribeTimeout: 0.5, sleep: { _ in })
+                outcome.set(nil)
+            } catch {
+                outcome.set(error)
+            }
+        }
+        let settled = await eventually(timeout: 5) { outcome.settled }
+        XCTAssertTrue(settled, "the stop must settle within the injected bound, not hang")
+        guard case .localTranscriptionTimedOut? = outcome.error as? CaptureSession.CaptureError else {
+            return XCTFail("got \(String(describing: outcome.error))")
+        }
+        XCTAssertEqual(transport.submits, 0)
+        XCTAssertTrue(dirExists)
+    }
+
+    func test_aTranscriptThatCannotFit_failsAsTooLarge_withoutSubmitting() async throws {
+        let long = String(repeating: "x", count: 1_999)
+        let results = Dictionary(uniqueKeysWithValues: (0..<301).map { i in
+            ("seg-\(i)-\(i % 2 == 0 ? "me" : "them").m4a", [DeviceFixtures.speech(0, 0.5, long, 0.9)])
+        })
+        let local = LocalTranscriber(source: DeviceFixtures.source, language: "en",
+                                     loadEngine: LoadGate(open: true).loader(ScriptedEngine(results)))
+        await local.startLoading()
+        for i in 0..<300 { local.enqueue(DeviceFixtures.segment(i, in: dir, start: Double(i))) }
+        let transport = RecordingTransport()
+        do {
+            _ = try await CaptureSession.finishOnDevice(
+                meetingId: DeviceFixtures.meetingId, directory: dir,
+                tail: [DeviceFixtures.segment(300, in: dir, start: 300)], durationSeconds: 400,
+                transcriber: local, transport: transport, recapOpened: false, sleep: { _ in })
+            XCTFail("must throw")
+        } catch {
+            guard case .transcriptTooLarge? = error as? CaptureSession.CaptureError else { return XCTFail("got \(error)") }
+        }
+        XCTAssertEqual(transport.submits, 0)
+        XCTAssertTrue(dirExists)
+    }
+
+    func test_cancellingDuringBackoff_makesNoFurtherAttempts() async throws {
+        let transport = RecordingTransport(submitStatuses: [409])
+        let sleeps = SleepLog()
+        let submitting = Task {
+            try await CaptureSession.submitDeviceTranscript(
+                meetingId: DeviceFixtures.meetingId, body: Data("{}".utf8), transport: transport,
+                sleep: { seconds in
+                    sleeps.record(seconds)
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                })
+        }
+        let waiting = await eventually { sleeps.waits.count == 1 }
+        XCTAssertTrue(waiting)
+        submitting.cancel()
+        let started = Date()
+        let result = await submitting.result
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2)
+        if case .success = result { XCTFail("a cancelled submit must not report success") }
+        XCTAssertEqual(transport.submits, 1, "no attempt after cancellation")
+    }
+}
+
+final class OutcomeBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _error: Error?
+    private var _settled = false
+    var error: Error? { lock.withLock { _error } }
+    var settled: Bool { lock.withLock { _settled } }
+    func set(_ error: Error?) { lock.withLock { _error = error; _settled = true } }
 }

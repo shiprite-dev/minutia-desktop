@@ -58,8 +58,10 @@ final class AudioEgressTests: XCTestCase {
 
     // MARK: Recovery
 
-    func test_recoverySweep_skipsADeviceOrDeviceOnlyRecording_evenOnTheSameInstanceAndUser() {
-        for (mode, deviceOnly) in [(TranscriptionMode.device, false), (.device, true), (.blocked, true), (.cloud, true)] {
+    /// Device recordings go through the sweep to resend their transcript (DeviceResubmitTests); a
+    /// manifest that may not upload and is not a device recording is never picked up.
+    func test_recoverySweep_skipsANonDeviceRecordingThatMayNotUpload_evenOnTheSameInstanceAndUser() {
+        for (mode, deviceOnly) in [(TranscriptionMode.blocked, true), (.cloud, true)] {
             XCTAssertFalse(
                 CaptureRecovery.shouldRecover(
                     manifest: manifest(mode, deviceOnly: deviceOnly), connectedInstance: instance, connectedUserId: "u1"),
@@ -74,13 +76,14 @@ final class AudioEgressTests: XCTestCase {
             manifest: manifest(.cloud, deviceOnly: false), connectedInstance: instance, connectedUserId: "u1"))
     }
 
-    /// The egress refusal comes before every other step, so a device recording with readable segments
-    /// never reaches the segment upload loop, the recording upload, or the readability gate.
-    func test_recover_aDeviceRecording_refusesBeforeAnyUploadOrReadabilityCheck() async throws {
+    /// The egress refusal comes before every other step, so a recording that may not upload never
+    /// reaches the segment upload loop, the recording upload, or the readability gate. Device
+    /// recordings take the resubmit path instead (DeviceResubmitTests).
+    func test_recover_aRecordingThatMayNotUpload_refusesBeforeAnyUploadOrReadabilityCheck() async throws {
         try AudioFixtures.writeFragmentedM4A(to: dir.appendingPathComponent("seg-0-me.m4a"), seconds: 2)
         try AudioFixtures.writeFragmentedM4A(to: dir.appendingPathComponent("seg-0-them.m4a"), seconds: 2)
         try AudioFixtures.writeUnfinalizedM4A(to: dir.appendingPathComponent("recording.m4a"))
-        for (mode, deviceOnly) in [(TranscriptionMode.device, false), (.device, true), (.blocked, true), (.cloud, true)] {
+        for (mode, deviceOnly) in [(TranscriptionMode.blocked, true), (.cloud, true)] {
             do {
                 try await CaptureRecovery.recover(
                     directory: dir, manifest: manifest(mode, deviceOnly: deviceOnly), client: unreachableClient())
