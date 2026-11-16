@@ -102,7 +102,7 @@ struct SettingsView: View {
                     Picker("Transcription", selection: $transcriptionSetting) {
                         ForEach(TranscriptionSetting.allCases, id: \.self) { Text($0.title) }
                     }
-                    TranscriptionReasonText(controller: controller)
+                    TranscriptionReasonText(controller: controller, setting: transcriptionSetting)
                 }
                 ModelStatusText(store: controller.modelStore)
             }
@@ -239,15 +239,17 @@ struct SettingsView: View {
 
 private struct TranscriptionReasonText: View {
     let controller: AppController
+    let setting: TranscriptionSetting
     @ObservedObject private var store: ModelStore
 
-    init(controller: AppController) {
+    init(controller: AppController, setting: TranscriptionSetting) {
         self.controller = controller
+        self.setting = setting
         _store = ObservedObject(wrappedValue: controller.modelStore)
     }
 
     var body: some View {
-        Text(controller.transcriptionDecision().summary)
+        Text(controller.transcriptionDecision(setting: setting).summary)
             .font(.callout)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)

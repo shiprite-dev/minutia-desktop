@@ -51,6 +51,7 @@ final class CaptureSession: ObservableObject {
 
     private var pipeline: CapturePipeline?
     private var queue: UploadQueue?
+    private var audioMayLeaveMac = true
     private var client: MinutiaClient?
     private var meetingId: String?
     private var directory: URL?
@@ -69,6 +70,7 @@ final class CaptureSession: ObservableObject {
     /// so an interrupted meeting can be recovered on the next launch.
     func start(meetingId: String, seriesId: UUID?, userId: String?, client: MinutiaClient,
                decision: TranscriptionDecision, deviceOnly: Bool, language: String?) throws {
+        if case .blocked(let reason) = decision { throw CaptureError.transcriptionBlocked(reason) }
         guard pipeline == nil else { throw CaptureError.alreadyRunning }
         guard let canonical = UUID(uuidString: meetingId) else { throw CaptureError.invalidMeetingId }
 
@@ -120,7 +122,7 @@ final class CaptureSession: ObservableObject {
         // Segments are handed to the queue synchronously on the tick queue, so `finishCapture`'s
         // tick-queue barrier guarantees every enqueue lands before `stop` drains. The main-actor
         // tick only drives UI (elapsed, level, live segment count).
-        pipeline.onSegment = { segment in queue.enqueue(segment) }
+        pipeline.onSegment = manifest.audioMayLeaveMac ? { segment in queue.enqueue(segment) } : { _ in }
         pipeline.onTick = { [weak self] peak, closedCount, framesDrained in
             Task { @MainActor in self?.handleTick(peak: peak, closedCount: closedCount, framesDrained: framesDrained) }
         }
@@ -146,6 +148,7 @@ final class CaptureSession: ObservableObject {
         self.pipeline = pipeline
         self.queue = queue
         self.client = client
+        self.audioMayLeaveMac = manifest.audioMayLeaveMac
         self.meetingId = meetingId
         self.directory = dir
         self.startedAt = Date()
@@ -180,6 +183,12 @@ final class CaptureSession: ObservableObject {
             self.lastFramesAt = nil
             self.reconnecting = false
             self.micUnavailable = false
+        }
+
+        if !audioMayLeaveMac {
+            guard pipeline.finishCapture() != nil else { throw CaptureError.recordingUnfinished }
+            Task { await Self.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId) } }
+            return StopResult(expectedSegments: nil, transcriptRequested: false)
         }
 
         // Without a finished recording the server has nothing to transcribe; throwing keeps the
@@ -332,6 +341,9 @@ final class CaptureSession: ObservableObject {
         }
         if let micError = error as? MicCapture.CaptureError, case .permissionDenied = micError {
             return "Grant microphone access in System Settings to record."
+        }
+        if let captureError = error as? CaptureError, case .transcriptionBlocked(let reason) = captureError {
+            return "Can't record: " + reason.settingsText
         }
         if let captureError = error as? CaptureError, case .stalled = captureError {
             return "Recording stopped: audio capture stalled."

@@ -310,7 +310,10 @@ final class AppController: NSObject, ObservableObject {
     /// Record can begin only from a resting or recoverable phase. Guards a stale detection
     /// notification clicked mid-recording from starting a second server meeting and
     /// overwriting the recording meeting id (which would open the wrong recap).
-    nonisolated static func captureRefusal(for decision: TranscriptionDecision) -> String? { nil }
+    nonisolated static func captureRefusal(for decision: TranscriptionDecision) -> String? {
+        if case .blocked(let reason) = decision { return "Can't record: " + reason.settingsText }
+        return nil
+    }
 
     nonisolated static func canStartRecording(from phase: AppPhase) -> Bool {
         switch phase {
@@ -627,25 +630,49 @@ final class AppController: NSObject, ObservableObject {
     private var startingMeetingId: String?
     private var signingOut = false
     private var captureToken = 0
-    private static let modelHost = SystemModelHost()
-    let modelStore = ModelStore(transfer: HTTPModelTransfer(), host: AppController.modelHost, warmer: ParakeetWarmer())
+    let modelStore = ModelStore(transfer: HTTPModelTransfer(), host: SystemModelHost(), warmer: ParakeetWarmer())
 
-    private func transcriptionInput() -> TranscriptionRouter.Input {
+    private func transcriptionInput(setting: TranscriptionSetting) -> TranscriptionRouter.Input {
         let defaults = UserDefaults.standard
         return TranscriptionRouter.Input(
-            isAppleSilicon: Self.modelHost.isAppleSilicon,
-            osVersion: Self.modelHost.osVersion,
+            isAppleSilicon: modelStore.host.isAppleSilicon,
+            osVersion: modelStore.host.osVersion,
             language: TranscriptionRouter.resolveLanguage(
                 meetingLanguage: defaults.string(forKey: TranscriptionRouter.meetingLanguageKey),
                 preferredLanguages: Locale.preferredLanguages),
             manifest: modelStore.manifest,
             healthyRevisions: modelStore.healthyRevisions,
             thermalState: ProcessInfo.processInfo.thermalState,
-            setting: TranscriptionSetting.load(from: defaults),
+            setting: setting,
             deviceRoutingEnabled: TranscriptionRouter.isDeviceRoutingEnabled(defaults))
     }
 
-    func transcriptionDecision() -> TranscriptionDecision { TranscriptionRouter.decide(transcriptionInput()) }
+    func transcriptionDecision(setting: TranscriptionSetting) -> TranscriptionDecision {
+        TranscriptionRouter.decide(transcriptionInput(setting: setting))
+    }
+
+    func transcriptionDecision() -> TranscriptionDecision {
+        transcriptionDecision(setting: TranscriptionSetting.load(from: .standard))
+    }
+
+    private func routeCapture() -> CaptureRouting {
+        let input = transcriptionInput(setting: TranscriptionSetting.load(from: .standard))
+        return CaptureRouting(
+            decision: TranscriptionRouter.decide(input), deviceOnly: input.setting == .onDeviceOnly, language: input.language)
+    }
+
+    private struct CaptureRouting {
+        let decision: TranscriptionDecision
+        let deviceOnly: Bool
+        let language: String?
+    }
+
+    private func refuseCapture(_ routing: CaptureRouting, meetingId: UUID?) -> Bool {
+        guard let message = Self.captureRefusal(for: routing.decision) else { return false }
+        apply(.failed(message))
+        report(.failed, meetingId: meetingId, reason: "transcription_blocked")
+        return true
+    }
 
     private var canBeginRecording: Bool { !startInFlight && !signingOut && Self.canStartRecording(from: phase) }
 
@@ -1058,6 +1085,8 @@ final class AppController: NSObject, ObservableObject {
         }
         guard let seriesId = selectedSeriesId else { return }
         let instance = client.instance
+        let routing = routeCapture()
+        if refuseCapture(routing, meetingId: nil) { return }
         startInFlight = true
         Task {
             defer { startInFlight = false }
@@ -1066,7 +1095,7 @@ final class AppController: NSObject, ObservableObject {
                 let meeting = try await client.startOrJoinMeeting(seriesId: seriesId)
                 meetingId = meeting.id
                 try await launchCapture(
-                    meetingId: meeting.id.uuidString, seriesId: seriesId, announce: false, client: client)
+                    meetingId: meeting.id.uuidString, seriesId: seriesId, announce: false, client: client, routing: routing)
             } catch CaptureSession.CaptureError.alreadyRunning {
                 return
             } catch {
@@ -1098,6 +1127,8 @@ final class AppController: NSObject, ObservableObject {
             apply(.failed(CaptureSession.failureMessage(for: MicCapture.CaptureError.permissionDenied)))
             return
         }
+        let routing = routeCapture()
+        if refuseCapture(routing, meetingId: id) { return }
         let seriesId = claim.flatMap { UUID(uuidString: $0.seriesId) }
         startInFlight = true
         startingMeetingId = meetingId
@@ -1107,7 +1138,7 @@ final class AppController: NSObject, ObservableObject {
                 startingMeetingId = nil
             }
             do {
-                try await launchCapture(meetingId: meetingId, seriesId: seriesId, announce: claim != nil, client: client)
+                try await launchCapture(meetingId: meetingId, seriesId: seriesId, announce: claim != nil, client: client, routing: routing)
             } catch CaptureSession.CaptureError.alreadyRunning {
                 return
             } catch {
@@ -1118,13 +1149,11 @@ final class AppController: NSObject, ObservableObject {
         }
     }
 
-    private func launchCapture(meetingId: String, seriesId: UUID?, announce: Bool, client: MinutiaClient) async throws {
+    private func launchCapture(meetingId: String, seriesId: UUID?, announce: Bool, client: MinutiaClient, routing: CaptureRouting) async throws {
         let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
-        let input = transcriptionInput()
-        let decision = TranscriptionRouter.decide(input)
         try captureSession.start(
             meetingId: meetingId, seriesId: seriesId, userId: userId, client: client,
-            decision: decision, deviceOnly: input.setting == .onDeviceOnly, language: input.language)
+            decision: routing.decision, deviceOnly: routing.deviceOnly, language: routing.language)
         notepad.begin(meetingId: meetingId, instance: client.instance, userId: userId, client: client)
         recordingMeetingId = UUID(uuidString: meetingId)
         recordingSeriesId = seriesId
@@ -1439,12 +1468,12 @@ final class AppController: NSObject, ObservableObject {
         }
         Task {
             do {
-                _ = try await captureSession.stop(flushNotes: { [notepad] in try await notepad.flushNow() }, recapOpened: early)
+                let result = try await captureSession.stop(flushNotes: { [notepad] in try await notepad.flushNow() }, recapOpened: early)
                 recordingMeetingId = nil
                 recordingSeriesId = nil
                 recordingInstance = nil
                 apply(.finalized)
-                if !early, let meetingId, let instance, Self.opensRecap(for: reason) {
+                if !early, result.transcriptRequested, let meetingId, let instance, Self.opensRecap(for: reason) {
                     await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance)
                 }
             } catch {
@@ -1555,7 +1584,8 @@ final class AppController: NSObject, ObservableObject {
     nonisolated static func recoveryOutcome(for error: Error?) -> RecoveryOutcome {
         guard let error else { return .recovered }
         if case MinutiaClientError.featureUnavailable = error { return .transcriptionUnavailable }
-        if error as? CaptureRecovery.RecoveryError == .unreadableRecording { return .unreadable }
+        if let recoveryError = error as? CaptureRecovery.RecoveryError,
+           recoveryError == .unreadableRecording || recoveryError == .audioStaysOnThisMac { return .unreadable }
         return .retryLater
     }
 

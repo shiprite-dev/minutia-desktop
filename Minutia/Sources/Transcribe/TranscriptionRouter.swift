@@ -100,7 +100,8 @@ enum TranscriptionRouter {
     static func resolveLanguage(meetingLanguage: String?, preferredLanguages: [String]) -> String? {
         let raw = meetingLanguage.flatMap { $0.isEmpty ? nil : $0 } ?? preferredLanguages.first
         guard let raw, let code = Locale.Language(identifier: raw).languageCode, code.isISOLanguage else { return nil }
-        return code.identifier
+        // ISO 639 special codes, not languages
+        return ["und", "mul", "zxx", "mis"].contains(code.identifier) ? nil : code.identifier
     }
 
     static func decide(_ input: Input) -> TranscriptionDecision {
@@ -116,12 +117,8 @@ enum TranscriptionRouter {
         guard let entry = input.manifest.entries.first(where: {
             !$0.egressForbiddenOnly && $0.languages.contains(language)
         }) else { return .unsupportedLanguage }
-        guard isAtLeast(input.osVersion, entry.minimumOS) else { return .unsupportedOS }
+        guard input.osVersion.isAtLeast(entry.minimumOS) else { return .unsupportedOS }
         guard input.healthyRevisions.contains(entry.revision) else { return .modelNotReady }
         return input.thermalState == .critical ? .thermalCritical : nil
-    }
-
-    private static func isAtLeast(_ os: OperatingSystemVersion, _ minimum: OperatingSystemVersion) -> Bool {
-        (os.majorVersion, os.minorVersion, os.patchVersion) >= (minimum.majorVersion, minimum.minorVersion, minimum.patchVersion)
     }
 }

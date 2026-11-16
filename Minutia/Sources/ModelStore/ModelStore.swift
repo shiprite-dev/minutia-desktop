@@ -81,7 +81,7 @@ final class ModelStore: ObservableObject {
     let manifest: ModelManifest
     let root: URL
     private let transfer: ModelTransfer
-    private let host: ModelHost
+    let host: ModelHost
     private let warmer: ModelWarmer
     private let defaults: UserDefaults
 
@@ -155,7 +155,7 @@ final class ModelStore: ObservableObject {
     private func run(_ language: String) async {
         guard host.isAppleSilicon else { return status = .blocked(.intelMac) }
         guard let entry = manifest.entry(forLanguage: language) else { return status = .blocked(.noEntryForLanguage) }
-        guard Self.isAtLeast(host.osVersion, entry.minimumOS) else { return status = .blocked(.unsupportedOS) }
+        guard host.osVersion.isAtLeast(entry.minimumOS) else { return status = .blocked(.unsupportedOS) }
         let healthy = isHealthy(entry)
         if recording {
             if !healthy { status = .blocked(.recording) }
@@ -254,10 +254,6 @@ final class ModelStore: ObservableObject {
         let keep = Set(manifest.entries.map(\.revision))
         let stale = (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
         for url in stale where !keep.contains(url.lastPathComponent) { try? FileManager.default.removeItem(at: url) }
-    }
-
-    private static func isAtLeast(_ a: OperatingSystemVersion, _ b: OperatingSystemVersion) -> Bool {
-        (a.majorVersion, a.minorVersion, a.patchVersion) >= (b.majorVersion, b.minorVersion, b.patchVersion)
     }
 
     private nonisolated static func size(of url: URL) -> Int64 {

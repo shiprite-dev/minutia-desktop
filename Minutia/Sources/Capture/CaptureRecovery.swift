@@ -64,12 +64,12 @@ struct CaptureManifest: Codable, Equatable {
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         recoveryAttempts = try c.decodeIfPresent(Int.self, forKey: .recoveryAttempts) ?? 0
         notified = try c.decodeIfPresent(Bool.self, forKey: .notified) ?? false
-        transcriptionMode = (try? c.decodeIfPresent(TranscriptionMode.self, forKey: .transcriptionMode)).flatMap { $0 } ?? .cloud
+        transcriptionMode = ((try? c.decodeIfPresent(TranscriptionMode.self, forKey: .transcriptionMode)) ?? nil) ?? .cloud
         deviceOnly = try c.decodeIfPresent(Bool.self, forKey: .deviceOnly) ?? false
         language = try c.decodeIfPresent(String.self, forKey: .language)
     }
 
-    var audioMayLeaveMac: Bool { true }
+    var audioMayLeaveMac: Bool { transcriptionMode == .cloud && !deviceOnly }
 }
 
 /// Startup salvage for capture directories left behind by a quit, crash, or fatal mid-recording.
@@ -144,6 +144,7 @@ enum CaptureRecovery {
     nonisolated static func shouldRecover(
         manifest: CaptureManifest, connectedInstance: URL, connectedUserId: String?
     ) -> Bool {
+        guard manifest.audioMayLeaveMac else { return false }
         let manifestInstance = InstanceConfig.normalize(manifest.instanceURL.absoluteString) ?? manifest.instanceURL
         let connected = InstanceConfig.normalize(connectedInstance.absoluteString) ?? connectedInstance
         guard manifestInstance == connected else { return false }
@@ -164,6 +165,7 @@ enum CaptureRecovery {
         directory: URL, manifest: CaptureManifest, client: MinutiaClient,
         flushNotes: @escaping @Sendable () async throws -> Void = {}
     ) async throws {
+        guard manifest.audioMayLeaveMac else { throw RecoveryError.audioStaysOnThisMac }
         let recordingURL = directory.appendingPathComponent(recordingName)
         guard let duration = await readableAudioDuration(of: recordingURL) else { throw RecoveryError.unreadableRecording }
 
