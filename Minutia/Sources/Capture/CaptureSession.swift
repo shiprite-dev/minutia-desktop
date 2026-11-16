@@ -76,7 +76,7 @@ final class CaptureSession: ObservableObject {
                decision: TranscriptionDecision, deviceOnly: Bool, language: String?,
                transcriber: LocalTranscriber? = nil) throws {
         if case .blocked(let reason) = decision { throw CaptureError.transcriptionBlocked(reason) }
-        if decision == .device, transcriber == nil { throw CaptureError.transcriptionBlocked(.modelNotReady) }
+        if transcriber == nil, decision.mode != .cloud || deviceOnly { throw CaptureError.transcriptionBlocked(.modelNotReady) }
         guard pipeline == nil else { throw CaptureError.alreadyRunning }
         guard let canonical = UUID(uuidString: meetingId) else { throw CaptureError.invalidMeetingId }
 
@@ -325,6 +325,7 @@ final class CaptureSession: ObservableObject {
             var failure: Error?
             do { status = try await transport.submitDeviceTranscript(meetingId: meetingId, body: body) } catch { failure = error }
             if let status, (200...299).contains(status) { return }
+            if let status, (400...499).contains(status), ![401, 403, 408, 409, 429].contains(status) { throw CaptureError.transcriptRejected }
             let retryable: Bool
             if let status {
                 retryable = status == 409 || [.authExpired, .transientRetryable].contains(MinutiaClient.classify(status: status, body: nil))
@@ -351,8 +352,8 @@ final class CaptureSession: ObservableObject {
         flushNotes: @escaping @Sendable () async throws -> Void = {},
         onStep: @escaping @Sendable (FinishingStep) async -> Void = { _ in }
     ) async throws -> StopResult {
-        try? await flushNotes()
         guard durationSeconds > 0 else { throw CaptureError.nothingRecorded }
+        async let notesFlushed: Void = { try? await flushNotes() }()
         let transcript: DeviceTranscript
         do {
             transcript = try await transcribeBounded(seconds: transcribeTimeout ?? localTranscriptionTimeout(durationSeconds: durationSeconds)) {
@@ -364,6 +365,7 @@ final class CaptureSession: ObservableObject {
         }
         guard let fitted = transcript.fitted() else { throw CaptureError.transcriptTooLarge }
         let body = try fitted.encoded()
+        await notesFlushed
         try body.write(to: directory.appendingPathComponent(CaptureRecovery.transcriptName), options: .atomic)
         try? await transport.markAwaitingDeviceTranscript(meetingId: meetingId, durationSeconds: fitted.durationSeconds)
         await onStep(.submitting)
@@ -371,6 +373,8 @@ final class CaptureSession: ObservableObject {
             try await withTimeout(seconds: finalizeTimeout) {
                 try await submitDeviceTranscript(meetingId: meetingId, body: body, transport: transport, sleep: sleep)
             }
+        } catch CaptureError.transcriptRejected {
+            throw CaptureError.transcriptRejected
         } catch {
             throw CaptureError.transcriptNotSent
         }
@@ -383,7 +387,7 @@ final class CaptureSession: ObservableObject {
     /// How long Quit waits for a stop already in flight.
     nonisolated static func quitDeadline(audioMayLeaveMac: Bool, elapsedSeconds: TimeInterval,
                                          finalizeTimeout: TimeInterval = CaptureSession.finalizeTimeout) -> TimeInterval {
-        finalizeTimeout + 5
+        (audioMayLeaveMac ? 0 : localTranscriptionTimeout(durationSeconds: elapsedSeconds)) + finalizeTimeout + 5
     }
 
     /// Ceiling on local transcription at stop; past it the stop fails with a retryable error.

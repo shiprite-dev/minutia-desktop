@@ -44,7 +44,6 @@ struct DeviceTranscript: Codable, Equatable, Sendable {
     let segments: [Segment]
 
     static let maxSegmentText = 2000
-    static let endSlackSeconds = 5.0
     static let maxBodyBytes = 2_097_152
     static let maxSegments = 20_000
     static let maxTotalText = 600_000

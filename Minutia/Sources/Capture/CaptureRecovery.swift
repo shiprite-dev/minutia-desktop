@@ -99,6 +99,8 @@ enum CaptureRecovery {
         }
         do {
             try await CaptureSession.submitDeviceTranscript(meetingId: meetingId, body: data, transport: transport, sleep: sleep)
+        } catch CaptureSession.CaptureError.transcriptRejected {
+            throw CaptureSession.CaptureError.transcriptRejected
         } catch {
             throw CaptureSession.CaptureError.transcriptNotSent
         }

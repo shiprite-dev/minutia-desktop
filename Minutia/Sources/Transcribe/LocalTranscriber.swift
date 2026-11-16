@@ -151,9 +151,9 @@ actor LocalTranscriber {
     /// Reports `.preparingModel` while the engine is still loading and `.transcribing` as jobs finish.
     func finish(tail: [SegmentWriter.ClosedSegment], durationSeconds: Double,
                 onStep: @escaping @Sendable (CaptureSession.FinishingStep) async -> Void = { _ in }) async throws -> DeviceTranscript {
-        if engine == nil { await onStep(.preparingModel) }
         tail.forEach(enqueue)
         let all = intakeLock.withLock { jobs }
+        await onStep(engine == nil ? .preparingModel : .transcribing(completed: 0, total: all.count))
         var segments: [DeviceTranscript.Segment] = []
         for (index, job) in all.enumerated() {
             segments += try await job.value

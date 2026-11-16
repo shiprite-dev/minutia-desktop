@@ -444,7 +444,7 @@ final class AppController: NSObject, ObservableObject {
         }
         switch error as? CaptureSession.CaptureError {
         case .transcriptNotSent?: return "Could not send the transcript. Retry to send it again."
-        case .localTranscriptionTimedOut?, .transcriptTooLarge?: return Self.deviceTranscriptFailure
+        case .localTranscriptionTimedOut?, .transcriptTooLarge?, .transcriptRejected?: return Self.deviceTranscriptFailure
         case .nothingRecorded?: return "Nothing was recorded, so there is no transcript to send."
         default: break
         }
@@ -1620,6 +1620,7 @@ final class AppController: NSObject, ObservableObject {
         if case MinutiaClientError.featureUnavailable = error { return .transcriptionUnavailable }
         if let recoveryError = error as? CaptureRecovery.RecoveryError,
            recoveryError == .unreadableRecording || recoveryError == .audioStaysOnThisMac { return .unreadable }
+        if case CaptureSession.CaptureError.transcriptRejected? = error as? CaptureSession.CaptureError { return .unreadable }
         return .retryLater
     }
 
@@ -1721,7 +1722,9 @@ final class AppController: NSObject, ObservableObject {
     }
 
     nonisolated static func recoveryNotificationBody(transcriptionMode: TranscriptionMode) -> String {
-        "A meeting that didn't finish uploading has been recovered. The recap is being prepared."
+        transcriptionMode == .device
+            ? "A meeting transcribed on this Mac has been sent."
+            : "A meeting that didn't finish uploading has been recovered. The recap is being prepared."
     }
 
     /// Posts the "Recovered your recording" notification, carrying the recap URL in userInfo so the
