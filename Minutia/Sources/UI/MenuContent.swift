@@ -53,10 +53,26 @@ struct MenuContent: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
+            ModelStatusRow(store: controller.modelStore)
             Divider()
             Footer(updater: updater)
         }
         .frame(width: 320)
+    }
+}
+
+private struct ModelStatusRow: View {
+    @ObservedObject var store: ModelStore
+
+    var body: some View {
+        if let label = store.status.menuLabel {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 }
 
