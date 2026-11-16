@@ -98,7 +98,8 @@ struct ModelManifest: Sendable {
             ],
             languages: ["ja"],
             minimumOS: OperatingSystemVersion(majorVersion: 14, minorVersion: 4, patchVersion: 0),
-            guardFloor: 0
+            guardFloor: 0,
+            egressForbiddenOnly: true
         ),
     ])
 }

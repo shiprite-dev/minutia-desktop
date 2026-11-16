@@ -16,10 +16,16 @@ enum TranscriptionSetting: String, CaseIterable {
     static let defaultsKey = "app.minutia.transcriptionSetting"
 
     static func load(from defaults: UserDefaults) -> TranscriptionSetting {
-        .cloud
+        defaults.string(forKey: defaultsKey).flatMap(TranscriptionSetting.init(rawValue:)) ?? .automatic
     }
 
-    var title: String { "" }
+    var title: String {
+        switch self {
+        case .automatic: "Automatic"
+        case .onDeviceOnly: "On this Mac only"
+        case .cloud: "Cloud"
+        }
+    }
 }
 
 enum TranscriptionReason: String, CaseIterable {
@@ -33,7 +39,18 @@ enum TranscriptionReason: String, CaseIterable {
     case deviceRoutingOff
 
     /// Plain-language line shown in Settings under the picker.
-    var settingsText: String { "" }
+    var settingsText: String {
+        switch self {
+        case .intelMac: "This Mac can't run the on-device model."
+        case .unsupportedOS: "This version of macOS is too old for the on-device model."
+        case .modelNotReady: "The on-device model is still being set up."
+        case .unsupportedLanguage: "The on-device model doesn't cover this language."
+        case .unknownLanguage: "The meeting language couldn't be determined."
+        case .thermalCritical: "This Mac is too hot to transcribe right now."
+        case .userChoseCloud: "You chose cloud transcription."
+        case .deviceRoutingOff: "On-device transcription isn't available yet."
+        }
+    }
 }
 
 enum TranscriptionDecision: Equatable {
@@ -41,10 +58,22 @@ enum TranscriptionDecision: Equatable {
     case cloud(TranscriptionReason)
     case blocked(TranscriptionReason)
 
-    var mode: TranscriptionMode { .blocked }
+    var mode: TranscriptionMode {
+        switch self {
+        case .device: .device
+        case .cloud: .cloud
+        case .blocked: .blocked
+        }
+    }
 
     /// Settings line: the current mode, plus the reason when it is not on this Mac.
-    var summary: String { "" }
+    var summary: String {
+        switch self {
+        case .device: "Meetings are transcribed on this Mac."
+        case .cloud(let reason): "Meetings are transcribed in the cloud. " + reason.settingsText
+        case .blocked(let reason): "Meetings can't be transcribed right now. " + reason.settingsText
+        }
+    }
 }
 
 enum TranscriptionRouter {
@@ -65,14 +94,34 @@ enum TranscriptionRouter {
     static let deviceRoutingEnabledByDefault = false
 
     static func isDeviceRoutingEnabled(_ defaults: UserDefaults) -> Bool {
-        false
+        defaults.object(forKey: deviceRoutingKey) as? Bool ?? deviceRoutingEnabledByDefault
     }
 
     static func resolveLanguage(meetingLanguage: String?, preferredLanguages: [String]) -> String? {
-        nil
+        let raw = meetingLanguage.flatMap { $0.isEmpty ? nil : $0 } ?? preferredLanguages.first
+        guard let raw, let code = Locale.Language(identifier: raw).languageCode, code.isISOLanguage else { return nil }
+        return code.identifier
     }
 
     static func decide(_ input: Input) -> TranscriptionDecision {
-        .blocked(.thermalCritical)
+        if input.setting == .cloud { return .cloud(.userChoseCloud) }
+        guard let reason = failure(input) else { return .device }
+        return input.setting == .automatic ? .cloud(reason) : .blocked(reason)
+    }
+
+    private static func failure(_ input: Input) -> TranscriptionReason? {
+        guard input.deviceRoutingEnabled else { return .deviceRoutingOff }
+        guard input.isAppleSilicon else { return .intelMac }
+        guard let language = input.language else { return .unknownLanguage }
+        guard let entry = input.manifest.entries.first(where: {
+            !$0.egressForbiddenOnly && $0.languages.contains(language)
+        }) else { return .unsupportedLanguage }
+        guard isAtLeast(input.osVersion, entry.minimumOS) else { return .unsupportedOS }
+        guard input.healthyRevisions.contains(entry.revision) else { return .modelNotReady }
+        return input.thermalState == .critical ? .thermalCritical : nil
+    }
+
+    private static func isAtLeast(_ os: OperatingSystemVersion, _ minimum: OperatingSystemVersion) -> Bool {
+        (os.majorVersion, os.minorVersion, os.patchVersion) >= (minimum.majorVersion, minimum.minorVersion, minimum.patchVersion)
     }
 }

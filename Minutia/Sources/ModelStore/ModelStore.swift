@@ -126,7 +126,7 @@ final class ModelStore: ObservableObject {
         return entry
     }
 
-    var healthyRevisions: Set<String> { [] }
+    var healthyRevisions: Set<String> { Set(manifest.entries.filter(isHealthy).map(\.revision)) }
 
     func recordingDidStart() {
         recording = true

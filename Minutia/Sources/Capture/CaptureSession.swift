@@ -67,7 +67,8 @@ final class CaptureSession: ObservableObject {
     /// up asynchronously inside the pipeline so a permission prompt never blocks the caller. The
     /// capture directory lives under Application Support (durable across quit/crash) with a manifest
     /// so an interrupted meeting can be recovered on the next launch.
-    func start(meetingId: String, seriesId: UUID?, userId: String?, client: MinutiaClient) throws {
+    func start(meetingId: String, seriesId: UUID?, userId: String?, client: MinutiaClient,
+               decision: TranscriptionDecision, deviceOnly: Bool, language: String?) throws {
         guard pipeline == nil else { throw CaptureError.alreadyRunning }
         guard let canonical = UUID(uuidString: meetingId) else { throw CaptureError.invalidMeetingId }
 
@@ -84,7 +85,10 @@ final class CaptureSession: ObservableObject {
             seriesId: seriesId?.uuidString,
             instanceURL: client.instance,
             userId: userId,
-            createdAt: Date())
+            createdAt: Date(),
+            transcriptionMode: decision.mode,
+            deviceOnly: deviceOnly,
+            language: language)
         try JSONEncoder().encode(manifest).write(to: dir.appendingPathComponent(CaptureRecovery.manifestName))
 
         captureGeneration += 1

@@ -625,7 +625,25 @@ final class AppController: NSObject, ObservableObject {
     private var startingMeetingId: String?
     private var signingOut = false
     private var captureToken = 0
-    let modelStore = ModelStore(transfer: HTTPModelTransfer(), host: SystemModelHost(), warmer: ParakeetWarmer())
+    private static let modelHost = SystemModelHost()
+    let modelStore = ModelStore(transfer: HTTPModelTransfer(), host: AppController.modelHost, warmer: ParakeetWarmer())
+
+    private func transcriptionInput() -> TranscriptionRouter.Input {
+        let defaults = UserDefaults.standard
+        return TranscriptionRouter.Input(
+            isAppleSilicon: Self.modelHost.isAppleSilicon,
+            osVersion: Self.modelHost.osVersion,
+            language: TranscriptionRouter.resolveLanguage(
+                meetingLanguage: defaults.string(forKey: TranscriptionRouter.meetingLanguageKey),
+                preferredLanguages: Locale.preferredLanguages),
+            manifest: modelStore.manifest,
+            healthyRevisions: modelStore.healthyRevisions,
+            thermalState: ProcessInfo.processInfo.thermalState,
+            setting: TranscriptionSetting.load(from: defaults),
+            deviceRoutingEnabled: TranscriptionRouter.isDeviceRoutingEnabled(defaults))
+    }
+
+    func transcriptionDecision() -> TranscriptionDecision { TranscriptionRouter.decide(transcriptionInput()) }
 
     private var canBeginRecording: Bool { !startInFlight && !signingOut && Self.canStartRecording(from: phase) }
 
@@ -1100,7 +1118,11 @@ final class AppController: NSObject, ObservableObject {
 
     private func launchCapture(meetingId: String, seriesId: UUID?, announce: Bool, client: MinutiaClient) async throws {
         let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
-        try captureSession.start(meetingId: meetingId, seriesId: seriesId, userId: userId, client: client)
+        let input = transcriptionInput()
+        let decision = TranscriptionRouter.decide(input)
+        try captureSession.start(
+            meetingId: meetingId, seriesId: seriesId, userId: userId, client: client,
+            decision: decision, deviceOnly: input.setting == .onDeviceOnly, language: input.language)
         notepad.begin(meetingId: meetingId, instance: client.instance, userId: userId, client: client)
         recordingMeetingId = UUID(uuidString: meetingId)
         recordingSeriesId = seriesId
