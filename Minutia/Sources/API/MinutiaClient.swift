@@ -162,6 +162,24 @@ struct MinutiaClient {
             .execute()
     }
 
+    struct AwaitingDeviceUpdate: Encodable, Equatable {
+        let transcription_status: String
+        let transcription_provider: String
+        let audio_duration_seconds: Int
+    }
+
+    static func awaitingDeviceUpdate(durationSeconds: Double) -> AwaitingDeviceUpdate {
+        AwaitingDeviceUpdate(transcription_status: "", transcription_provider: "", audio_duration_seconds: 0)
+    }
+
+    static func deviceTranscriptRequest(instance: URL, meetingId: String, body: Data, token: String) -> URLRequest {
+        URLRequest(url: instance)
+    }
+
+    func markAwaitingDeviceTranscript(meetingId: String, durationSeconds: Double) async throws {}
+
+    func submitDeviceTranscript(meetingId: String, body: Data) async throws -> Int { 0 }
+
     static func summaryWarmupRequest(instance: URL, meetingId: String, token: String) -> URLRequest {
         bearerRequest(
             instance.appendingPathComponent("api/meetings/\(meetingId.lowercased())/summary/stream"),

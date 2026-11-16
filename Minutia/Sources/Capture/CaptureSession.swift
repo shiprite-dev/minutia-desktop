@@ -264,6 +264,40 @@ final class CaptureSession: ObservableObject {
         !segmentsDropped && enqueued > 0 && registered == enqueued ? enqueued : nil
     }
 
+    /// What a device-mode stop is doing, shown by the finishing view. nil in cloud mode.
+    enum FinishingStep: Equatable, Sendable {
+        case preparingModel
+        case transcribing(completed: Int, total: Int)
+        case submitting
+
+        var label: String { "" }
+    }
+
+    /// Waits between transcript submits after a 409, a 401, a 5xx or a network error.
+    nonisolated static let submitBackoff: [TimeInterval] = []
+
+    /// POSTs the device transcript. A 2xx (a replay included) returns; a 409, 401, retriable 5xx or
+    /// network error retries after each `submitBackoff` wait; anything else, or running out of
+    /// waits, throws.
+    nonisolated static func submitDeviceTranscript(
+        meetingId: String, body: Data, transport: any DeviceTranscriptTransport,
+        sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }
+    ) async throws {
+        throw CocoaError(.featureUnsupported)
+    }
+
+    /// The device-mode stop after capture has finished: marks the meeting as waiting for this Mac,
+    /// finishes local transcription, writes `transcript.json`, submits it, deletes the directory on
+    /// a 2xx, then warms the summary (unless the recap already opened) and ends the meeting.
+    nonisolated static func finishOnDevice(
+        meetingId: String, directory: URL, tail: [SegmentWriter.ClosedSegment], durationSeconds: Double,
+        transcriber: LocalTranscriber, transport: any DeviceTranscriptTransport, recapOpened: Bool,
+        sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
+        onStep: @escaping @Sendable (FinishingStep) async -> Void = { _ in }
+    ) async throws -> StopResult {
+        throw CocoaError(.featureUnsupported)
+    }
+
     nonisolated static func shouldWatchdogFire(secondsSinceFrames: TimeInterval, threshold: TimeInterval) -> Bool {
         secondsSinceFrames >= threshold
     }
