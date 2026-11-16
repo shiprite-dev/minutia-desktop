@@ -605,6 +605,28 @@ final class ModelStoreTests: XCTestCase {
         XCTAssertEqual(fetched.count, Set(fetched).count, "no file is fetched twice: \(fetched)")
     }
 
+    func test_waitersForAnEarlierLanguage_neverOverrideANewerLanguageRequest() async {
+        executionTimeAllowance = 60
+        let manifest = Fixture.manifest()
+        let weight = url("Encoder.mlmodelc/weights/weight.bin", in: en(manifest))
+        let transfer = FakeTransfer(manifest: manifest, gate: (weight, 20))
+        let store = makeStore(manifest: manifest, transfer: transfer)
+
+        let first = Task { await store.prepare(language: "en") }
+        await transfer.waitUntilGateReached()
+        let staleEnglish = Task { await store.prepare(language: "en") }
+        await Task.yield()
+        let japanese = Task { await store.prepare(language: "ja") }
+        await Task.yield()
+        transfer.release()
+        await first.value
+        await staleEnglish.value
+        await japanese.value
+
+        XCTAssertEqual(store.routableEntry(forLanguage: "ja")?.id, "fake-ja", "the newest language request is prepared")
+        XCTAssertEqual(store.status, .ready(revision: manifest.entry(forLanguage: "ja")!.revision))
+    }
+
     func test_recordingStartMidDownload_cancelsTheTransfer_andResumesFromDiskWhenItStops() async {
         let manifest = Fixture.manifest()
         let weight = url("Encoder.mlmodelc/weights/weight.bin", in: en(manifest))
