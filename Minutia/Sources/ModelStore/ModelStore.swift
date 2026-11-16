@@ -108,7 +108,8 @@ final class ModelStore: ObservableObject {
         lastLanguage = language
         if let current = running {
             await current.task.value
-            if current.language == lastLanguage, !current.task.isCancelled { return }
+            guard language == lastLanguage else { return }
+            if current.language == language, !current.task.isCancelled { return }
             return await prepare(language: language)
         }
         let id = UUID()
