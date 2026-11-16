@@ -63,13 +63,42 @@ private final class FakeTransfer: ModelTransfer, @unchecked Sendable {
     private var _requests: [(url: URL, offset: Int64)] = []
     var onFetch: (@Sendable (URL) -> Void)?
 
-    init(manifest: ModelManifest, interruptAfter: [URL: Int] = [:], corrupt: Set<URL> = []) {
+    private var gate: (url: URL, bytes: Int)?
+    private var _gateReached = false
+    private var _released = false
+    private var _cancellations = 0
+
+    /// `gate` holds one fetch of that URL after writing that many bytes, until `release()`, task
+    /// cancellation (throws `CancellationError`, keeping the bytes), or a two-second deadline (then it
+    /// finishes normally, so a store that never cancels fails its assertions instead of hanging).
+    init(manifest: ModelManifest, interruptAfter: [URL: Int] = [:], corrupt: Set<URL> = [],
+         gate: (url: URL, bytes: Int)? = nil) {
         bodies = Fixture.bodies(manifest)
         self.interruptAfter = interruptAfter
         self.corrupt = corrupt
+        self.gate = gate
     }
 
     var requests: [(url: URL, offset: Int64)] { lock.lock(); defer { lock.unlock() }; return _requests }
+    var cancellations: Int { lock.lock(); defer { lock.unlock() }; return _cancellations }
+    private var gateReached: Bool { lock.lock(); defer { lock.unlock() }; return _gateReached }
+    private var released: Bool { lock.lock(); defer { lock.unlock() }; return _released }
+    func release() { lock.lock(); _released = true; lock.unlock() }
+
+    func waitUntilGateReached() async {
+        let deadline = Date().addingTimeInterval(2)
+        while !gateReached, Date() < deadline { try? await Task.sleep(nanoseconds: 2_000_000) }
+    }
+
+    private func append(_ chunk: Data, to partial: URL) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: partial.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if !fm.fileExists(atPath: partial.path) { fm.createFile(atPath: partial.path, contents: nil) }
+        let handle = try FileHandle(forWritingTo: partial)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: chunk)
+        try handle.close()
+    }
 
     func fetch(_ url: URL, appendingTo partial: URL, from offset: Int64,
                progress: @escaping @Sendable (Int64) -> Void) async throws {
@@ -79,17 +108,29 @@ private final class FakeTransfer: ModelTransfer, @unchecked Sendable {
         var body = bodies[url]!
         if corrupt.contains(url) { body = Data(body.map { $0 ^ 0xFF }) }
         let cut = interruptAfter.removeValue(forKey: url)
+        var hold: Int?
+        if let gate, gate.url == url, Int(offset) < gate.bytes {
+            hold = gate.bytes
+            self.gate = nil
+        }
         lock.unlock()
 
+        var start = Int(offset)
+        if let hold {
+            try append(body.subdata(in: start..<hold), to: partial)
+            progress(Int64(hold))
+            start = hold
+            lock.lock(); _gateReached = true; lock.unlock()
+            let deadline = Date().addingTimeInterval(2)
+            while !released, Date() < deadline {
+                do { try await Task.sleep(nanoseconds: 2_000_000) } catch {
+                    lock.lock(); _cancellations += 1; lock.unlock()
+                    throw error
+                }
+            }
+        }
         let end = cut.map { min($0, body.count) } ?? body.count
-        let chunk = body.subdata(in: Int(offset)..<max(Int(offset), end))
-        let fm = FileManager.default
-        try fm.createDirectory(at: partial.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if !fm.fileExists(atPath: partial.path) { fm.createFile(atPath: partial.path, contents: nil) }
-        let handle = try FileHandle(forWritingTo: partial)
-        try handle.seekToEnd()
-        try handle.write(contentsOf: chunk)
-        try handle.close()
+        try append(body.subdata(in: start..<max(start, end)), to: partial)
         progress(Int64(end))
         if cut != nil { throw Interrupted() }
     }
@@ -116,11 +157,15 @@ private final class FakeWarmer: ModelWarmer, @unchecked Sendable {
     private var _cancellations = 0
     private var _gated: Bool
     private let fails: Bool
+    private let ignoresCancellation: Bool
     var onWarm: (@Sendable (URL) -> Void)?
 
-    init(gated: Bool = false, fails: Bool = false) {
+    /// `ignoresCancellation` models a warmer stuck in a Core ML call: it waits out the gate and
+    /// returns normally even when cancelled. A gate gives up after three seconds either way.
+    init(gated: Bool = false, fails: Bool = false, ignoresCancellation: Bool = false) {
         _gated = gated
         self.fails = fails
+        self.ignoresCancellation = ignoresCancellation
     }
 
     var calls: [String] { lock.lock(); defer { lock.unlock() }; return _calls }
@@ -131,11 +176,16 @@ private final class FakeWarmer: ModelWarmer, @unchecked Sendable {
     func warmUp(_ entry: ModelManifest.Entry, at directory: URL) async throws {
         lock.lock(); _calls.append(entry.id); lock.unlock()
         onWarm?(directory)
-        do {
-            while gated { try await Task.sleep(nanoseconds: 2_000_000) }
-        } catch {
-            lock.lock(); _cancellations += 1; lock.unlock()
-            throw error
+        let deadline = Date().addingTimeInterval(3)
+        if ignoresCancellation {
+            while gated, Date() < deadline { usleep(2_000) }
+        } else {
+            do {
+                while gated, Date() < deadline { try await Task.sleep(nanoseconds: 2_000_000) }
+            } catch {
+                lock.lock(); _cancellations += 1; lock.unlock()
+                throw error
+            }
         }
         if fails { throw Failed() }
     }
@@ -516,6 +566,145 @@ final class ModelStoreTests: XCTestCase {
         XCTAssertTrue(transfer.requests.isEmpty)
         XCTAssertEqual(store.status, .blocked(.noEntryForLanguage))
     }
+
+    // MARK: Review fixes
+
+    /// Hangs here spin the main actor, which no in-process watchdog can interrupt; the run is bounded
+    /// by `executionTimeAllowance` with `-test-timeouts-enabled YES` (see the executor DONE WHEN).
+    func test_concurrentPrepares_withAReadyModel_allReturn() async {
+        executionTimeAllowance = 60
+        _ = await readyEnglishStore()
+        let store = makeStore()
+
+        async let a: Void = store.prepare(language: "en")
+        async let b: Void = store.prepare(language: "en")
+        async let c: Void = store.prepare(language: "en")
+        _ = await (a, b, c)
+
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"))
+    }
+
+    func test_concurrentPrepares_duringADownload_allReturn_andFetchEachFileOnce() async {
+        executionTimeAllowance = 60
+        let manifest = Fixture.manifest()
+        let weight = url("Encoder.mlmodelc/weights/weight.bin", in: en(manifest))
+        let transfer = FakeTransfer(manifest: manifest, gate: (weight, 20))
+        let store = makeStore(manifest: manifest, transfer: transfer)
+
+        let first = Task { await store.prepare(language: "en") }
+        await transfer.waitUntilGateReached()
+        let second = Task { await store.prepare(language: "en") }
+        let third = Task { await store.prepare(language: "en") }
+        transfer.release()
+        await first.value
+        await second.value
+        await third.value
+
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"))
+        let fetched = transfer.requests.map(\.url)
+        XCTAssertEqual(fetched.count, Set(fetched).count, "no file is fetched twice: \(fetched)")
+    }
+
+    func test_recordingStartMidDownload_cancelsTheTransfer_andResumesFromDiskWhenItStops() async {
+        let manifest = Fixture.manifest()
+        let weight = url("Encoder.mlmodelc/weights/weight.bin", in: en(manifest))
+        let vocab = url("vocab.json", in: en(manifest))
+        let transfer = FakeTransfer(manifest: manifest, gate: (weight, 20))
+        let store = makeStore(manifest: manifest, transfer: transfer)
+
+        let download = Task { await store.prepare(language: "en") }
+        await transfer.waitUntilGateReached()
+        store.recordingDidStart()
+        await download.value
+
+        XCTAssertEqual(transfer.cancellations, 1, "the in-flight transfer is cancelled")
+        XCTAssertFalse(transfer.requests.contains { $0.url == vocab }, "no further file is fetched while recording")
+        XCTAssertEqual(store.status, .blocked(.recording))
+        XCTAssertNil(store.routableEntry(forLanguage: "en"))
+
+        await store.recordingDidStop()
+
+        XCTAssertEqual(transfer.requests.last { $0.url == weight }?.offset, 20, "resumes from the bytes on disk")
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"))
+    }
+
+    func test_recordingStartDuringWarmUp_showsBlockedRecording_notWarming() async {
+        _ = await readyEnglishStore()
+        var host = FakeHost()
+        host.appBuild = "101"
+        let warmer = FakeWarmer(gated: true)
+        let store = makeStore(host: host, warmer: warmer)
+
+        let launch = Task { await store.prepare(language: "en") }
+        await warmer.waitUntilStarted()
+        store.recordingDidStart()
+        await launch.value
+
+        XCTAssertEqual(store.status, .blocked(.recording))
+    }
+
+    func test_warmUpThatIgnoresCancellation_recordsNeitherHealthNorMarker_whenARecordingStarted() async {
+        let manifest = Fixture.manifest()
+        let warmer = FakeWarmer(gated: true, ignoresCancellation: true)
+        let store = makeStore(manifest: manifest, warmer: warmer)
+
+        let install = Task { await store.prepare(language: "en") }
+        await warmer.waitUntilStarted()
+        store.recordingDidStart()
+        warmer.release()
+        await install.value
+
+        XCTAssertNil(store.routableEntry(forLanguage: "en"), "a warm-up that finished after a recording start is not trusted")
+        XCTAssertEqual(store.status, .blocked(.recording))
+
+        let nextLaunchWarmer = FakeWarmer()
+        let transfer = FakeTransfer(manifest: manifest)
+        await makeStore(manifest: manifest, transfer: transfer, warmer: nextLaunchWarmer).prepare(language: "en")
+        XCTAssertEqual(nextLaunchWarmer.calls, ["fake-en"], "no warm marker was written, so the next launch warms")
+        XCTAssertTrue(transfer.requests.isEmpty, "verified files are kept")
+    }
+
+    func test_failedWarmUpOfAHealthyEntry_clearsHealth_andTheNextPrepareRefetchesTheCorruptFile() async throws {
+        let ready = await readyEnglishStore()
+        let installed = ready.directory(for: en()).appendingPathComponent("Encoder.mlmodelc/weights/weight.bin")
+        try Data(repeating: 0xAB, count: 64).write(to: installed)
+        var host = FakeHost()
+        host.appBuild = "101"
+
+        let broken = makeStore(host: host, warmer: FakeWarmer(fails: true))
+        await broken.prepare(language: "en")
+
+        guard case .failed = broken.status else { return XCTFail("expected failed, got \(broken.status)") }
+        XCTAssertNil(broken.routableEntry(forLanguage: "en"), "a model that fails to load is no longer healthy")
+        XCTAssertNil(makeStore(host: host).routableEntry(forLanguage: "en"), "cleared health survives relaunch")
+
+        let manifest = Fixture.manifest()
+        let transfer = FakeTransfer(manifest: manifest)
+        let healed = makeStore(manifest: manifest, transfer: transfer, host: host)
+        await healed.prepare(language: "en")
+
+        XCTAssertEqual(transfer.requests.map(\.url), [url("Encoder.mlmodelc/weights/weight.bin", in: en(manifest))])
+        XCTAssertEqual(healed.status, .ready(revision: "en-rev-1"))
+    }
+
+    func test_menuLabel_holdsTheLastPercentageThroughVerification_andClearsOnlyAtWarming() async {
+        let store = makeStore()
+        var seen: [ModelStatus] = []
+        let sink = store.$status.sink { seen.append($0) }
+        defer { sink.cancel() }
+
+        await store.prepare(language: "en")
+
+        guard let first = seen.firstIndex(where: { $0.menuLabel != nil }),
+              let warming = seen.firstIndex(of: .warming) else { return XCTFail("\(seen)") }
+        let labels = seen[first..<warming].map(\.menuLabel)
+        XCTAssertFalse(labels.contains(nil), "the menu row never blanks between files: \(seen[first..<warming])")
+        let percents = labels.compactMap { $0?.split(separator: " ").last.flatMap { Int($0.dropLast()) } }
+        XCTAssertEqual(percents, percents.sorted(), "the percentage never goes backwards")
+        XCTAssertEqual(labels.last, "Downloading model 100%")
+        XCTAssertNil(ModelStatus.warming.menuLabel)
+    }
+
 }
 
 private final class LockedFlags: @unchecked Sendable {
