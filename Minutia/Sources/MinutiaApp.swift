@@ -625,6 +625,7 @@ final class AppController: NSObject, ObservableObject {
     private var startingMeetingId: String?
     private var signingOut = false
     private var captureToken = 0
+    let modelStore = ModelStore(transfer: HTTPModelTransfer(), host: SystemModelHost(), warmer: ParakeetWarmer())
 
     private var canBeginRecording: Bool { !startInFlight && !signingOut && Self.canStartRecording(from: phase) }
 
@@ -679,6 +680,7 @@ final class AppController: NSObject, ObservableObject {
     /// Connect step. Idempotent with SignInView's on-appear auto-connect.
     func restoreSession() async {
         try? await authManager.ensureConnected()
+        if authManager.sessionIdentity.email != nil { Task { await modelStore.prepare(language: "en") } }
         // Recover orphaned captures on every launch, not only on a sign-in transition: a warm launch
         // restoring a Keychain session emits no signedIn transition, so a recording orphaned by a
         // prior crash would otherwise sit unrescued across relaunches. Single-flight and self-guarded
@@ -691,7 +693,13 @@ final class AppController: NSObject, ObservableObject {
     private func apply(_ event: AppEvent) {
         let next = phase.next(event)
         guard next != phase else { return }
+        let wasRecording = phase == .recording
         phase = next
+        if next == .recording {
+            modelStore.recordingDidStart()
+        } else if wasRecording {
+            Task { await modelStore.recordingDidStop() }
+        }
         // A pending web-record consent is only actionable from a resting/recoverable phase.
         // Drop it the moment we leave one (recording started by any path, finalizing, or sign-out)
         // so a stale banner cannot linger past the meeting or a sign-out.
@@ -773,6 +781,7 @@ final class AppController: NSObject, ObservableObject {
             syncDetector()
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
             Task { await loadSeries() }
+            Task { await modelStore.prepare(language: "en") }
             runRecovery()
             checkInNow()
         } else {

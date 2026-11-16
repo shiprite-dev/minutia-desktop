@@ -96,6 +96,10 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Transcription") {
+                ModelStatusText(store: controller.modelStore)
+            }
+
             Section("About") {
                 LabeledContent("Version", value: Self.versionString)
                 if updater.updateAvailable {
@@ -223,5 +227,27 @@ struct SettingsView: View {
         let state = SettingsView.loginItemState(SMAppService.mainApp.status)
         launchAtLogin = state != .disabled
         loginRequiresApproval = state == .requiresApproval
+    }
+}
+
+private struct ModelStatusText: View {
+    @ObservedObject var store: ModelStore
+
+    var body: some View {
+        Text(text)
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var text: String {
+        switch store.status {
+        case .idle: "The on-device model has not been set up yet."
+        case .blocked(let reason): reason.settingsText
+        case .downloading: store.status.menuLabel ?? "Downloading the on-device model."
+        case .warming: "Preparing the on-device model."
+        case .ready: "The on-device model is ready."
+        case .failed(let message): message
+        }
     }
 }
