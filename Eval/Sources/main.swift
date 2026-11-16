@@ -84,6 +84,11 @@ func require(_ name: String) throws -> String {
     return value
 }
 
+func secret(_ name: String) throws -> String {
+    guard let value = ProcessInfo.processInfo.environment[name], !value.isEmpty else { throw EvalError("\(name) is not set") }
+    return value
+}
+
 func write<T: Encodable>(_ value: T, to path: String) throws {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -123,10 +128,9 @@ func run() async throws {
             floor = model.guardFloor
             if model == .ja { items = items.filter { $0.lang == "ja" || $0.lang == "en+ja" } }
         } else if engineName == "groq-turbo" {
-            guard let key = ProcessInfo.processInfo.environment["GROQ_API_KEY"], !key.isEmpty else {
-                throw EvalError("GROQ_API_KEY is not set")
-            }
-            engine = GroqEngine(apiKey: key)
+            engine = CloudEngine.groq(apiKey: try secret("GROQ_API_KEY"))
+        } else if engineName == "openrouter-parakeet-ultra" {
+            engine = CloudEngine.openRouter(model: "moondream/parakeet-ultra", apiKey: try secret("OPENROUTER_API_KEY"))
         } else {
             throw EvalError("unknown engine \(engineName)")
         }

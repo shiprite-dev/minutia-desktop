@@ -4,8 +4,11 @@ Usage: python3 -I build_fixtures.py <fixtures-dir> <repo-manifest-path>
 Selection is deterministic so every run yields the same audio and references.
 """
 import csv
+import hashlib
+import html
 import json
 import pathlib
+import re
 import subprocess
 import sys
 import tarfile
@@ -18,6 +21,17 @@ RAW = FIX / "raw"
 REPO_MANIFEST = pathlib.Path(sys.argv[2])
 AMI_EXCERPTS = {"ES2004a": (300.0, 600.0), "IS1009a": (300.0, 600.0)}
 AMI_FULL = "ES2004a"
+YT_DLP = ["uvx", "yt-dlp@2026.10.26", "-q", "-o", str(RAW / "youtube" / "%(id)s.%(ext)s")]
+# Real meetings with human-made captions, all CC BY 3.0. Windows keep each FLAC under the 25 MB cloud upload limit.
+# pcm_sha256 is the hash of the 16 kHz mono s16 excerpt, so a changed upload is skipped with a warning instead of shifting numbers.
+REAL_MEETINGS = [
+    {"id": "dmFENp1-lcM", "lang": "en", "start": 0, "end": 1080,
+     "title": "Interpretation of Staff Meeting", "channel": "CATIE Center",
+     "pcm_sha256": "9aee306791288f22a901d3570ab134be1688722744397829a0e5aab69cfbcab8"},
+    {"id": "FrrrtE9HNOA", "lang": "ja", "start": 1800, "end": 3060,
+     "title": "Civictech Accelerator Program 1st Batch エントリー説明会", "channel": "Code for Japan",
+     "pcm_sha256": "61305aecda65e4356ce30ab3a169c39205048fe16ed460e29a5feafafe7e4394"},
+]
 NITE = "{http://nite.sourceforge.net/}"
 items = []
 
@@ -158,6 +172,62 @@ def fleurs(lang, count, klass, skip=0):
     return paths
 
 
+def vtt_reference(path, start, end, lang):
+    """Plain text of the cues starting inside [start, end): no timing, speaker tags, sound labels or rolling repeats."""
+    def seconds(stamp):
+        h, m, sec = stamp.split(":")
+        return int(h) * 3600 + int(m) * 60 + float(sec)
+
+    lines = []
+    for block in path.read_text().split("\n\n"):
+        rows = block.strip().splitlines()
+        cue = next((i for i, row in enumerate(rows) if "-->" in row), None)
+        if cue is None or not start <= seconds(rows[cue].split("-->")[0].strip()) < end:
+            continue
+        for row in rows[cue + 1:]:
+            row = html.unescape(re.sub(r"<[^>]+>", "", row))
+            row = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", row)
+            row = re.sub(r"^\s*(?:[A-Z][\w .'-]{0,30})?:\s+", "", row).strip()
+            if row and "-->" not in row and not re.fullmatch(r"\d+", row):
+                lines.append(row)
+    return ("" if lang == "ja" else " ").join(lines)
+
+
+def real_meeting(meeting):
+    vid, lang = meeting["id"], meeting["lang"]
+    raw = RAW / "youtube"
+    raw.mkdir(parents=True, exist_ok=True)
+    subs, audio = raw / f"{vid}.{lang}.vtt", raw / f"{vid}.webm"
+    if not subs.exists():
+        subprocess.run([*YT_DLP, "--skip-download", "--write-subs", "--no-write-auto-subs", "--sub-langs", lang,
+                        "--sub-format", "vtt", "--", vid])
+    if not subs.exists():
+        print(f"warning: skipping {vid}, no manual {lang} caption track on YouTube", file=sys.stderr)
+        return
+    if not audio.exists():
+        subprocess.run([*YT_DLP, "-f", "251", "--", vid])
+    if not audio.exists():
+        print(f"warning: skipping {vid}, audio could not be downloaded", file=sys.stderr)
+        return
+    dst = FIX / "real" / f"{vid}.flac"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg("-ss", str(meeting["start"]), "-to", str(meeting["end"]), "-i", str(audio), "-ac", "1", "-ar", "16000",
+           "-sample_fmt", "s16", str(dst))
+    pcm_bytes = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(dst), "-f", "s16le", "-"],
+                               check=True, capture_output=True).stdout
+    digest = hashlib.sha256(pcm_bytes).hexdigest()
+    if meeting["pcm_sha256"] and digest != meeting["pcm_sha256"]:
+        print(f"warning: skipping {vid}, audio changed upstream (pcm sha256 {digest})", file=sys.stderr)
+        return
+    print(f"{vid} pcm sha256 {digest}")
+    add(f"real-{lang}-{vid}", f"real-{lang}-{vid}", "mono", f"real-meeting-{lang}", lang, dst,
+        vtt_reference(subs, meeting["start"], meeting["end"], lang),
+        f"YouTube {vid} \"{meeting['title']}\" by {meeting['channel']}, {meeting['start']}-{meeting['end']} s, "
+        "CC BY 3.0, reference = uploader's manual captions (not YouTube auto captions)")
+    items[-1]["youtube"] = {"id": vid, "title": meeting["title"], "channel": meeting["channel"], "license": "CC BY 3.0",
+                            "captions": "manual", "window": [meeting["start"], meeting["end"]], "pcmSha256": digest}
+
+
 def concat_trim(paths, seconds, dst):
     listing = dst.with_suffix(".txt")
     listing.write_text("".join(f"file '{p}'\n" for p in paths))
@@ -173,6 +243,9 @@ for meeting, (start, end) in AMI_EXCERPTS.items():
 ami(AMI_FULL, 0.0, duration(RAW / f"{AMI_FULL}.Headset-0.wav"), "meeting-full", "full")
 fleurs("de_de", 10, "de")
 fleurs("ja_jp", 5, "ja")
+
+for meeting in REAL_MEETINGS:
+    real_meeting(meeting)
 
 synth = FIX / "synthetic"
 synth.mkdir(parents=True, exist_ok=True)
