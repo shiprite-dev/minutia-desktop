@@ -45,14 +45,54 @@ struct DeviceTranscript: Codable, Equatable, Sendable {
 
     static let maxSegmentText = 2000
     static let endSlackSeconds = 5.0
-    static let maxBodyBytes = 0
-    static let maxSegments = 0
-    static let maxTotalText = 0
+    static let maxBodyBytes = 2_097_152
+    static let maxSegments = 20_000
+    static let maxTotalText = 600_000
 
     /// Merges adjacent same-speaker segments (meeting-clock order, merged text at most
     /// `maxSegmentText`) until the encoded body, the segment count and the total text fit the server
     /// limits. Unchanged when it already fits; nil when it cannot fit.
-    func fitted() -> DeviceTranscript? { self }
+    func fitted() -> DeviceTranscript? {
+        var current = self
+        while !current.fits {
+            guard current.segments.reduce(0, { $0 + $1.text.count }) <= Self.maxTotalText else { return nil }
+            let merged = current.mergedPairs()
+            guard merged.count < current.segments.count else { return nil }
+            current = DeviceTranscript(
+                source: source, language: language, durationSeconds: durationSeconds, outcome: outcome, segments: merged)
+        }
+        return current
+    }
+
+    private var fits: Bool {
+        segments.count <= Self.maxSegments
+            && segments.reduce(0) { $0 + $1.text.count } <= Self.maxTotalText
+            && ((try? encoded().count) ?? .max) <= Self.maxBodyBytes
+    }
+
+    private func mergedPairs() -> [Segment] {
+        var out: [Segment] = []
+        var lastMergedHere = false
+        for segment in segments {
+            if let previous = out.last, !lastMergedHere, previous.speaker == segment.speaker,
+               previous.text.count + 1 + segment.text.count <= Self.maxSegmentText {
+                let weights = (Double(previous.text.count), Double(segment.text.count))
+                let confidence = previous.confidence.flatMap { a in
+                    segment.confidence.map { b in Self.rounded((a * weights.0 + b * weights.1) / (weights.0 + weights.1)) }
+                }
+                out[out.count - 1] = Segment(
+                    speaker: segment.speaker, start: previous.start, end: segment.end,
+                    text: previous.text + " " + segment.text, confidence: confidence)
+                lastMergedHere = true
+            } else {
+                out.append(segment)
+                lastMergedHere = false
+            }
+        }
+        return out
+    }
+
+    private static func rounded(_ value: Double) -> Double { (value * 100).rounded() / 100 }
 
     /// Sorts by start (me before them on a tie), drops empty text, clamps times into
     /// `0...durationSeconds`, splits text over `maxSegmentText` at word boundaries, and sets the
@@ -74,9 +114,13 @@ struct DeviceTranscript: Codable, Equatable, Sendable {
             if x.speaker != y.speaker { return x.speaker == "me" }
             return a.offset < b.offset
         }.map(\.element.segment)
+        let rounded = ordered.map {
+            Segment(speaker: $0.speaker, start: Self.rounded($0.start), end: Self.rounded($0.end), text: $0.text,
+                    confidence: $0.confidence.map(Self.rounded))
+        }
         return DeviceTranscript(
             source: source, language: language, durationSeconds: durationSeconds,
-            outcome: ordered.isEmpty ? "no_speech" : "speech", segments: ordered)
+            outcome: rounded.isEmpty ? "no_speech" : "speech", segments: rounded)
     }
 
     private static func split(_ text: String, start: Double, end: Double) -> [(text: String, start: Double, end: Double)] {

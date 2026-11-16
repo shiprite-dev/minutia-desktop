@@ -317,6 +317,7 @@ final class CaptureSession: ObservableObject {
     ) async throws {
         var attempt = 0
         while true {
+            try Task.checkCancellation()
             var status: Int?
             var failure: Error?
             do { status = try await transport.submitDeviceTranscript(meetingId: meetingId, body: body) } catch { failure = error }
@@ -331,6 +332,7 @@ final class CaptureSession: ObservableObject {
                 throw failure ?? MinutiaClientError.serverError(status: status ?? 0)
             }
             await sleep(submitBackoff[attempt])
+            try Task.checkCancellation()
             attempt += 1
         }
     }
@@ -345,14 +347,22 @@ final class CaptureSession: ObservableObject {
         sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
         onStep: @escaping @Sendable (FinishingStep) async -> Void = { _ in }
     ) async throws -> StopResult {
+        guard durationSeconds > 0 else { throw CaptureError.nothingRecorded }
         async let marked: Void? = try? await transport.markAwaitingDeviceTranscript(meetingId: meetingId, durationSeconds: durationSeconds)
-        let transcript = try await transcriber.finish(tail: tail, durationSeconds: durationSeconds, onStep: onStep)
-        let body = try transcript.encoded()
-        try body.write(to: directory.appendingPathComponent("transcript.json"), options: .atomic)
+        let transcript = try await transcribeBounded(seconds: transcribeTimeout ?? localTranscriptionTimeout(durationSeconds: durationSeconds)) {
+            try await transcriber.finish(tail: tail, durationSeconds: durationSeconds, onStep: onStep)
+        }
+        guard let fitted = transcript.fitted() else { throw CaptureError.transcriptTooLarge }
+        let body = try fitted.encoded()
+        try body.write(to: directory.appendingPathComponent(CaptureRecovery.transcriptName), options: .atomic)
         _ = await marked
         await onStep(.submitting)
-        try await withTimeout(seconds: finalizeTimeout) {
-            try await submitDeviceTranscript(meetingId: meetingId, body: body, transport: transport, sleep: sleep)
+        do {
+            try await withTimeout(seconds: finalizeTimeout) {
+                try await submitDeviceTranscript(meetingId: meetingId, body: body, transport: transport, sleep: sleep)
+            }
+        } catch {
+            throw CaptureError.transcriptNotSent
         }
         try? FileManager.default.removeItem(at: directory)
         if !recapOpened { Task { await transport.warmSummary(meetingId: meetingId) } }
@@ -361,7 +371,39 @@ final class CaptureSession: ObservableObject {
     }
 
     /// Ceiling on local transcription at stop; past it the stop fails with a retryable error.
-    nonisolated static func localTranscriptionTimeout(durationSeconds: Double) -> TimeInterval { 0 }
+    nonisolated static func localTranscriptionTimeout(durationSeconds: Double) -> TimeInterval {
+        max(180, durationSeconds / 10)
+    }
+
+    /// Races the work against a timer with a continuation that resumes once. A task group would
+    /// wait for a wedged child: awaiting an unstructured task's value ignores cancellation.
+    private nonisolated static func transcribeBounded(
+        seconds: TimeInterval, _ work: @escaping @Sendable () async throws -> DeviceTranscript
+    ) async throws -> DeviceTranscript {
+        final class Once: @unchecked Sendable {
+            private let lock = NSLock()
+            private var done = false
+            func first() -> Bool { lock.withLock { defer { done = true }; return !done } }
+        }
+        let once = Once()
+        return try await withCheckedThrowingContinuation { continuation in
+            let job = Task {
+                do {
+                    let transcript = try await work()
+                    if once.first() { continuation.resume(returning: transcript) }
+                } catch {
+                    if once.first() { continuation.resume(throwing: error) }
+                }
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                if once.first() {
+                    job.cancel()
+                    continuation.resume(throwing: CaptureError.localTranscriptionTimedOut)
+                }
+            }
+        }
+    }
 
     nonisolated static func shouldWatchdogFire(secondsSinceFrames: TimeInterval, threshold: TimeInterval) -> Bool {
         secondsSinceFrames >= threshold

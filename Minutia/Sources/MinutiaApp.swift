@@ -440,6 +440,16 @@ final class AppController: NSObject, ObservableObject {
         if case MinutiaClientError.featureUnavailable = error {
             return "Transcription is not enabled for this account on \(host ?? "the server"). Your audio is saved. Ask your workspace admin to enable AI features."
         }
+        switch error as? CaptureSession.CaptureError {
+        case .transcriptNotSent?: return "Could not send the transcript. Retry to send it again."
+        case .localTranscriptionTimedOut?: return "Transcribing on this Mac took too long. The recording is saved on this Mac."
+        case .nothingRecorded?: return "Nothing was recorded, so there is no transcript to send."
+        case .transcriptTooLarge?: return "This meeting's transcript is too large to send. The recording is saved on this Mac."
+        default: break
+        }
+        if case CaptureRecovery.RecoveryError.transcriptNotFinished = error {
+            return "The transcript for this meeting is not finished. The recording is saved on this Mac."
+        }
         if error is TimeoutError {
             return "Finishing the recording timed out. Your audio is saved locally; Retry to finish uploading."
         }

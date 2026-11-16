@@ -7,7 +7,7 @@ import Foundation
 actor LocalTranscriber {
     static let idleUnloadSeconds: TimeInterval = 60
     /// FluidAudio's `ASRConstants.minimumAudioDurationSeconds`: shorter audio throws `invalidAudioData`.
-    static let minimumSegmentSeconds: Double = 0
+    static let minimumSegmentSeconds: Double = 0.3
 
     /// Contents of `seg-N.transcript.json`: both channels, labeled and on the meeting clock.
     struct SegmentTranscript: Codable, Equatable {
@@ -68,7 +68,6 @@ actor LocalTranscriber {
     private func didLoad(_ loaded: any SpeechEngine) {
         engine = loaded
         loadTask = nil
-        if activeCount == 0 { scheduleUnload() }
     }
 
     private func didFailLoad(_ error: Error) {
@@ -102,6 +101,7 @@ actor LocalTranscriber {
     }
 
     private func run(_ segment: SegmentWriter.ClosedSegment) async throws -> [DeviceTranscript.Segment] {
+        guard Double(segment.frames) / MixPlan.sampleRate >= Self.minimumSegmentSeconds else { return [] }
         let engine = try await engineForJob()
         let mine = try await engine.transcribe(.file(segment.micURL))
         let theirs = try await engine.transcribe(.file(segment.sysURL))
@@ -115,8 +115,7 @@ actor LocalTranscriber {
     }
 
     private func jobFinished() {
-        let idle = intakeLock.withLock { activeJobs -= 1; return activeJobs == 0 }
-        if idle { scheduleUnload() }
+        intakeLock.withLock { activeJobs -= 1 }
     }
 
     /// Synchronous hand-off from the capture tick queue.
@@ -151,6 +150,7 @@ actor LocalTranscriber {
             await onStep(.transcribing(completed: index + 1, total: all.count))
         }
         if let loadFailure { throw loadFailure }
+        scheduleUnload()
         return DeviceTranscript.build(source: source, language: language, durationSeconds: durationSeconds, segments: segments)
     }
 }
