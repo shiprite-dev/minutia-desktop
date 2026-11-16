@@ -47,4 +47,19 @@ final class TokenSegmenterTests: XCTestCase {
         XCTAssertEqual(segments.map(\.text), ["go.", "Next"])
         XCTAssertEqual(segments[0].end, 36.5)
     }
+
+    func test_leadingPunctuation_isDropped() {
+        let segments = TokenSegmenter.segments([token(".", 40, 40), token("\u{2581}hi", 41, 41.3)])
+        XCTAssertEqual(segments.map(\.text), ["hi"])
+        XCTAssertEqual(segments[0].start, 41)
+    }
+
+    func test_badTimings_areDroppedOrClamped_andStillEncode() throws {
+        let segments = TokenSegmenter.segments([
+            token("\u{2581}nan", .nan, 1), token("\u{2581}inf", 0, .infinity), token("\u{2581}neg", -1, 0.2),
+            TimedToken(text: "\u{2581}ok", start: 1.0, end: 0.5, confidence: .nan),
+        ])
+        XCTAssertEqual(segments, [SpeechSegment(start: 1.0, end: 1.0, text: "ok", confidence: 0)])
+        XCTAssertNoThrow(try JSONEncoder().encode(segments))
+    }
 }

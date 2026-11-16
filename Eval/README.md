@@ -10,9 +10,19 @@ Eval/run-eval.sh                           # build (Release), run every engine, 
 ENGINES="parakeet-v3" Eval/run-eval.sh     # subset
 ```
 
-Outputs land in `/Volumes/Mango/tmp/minutia-eval-results` (override with `MINUTIA_EVAL_RESULTS`): one
-`transcribe-<engine>.json` per engine, `prepare-<engine>.json` per local model, `results.json` and `report.md`.
-Fixtures, models and the venv default to `/Volumes/Mango/tmp/minutia-eval-{fixtures,models,tools}`.
+Requires Xcode, XcodeGen 2.46+, `ffmpeg`/`ffprobe` (`brew install ffmpeg`) and Python 3.
+
+Everything lands in the gitignored `.eval/` folder at the repo root: `fixtures/`, `models/`, `tools/` (scoring
+venv and normalizer), `DerivedData/` and `results/` (one `transcribe-<engine>.json` per engine,
+`prepare-<engine>.json` per local model, `results.json`, `report.md`). Point any of them elsewhere with
+`MINUTIA_EVAL_DIR`, or individually with `MINUTIA_EVAL_FIXTURES`, `MINUTIA_EVAL_MODELS`, `MINUTIA_EVAL_TOOLS`,
+`MINUTIA_EVAL_RESULTS`, `MINUTIA_EVAL_DERIVED`.
+
+`run-eval.sh` exits non-zero when a gated engine (`parakeet-v3`, `parakeet-ultra`) is missing or any gate fails:
+no item errors, read English WER at most 12, conversational WER at most 20 and within 3 points of an error-free
+Groq run, at least 20x realtime per channel on the full meeting, peak extra RAM under 2 GB, silence yields no
+speech, the English then Japanese splice and every Japanese clip trip the quality guard, and every segment has
+finite timings.
 
 ## Code and model boundary
 

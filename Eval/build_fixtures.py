@@ -194,5 +194,6 @@ add("pink-noise-60s", "pink-noise", "mono", "noise", "none", synth / "pink-noise
 
 manifest = json.dumps({"version": 1, "items": items}, indent=1, ensure_ascii=False) + "\n"
 (FIX / "manifest.json").write_text(manifest)
-REPO_MANIFEST.write_text(manifest)
+if not REPO_MANIFEST.exists() or REPO_MANIFEST.read_text() != manifest:
+    REPO_MANIFEST.write_text(manifest)
 print(f"{len(items)} items, {sum(i['durationSeconds'] for i in items) / 60:.1f} min")

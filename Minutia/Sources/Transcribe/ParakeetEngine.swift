@@ -34,7 +34,7 @@ final class ParakeetEngine: SpeechEngine {
 
         var modelId: String { "\(rawValue)@\(revision.prefix(7))" }
 
-        /// Quality-guard confidence floor from the MIN-211 calibration (30 s windows, 3 s or more of speech).
+        /// Quality-guard confidence floor from the eval calibration (30 s windows, 3 s or more of speech).
         /// English bottoms out at 0.80 (v3) and 0.76 (Ultra, one window; the failing-share rule absorbs it);
         /// Japanese decoded by them tops out at 0.73 and 0.75. The Japanese model is only selected for
         /// Japanese, so it is not guarded.

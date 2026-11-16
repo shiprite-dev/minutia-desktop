@@ -4,14 +4,15 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-FIX=${MINUTIA_EVAL_FIXTURES:-/Volumes/Mango/tmp/minutia-eval-fixtures}
-TOOLS=${MINUTIA_EVAL_TOOLS:-/Volumes/Mango/tmp/minutia-eval-tools}
-MODELS=${MINUTIA_EVAL_MODELS:-/Volumes/Mango/tmp/minutia-eval-models}
-OUT=${MINUTIA_EVAL_RESULTS:-/Volumes/Mango/tmp/minutia-eval-results}
-DERIVED=${MINUTIA_EVAL_DERIVED:-/Volumes/Mango/Developer/DerivedData/MinutiaEval}
+EVAL=${MINUTIA_EVAL_DIR:-$ROOT/.eval}
+FIX=${MINUTIA_EVAL_FIXTURES:-$EVAL/fixtures}
+TOOLS=${MINUTIA_EVAL_TOOLS:-$EVAL/tools}
+MODELS=${MINUTIA_EVAL_MODELS:-$EVAL/models}
+OUT=${MINUTIA_EVAL_RESULTS:-$EVAL/results}
+DERIVED=${MINUTIA_EVAL_DERIVED:-$EVAL/DerivedData}
 ENGINES=${ENGINES:-parakeet-v3 parakeet-ultra parakeet-ja groq-turbo}
-export TMPDIR=${TMPDIR_EVAL:-/Volumes/Mango/tmp/minutia-eval-tmp}
-mkdir -p "$OUT" "$MODELS" "$TMPDIR"
+export MINUTIA_EVAL_FIXTURES=$FIX MINUTIA_EVAL_TOOLS=$TOOLS
+mkdir -p "$OUT" "$MODELS"
 
 [ -f "$FIX/manifest.json" ] || "$ROOT/Eval/fetch-fixtures.sh"
 

@@ -2,9 +2,10 @@
 # Downloads the public CC BY 4.0 sources (sha256 pinned), sets up the scoring venv and builds the fixtures.
 set -euo pipefail
 
-FIX=${MINUTIA_EVAL_FIXTURES:-/Volumes/Mango/tmp/minutia-eval-fixtures}
-TOOLS=${MINUTIA_EVAL_TOOLS:-/Volumes/Mango/tmp/minutia-eval-tools}
 HERE=$(cd "$(dirname "$0")" && pwd)
+EVAL=${MINUTIA_EVAL_DIR:-$HERE/../.eval}
+FIX=${MINUTIA_EVAL_FIXTURES:-$EVAL/fixtures}
+TOOLS=${MINUTIA_EVAL_TOOLS:-$EVAL/tools}
 AMI=https://groups.inf.ed.ac.uk/ami
 FLEURS=https://huggingface.co/datasets/google/fleurs/resolve/70bb2e84b976b7e960aa89f1c648e09c59f894dd/data
 LIBRI=https://huggingface.co/datasets/openslr/librispeech_asr/resolve/71cacbfb7e2354c4226d01e70d77d5fca3d04ba1

@@ -38,7 +38,9 @@ enum TokenSegmenter {
 
     /// Groups SentencePiece tokens ("\u{2581}" or a leading space starts a word) into segments,
     /// breaking at a word start after sentence punctuation or a pause longer than `maxGap`.
-    /// A punctuation token keeps the previous token's end: the decoder can stamp it many seconds later.
+    /// A punctuation token keeps the previous token's end: the decoder can stamp it many seconds later,
+    /// so one with no token before it is dropped. Tokens with non-finite or negative times are dropped
+    /// and an end before the start is clamped to the start.
     static func segments(_ tokens: [TimedToken]) -> [SpeechSegment] {
         var out: [SpeechSegment] = []
         var current: [TimedToken] = []
@@ -54,9 +56,13 @@ enum TokenSegmenter {
             current = []
         }
 
-        for var token in tokens {
-            if let previous = current.last, isPunctuation(token.text) {
-                token = TimedToken(text: token.text, start: previous.end, end: previous.end, confidence: token.confidence)
+        for token in tokens {
+            guard token.start.isFinite, token.end.isFinite, token.start >= 0 else { continue }
+            let confidence = token.confidence.isFinite ? token.confidence : 0
+            var token = TimedToken(text: token.text, start: token.start, end: max(token.end, token.start), confidence: confidence)
+            if isPunctuation(token.text) {
+                guard let previous = current.last else { continue }
+                token = TimedToken(text: token.text, start: previous.end, end: previous.end, confidence: confidence)
             }
             if let previous = current.last,
                token.start - previous.end > maxGap || endsSentence(previous.text, before: token.text) {

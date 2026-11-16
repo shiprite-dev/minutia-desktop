@@ -69,10 +69,8 @@ func directoryBytes(_ url: URL) -> Int64 {
 }
 
 func timed<T>(_ body: () async throws -> T) async rethrows -> (T, Double) {
-    let start = ContinuousClock.now
-    let value = try await body()
-    let elapsed = ContinuousClock.now - start
-    return (value, Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18)
+    let start = Date()
+    return (try await body(), Date().timeIntervalSince(start))
 }
 
 func argument(_ name: String) -> String? {
@@ -138,16 +136,16 @@ func run() async throws {
             let url = fixtures.appendingPathComponent(item.path)
             do {
                 let (result, wall) = try await timed { try await engine.transcribe(.file(url)) }
+                let windows = QualityGuard.windows(result.segments)
                 results.append(ItemResult(id: item.id, durationSeconds: item.durationSeconds, wallSeconds: wall,
                                           xRealtime: item.durationSeconds / wall, noSpeech: result.noSpeech,
-                                          text: result.text, segments: result.segments,
-                                          guardWindows: QualityGuard.windows(result.segments),
-                                          guardFailingWindowStarts: QualityGuard.windows(result.segments).filter { $0.fails(floor: floor) }.map(\.start),
-                                          guardPasses: QualityGuard.passes(result.segments, floor: floor), error: nil))
+                                          text: result.text, segments: result.segments, guardWindows: windows,
+                                          guardFailingWindowStarts: windows.filter { $0.fails(floor: floor) }.map(\.start),
+                                          guardPasses: QualityGuard.passes(windows, floor: floor), error: nil))
             } catch {
                 results.append(ItemResult(id: item.id, durationSeconds: item.durationSeconds, wallSeconds: 0, xRealtime: 0,
-                                          noSpeech: true, text: "", segments: [], guardWindows: [], guardFailingWindowStarts: [],
-                                          guardPasses: true,
+                                          noSpeech: false, text: "", segments: [], guardWindows: [], guardFailingWindowStarts: [],
+                                          guardPasses: false,
                                           error: String(describing: error)))
             }
             FileHandle.standardError.write("\(engineName) \(item.id) done\n".data(using: .utf8)!)

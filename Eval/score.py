@@ -3,6 +3,7 @@
 Usage: python score.py <fixtures-dir> <results-dir> <normalizer-dir>
 """
 import json
+import math
 import pathlib
 import re
 import statistics
@@ -21,6 +22,7 @@ HESITATIONS = re.compile(r"\b(mm-hmm|uh-huh|um+|uh+|hmm+|mm+|mhm|er|erm|ah|huh)\
 LOCAL = ["parakeet-v3", "parakeet-ultra", "parakeet-ja"]
 ENGINES = LOCAL + ["groq-turbo"]
 ENGLISH_CLASSES = ["read-clean", "read-other", "conversational", "conversational-echo", "meeting-full"]
+GATED = ["parakeet-v3", "parakeet-ultra"]
 RAM_BUDGET_MB, SPEED_FLOOR = 2048, 20.0
 
 
@@ -37,7 +39,7 @@ def cer_chars(text):
 
 def errors(ref, hyp, lang):
     if lang == "ja":
-        out = jiwer.process_characters(cer_chars(ref).replace(" ", ""), cer_chars(hyp).replace(" ", "") or "")
+        out = jiwer.process_characters(cer_chars(ref).replace(" ", ""), cer_chars(hyp).replace(" ", ""))
     else:
         r, h = normalize(ref, lang), normalize(hyp, lang)
         if not r.strip():
@@ -61,7 +63,8 @@ for engine, run in runs.items():
                "guardPasses": res["guardPasses"],
                "guardWindows": [dict(w, fails=w["start"] in res["guardFailingWindowStarts"]) for w in res["guardWindows"]], "error": res.get("error"),
                "hypothesis": res["text"], "errors": None,
-               "hasTimings": all(s["end"] >= s["start"] >= 0 for s in res["segments"]) and bool(res["segments"])}
+               "hasTimings": all(math.isfinite(s["start"]) and math.isfinite(s["end"]) and s["end"] >= s["start"] >= 0
+                                 for s in res["segments"])}
         if item["reference"] and not res.get("error"):
             row["errors"] = errors(item["reference"], res["text"], item["lang"])
         rows.append(row)
@@ -94,6 +97,14 @@ def rate(engine, klass, channel="all"):
     return (slices.get(f"{engine}|{klass}|{channel}") or {}).get("errorRate")
 
 
+def below(value, limit):
+    return value is not None and value <= limit
+
+
+def errored(engine):
+    return any(r["error"] for r in rows if r["engine"] == engine)
+
+
 def peak_extra(engine):
     run = runs.get(engine, {})
     return round(run.get("peakFootprintMB", 0) - run.get("baselineFootprintMB", 0), 0) if run else None
@@ -119,7 +130,7 @@ for engine in ["parakeet-v3", "parakeet-ultra"]:
             return None
         pick = lambda q: round(vals[min(len(vals) - 1, int(q * len(vals)))], 3)
         return {"n": len(vals), "min": pick(0), "p5": pick(0.05), "median": round(statistics.median(vals), 3),
-                "p95": pick(0.95), "max": pick(0.9999)}
+                "p95": pick(0.95), "max": round(vals[-1], 3)}
 
     calibration[engine] = {
         "english": {k: stats(english, k) for k in ("meanConfidence", "charsPerSpeechSecond")},
@@ -129,22 +140,27 @@ for engine in ["parakeet-v3", "parakeet-ultra"]:
     }
 
 gates = {}
-for engine in ["parakeet-v3", "parakeet-ultra"]:
+for engine in GATED:
     if engine not in runs:
         continue
     by_id = {r["id"]: r for r in rows if r["engine"] == engine}
     full = [r for r in by_id.values() if r["class"] == "meeting-full"]
-    groq_conv = rate("groq-turbo", "conversational")
+    japanese = [r for r in by_id.values() if r["class"] == "ja"]
+    with_segments = [r for r in by_id.values() if r["segments"]]
+    conv, groq_conv = rate(engine, "conversational"), rate("groq-turbo", "conversational")
+    peak = peak_extra(engine)
     gates[engine] = {
-        "readEnglishWerAtMost12": (rate(engine, "read") or 999) <= 12,
-        "conversationalWerAtMost20": (rate(engine, "conversational") or 999) <= 20,
-        "conversationalWithin3OfGroq": groq_conv is not None and (rate(engine, "conversational") or 999) - groq_conv <= 3,
+        "noItemErrors": not errored(engine),
+        "readEnglishWerAtMost12": below(rate(engine, "read"), 12),
+        "conversationalWerAtMost20": below(conv, 20),
+        "conversationalWithin3OfGroq": ("groq-turbo" in runs and not errored("groq-turbo")
+                                        and conv is not None and groq_conv is not None and conv - groq_conv <= 3),
         "atLeast20xRealtimePerChannel": bool(full) and all(r["xRealtime"] >= SPEED_FLOOR for r in full),
-        "peakExtraRamUnder2GB": (peak_extra(engine) or 1e9) < RAM_BUDGET_MB,
+        "peakExtraRamUnder2GB": peak is not None and peak < RAM_BUDGET_MB,
         "silenceIsNoSpeech": by_id.get("silence-60s", {}).get("noSpeech") is True,
         "splicedTripsGuard": by_id.get("spliced-en-ja", {}).get("guardPasses") is False,
-        "japaneseTripsGuard": all(not r["guardPasses"] for r in by_id.values() if r["class"] == "ja"),
-        "segmentsHaveFiniteTimings": all(r["hasTimings"] for r in by_id.values() if r["segments"]),
+        "japaneseTripsGuard": bool(japanese) and all(not r["guardPasses"] for r in japanese),
+        "segmentsHaveFiniteTimings": bool(with_segments) and all(r["hasTimings"] for r in with_segments),
     }
 
 v3, ultra = rate("parakeet-v3", "conversational"), rate("parakeet-ultra", "conversational")
@@ -179,7 +195,7 @@ for key, s in sorted(slices.items(), key=lambda kv: (ENGINES.index(kv[0].split("
 lines += ["", "## Engines", "", "| Engine | Model | Size MB | Download + first compile s | Load s, new process | Peak extra RAM MB | Timestamps |", "|---|---|---:|---:|---:|---:|---|"]
 for engine, i in engines_info.items():
     lines.append(f"| {engine} | {i['modelId']} | {fmt(i.get('modelSizeMB'))} | {fmt(i.get('downloadAndCompileSeconds'))} | "
-                 f"{fmt(round(i['loadSeconds'], 2) if i['loadSeconds'] else None)} | {fmt(i['peakExtraRamMB'])} | {i['timestamps']} |")
+                 f"{fmt(round(i['loadSeconds'], 2) if i['loadSeconds'] is not None else None)} | {fmt(i['peakExtraRamMB'])} | {i['timestamps']} |")
 lines += ["", "Load in a new process is a Core ML cache miss when this process last loaded a different model or the binary changed; "
           "a warm reload measures about 0.4 s. Peak extra RAM is the process phys_footprint peak minus the pre-load baseline; "
           "memory-mapped model weights and Neural Engine buffers are not in that ledger.",
@@ -197,3 +213,9 @@ lines += ["", f"Ultra becomes default: {'yes' if ultra_default else 'no'} (needs
           "", "## Quality guard calibration (30 s windows with at least 3 s of speech)", "", "```", json.dumps(calibration, indent=1), "```", ""]
 (RESULTS / "report.md").write_text("\n".join(lines))
 print("\n".join(lines))
+
+missing = [e for e in GATED if e not in runs]
+failed = [f"{e}.{name}" for e, g in gates.items() for name, ok in g.items() if not ok]
+if missing or failed:
+    print(f"GATE FAILURE: missing engines {missing}, failed gates {failed}", file=sys.stderr)
+    sys.exit(1)

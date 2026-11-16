@@ -164,7 +164,7 @@ struct SettingsView: View {
     }
 
     static let speechAttribution =
-        "On-device speech recognition: NVIDIA Parakeet TDT 0.6B v3 (CC BY 4.0), Core ML conversion by FluidInference, FluidAudio (Apache 2.0)."
+        "On-device speech recognition: Parakeet Ultra by moondream (CC BY 4.0), a post-training of NVIDIA Parakeet TDT 0.6B v3 (CC BY 4.0); Core ML conversion by FluidInference (CC BY 4.0); FluidAudio (Apache 2.0)."
 
     static var versionString: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"

@@ -2,8 +2,10 @@ import Foundation
 
 /// Flags audio the local model is likely decoding in a language it does not know, by mean token
 /// confidence per 30 s window against a per-model floor (`ParakeetEngine.Model.guardFloor`).
-/// Characters per speech second do not separate English from Japanese in the MIN-211 eval
-/// (Japanese decodes to 9 to 15, English 6 to 23), so they are reported but not gated on.
+/// A recording fails when at least `maxFailingShare` of the judged windows fail, or when two judged
+/// windows in a row fail; a lone failed window in a long meeting is tolerated. Characters per speech
+/// second do not separate English from Japanese in the eval calibration (Japanese decodes to 9 to 15,
+/// English 6 to 23), so they are reported but not gated on.
 enum QualityGuard {
     static let windowSeconds = 30.0
     static let minSpeechSeconds = 3.0
@@ -32,10 +34,10 @@ enum QualityGuard {
             }
     }
 
-    /// True unless at least `maxFailingShare` of the windows with enough speech fall below the floor.
-    static func passes(_ segments: [SpeechSegment], floor: Double) -> Bool {
-        let evaluated = windows(segments).filter(\.evaluated)
-        guard !evaluated.isEmpty else { return true }
-        return Double(evaluated.filter { $0.fails(floor: floor) }.count) / Double(evaluated.count) < maxFailingShare
+    static func passes(_ windows: [Window], floor: Double) -> Bool {
+        let fails = windows.filter(\.evaluated).map { $0.fails(floor: floor) }
+        guard !fails.isEmpty else { return true }
+        let consecutive = zip(fails, fails.dropFirst()).contains { $0 && $1 }
+        return !consecutive && Double(fails.filter { $0 }.count) / Double(fails.count) < maxFailingShare
     }
 }
