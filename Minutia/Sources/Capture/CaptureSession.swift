@@ -186,7 +186,7 @@ final class CaptureSession: ObservableObject {
         }
 
         if !audioMayLeaveMac {
-            guard pipeline.finishCapture() != nil else { throw CaptureError.recordingUnfinished }
+            _ = pipeline.finishCapture()
             Task { await Self.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId) } }
             return StopResult(expectedSegments: nil, transcriptRequested: false)
         }

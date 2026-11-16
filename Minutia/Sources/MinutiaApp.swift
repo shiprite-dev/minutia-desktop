@@ -1749,6 +1749,8 @@ final class AppController: NSObject, ObservableObject {
                         seriesId: manifest.seriesId.flatMap { UUID(uuidString: $0) },
                         instance: manifest.instanceURL)
                 }
+            } catch CaptureRecovery.RecoveryError.audioStaysOnThisMac {
+                apply(.finalized)
             } catch {
                 // Re-arm the finalize target: apply(.refinalizeStarted) moved through .finalizing,
                 // which retires lastFailedStart, so set it again before parking back in .error.

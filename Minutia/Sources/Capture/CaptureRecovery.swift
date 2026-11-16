@@ -64,7 +64,9 @@ struct CaptureManifest: Codable, Equatable {
         createdAt = try c.decode(Date.self, forKey: .createdAt)
         recoveryAttempts = try c.decodeIfPresent(Int.self, forKey: .recoveryAttempts) ?? 0
         notified = try c.decodeIfPresent(Bool.self, forKey: .notified) ?? false
-        transcriptionMode = ((try? c.decodeIfPresent(TranscriptionMode.self, forKey: .transcriptionMode)) ?? nil) ?? .cloud
+        transcriptionMode = c.contains(.transcriptionMode)
+            ? (try? c.decode(TranscriptionMode.self, forKey: .transcriptionMode)) ?? .device
+            : .cloud
         deviceOnly = try c.decodeIfPresent(Bool.self, forKey: .deviceOnly) ?? false
         language = try c.decodeIfPresent(String.self, forKey: .language)
     }
