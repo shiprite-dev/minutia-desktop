@@ -126,6 +126,9 @@ struct MinutiaClient {
             method: "POST",
             token: token
         )
+        // The server transcribes inside this request for up to 300 seconds; the 60 second default
+        // gave up first and turned a working transcription into a retried failure.
+        request.timeoutInterval = 330
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         var body: [String: Any] = expectedSegments.map { ["expected_segments": $0] } ?? [:]
         if deferExtraction { body["defer_extraction"] = true }
