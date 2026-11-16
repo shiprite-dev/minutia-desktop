@@ -32,16 +32,17 @@ final class CaptureManifestRoutingTests: XCTestCase {
         XCTAssertEqual(decoded.meetingId, "abc")
     }
 
-    func test_unknownModeFromANewerBuild_decodesAsCloud_andKeepsTheOtherFields() throws {
+    func test_unknownModeFromANewerBuild_failsClosed_keepingTheAudioOnThisMac() throws {
         let json = Data(#"""
         {"meetingId":"abc","instanceURL":"https://example.com","createdAt":0,"recoveryAttempts":2,
-         "transcriptionMode":"hybrid","deviceOnly":true,"language":"de"}
+         "transcriptionMode":"hybrid","deviceOnly":false,"language":"de"}
         """#.utf8)
 
         let decoded = try JSONDecoder().decode(CaptureManifest.self, from: json)
 
-        XCTAssertEqual(decoded.transcriptionMode, .cloud)
-        XCTAssertTrue(decoded.deviceOnly)
+        XCTAssertEqual(decoded.transcriptionMode, .device)
+        XCTAssertFalse(decoded.audioMayLeaveMac, "an unknown mode never uploads after a downgrade")
+        XCTAssertFalse(decoded.deviceOnly)
         XCTAssertEqual(decoded.language, "de")
         XCTAssertEqual(decoded.recoveryAttempts, 2)
     }
