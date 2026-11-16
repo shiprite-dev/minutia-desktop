@@ -19,6 +19,10 @@ enum TranscriptionSetting: String, CaseIterable {
         defaults.string(forKey: defaultsKey).flatMap(TranscriptionSetting.init(rawValue:)) ?? .automatic
     }
 
+    /// A stored non-Automatic choice keeps the picker visible even with device routing off, so a
+    /// user on "On this Mac only" can always leave it.
+    func pickerVisible(deviceRoutingEnabled: Bool) -> Bool { deviceRoutingEnabled || self != .automatic }
+
     var title: String {
         switch self {
         case .automatic: "Automatic"

@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import Combine
+import FluidAudio
 import OSLog
 import Sparkle
 import SwiftUI
@@ -435,9 +436,20 @@ final class AppController: NSObject, ObservableObject {
     /// audio is saved (the entitlement is an account setting, not a recording fault); a timeout is
     /// honest that the audio is safe locally and recoverable via Retry, since the durable directory
     /// outlives the timed-out network step.
+    nonisolated private static let deviceTranscriptFailure = "This meeting could not be transcribed on this Mac. The recording is kept on this Mac."
+
     nonisolated static func finalizeFailureMessage(for error: Error, host: String?) -> String {
         if case MinutiaClientError.featureUnavailable = error {
             return "Transcription is not enabled for this account on \(host ?? "the server"). Your audio is saved. Ask your workspace admin to enable AI features."
+        }
+        switch error as? CaptureSession.CaptureError {
+        case .transcriptNotSent?: return "Could not send the transcript. Retry to send it again."
+        case .localTranscriptionTimedOut?, .transcriptTooLarge?, .transcriptRejected?: return Self.deviceTranscriptFailure
+        case .nothingRecorded?: return "Nothing was recorded, so there is no transcript to send."
+        default: break
+        }
+        if case CaptureRecovery.RecoveryError.transcriptNotFinished = error {
+            return deviceTranscriptFailure
         }
         if error is TimeoutError {
             return "Finishing the recording timed out. Your audio is saved locally; Retry to finish uploading."
@@ -1101,7 +1113,11 @@ final class AppController: NSObject, ObservableObject {
             } catch {
                 report(.failed, meetingId: meetingId, reason: "start_failed")
                 lastFailedStart = .series
-                apply(.failed("Could not start recording: \(error.localizedDescription)"))
+                if case CaptureSession.CaptureError.transcriptionBlocked = error {
+                    apply(.failed(CaptureSession.failureMessage(for: error)))
+                } else {
+                    apply(.failed("Could not start recording: \(error.localizedDescription)"))
+                }
             }
         }
     }
@@ -1144,7 +1160,11 @@ final class AppController: NSObject, ObservableObject {
             } catch {
                 reportStartFailure("start_failed")
                 lastFailedStart = .meeting(meetingId)
-                apply(.failed("Could not start recording: \(error.localizedDescription)"))
+                if case CaptureSession.CaptureError.transcriptionBlocked = error {
+                    apply(.failed(CaptureSession.failureMessage(for: error)))
+                } else {
+                    apply(.failed("Could not start recording: \(error.localizedDescription)"))
+                }
             }
         }
     }
@@ -1153,7 +1173,8 @@ final class AppController: NSObject, ObservableObject {
         let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
         try captureSession.start(
             meetingId: meetingId, seriesId: seriesId, userId: userId, client: client,
-            decision: routing.decision, deviceOnly: routing.deviceOnly, language: routing.language)
+            decision: routing.decision, deviceOnly: routing.deviceOnly, language: routing.language,
+            transcriber: deviceTranscriber(for: routing))
         notepad.begin(meetingId: meetingId, instance: client.instance, userId: userId, client: client)
         recordingMeetingId = UUID(uuidString: meetingId)
         recordingSeriesId = seriesId
@@ -1163,6 +1184,18 @@ final class AppController: NSObject, ObservableObject {
         if announce { postRecordingStartedNotification() }
         captureToken += 1
         verifySoleRecorder(meetingId: meetingId, token: captureToken, client: client)
+    }
+
+    private func deviceTranscriber(for routing: CaptureRouting) -> LocalTranscriber? {
+        guard routing.decision == .device, let language = routing.language,
+              let entry = modelStore.routableEntry(forLanguage: language),
+              let model = ParakeetEngine.Model(rawValue: entry.id) else { return nil }
+        let directory = modelStore.directory(for: entry)
+        let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+        return LocalTranscriber(source: .onDevice(entry, appVersion: appVersion), language: language) {
+            ModelHub.offlineMode = true
+            return try await ParakeetEngine.load(model, from: directory)
+        }
     }
 
     private func verifySoleRecorder(meetingId: String, token: Int, client: MinutiaClient) {
@@ -1525,7 +1558,8 @@ final class AppController: NSObject, ObservableObject {
     }
 
     private func waitWhileFinalizing() async {
-        let deadline = Date().addingTimeInterval(CaptureSession.finalizeTimeout + 5)
+        let deadline = Date().addingTimeInterval(CaptureSession.quitDeadline(
+            audioMayLeaveMac: captureSession.audioMayLeaveMac, elapsedSeconds: captureSession.elapsed))
         while case .finalizing = phase, Date() < deadline {
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
@@ -1586,6 +1620,7 @@ final class AppController: NSObject, ObservableObject {
         if case MinutiaClientError.featureUnavailable = error { return .transcriptionUnavailable }
         if let recoveryError = error as? CaptureRecovery.RecoveryError,
            recoveryError == .unreadableRecording || recoveryError == .audioStaysOnThisMac { return .unreadable }
+        if case CaptureSession.CaptureError.transcriptRejected? = error as? CaptureSession.CaptureError { return .unreadable }
         return .retryLater
     }
 
@@ -1686,6 +1721,12 @@ final class AppController: NSObject, ObservableObject {
         return (recovered, transcriptionUnavailable, exhausted)
     }
 
+    nonisolated static func recoveryNotificationBody(transcriptionMode: TranscriptionMode) -> String {
+        transcriptionMode == .device
+            ? "A meeting transcribed on this Mac has been sent."
+            : "A meeting that didn't finish uploading has been recovered. The recap is being prepared."
+    }
+
     /// Posts the "Recovered your recording" notification, carrying the recap URL in userInfo so the
     /// default tap action opens it. Resolves the series id (nil in the manifest for web-triggered
     /// records) before building the URL from the manifest's own instance.
@@ -1696,7 +1737,7 @@ final class AppController: NSObject, ObservableObject {
         }
         let content = UNMutableNotificationContent()
         content.title = "Recovered your recording"
-        content.body = "A meeting that didn't finish uploading has been recovered. The recap is being prepared."
+        content.body = Self.recoveryNotificationBody(transcriptionMode: manifest.transcriptionMode)
         if let seriesId, let meetingId = UUID(uuidString: manifest.meetingId) {
             let url = MinutiaClient.recapURL(
                 instance: manifest.instanceURL, seriesId: seriesId, meetingId: meetingId)

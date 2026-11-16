@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "source": {
+    "kind": "device",
+    "engine": "fluidaudio",
+    "engine_version": "0.18.2",
+    "model": "parakeet-ultra",
+    "model_revision": "95eaa59a39d4394f047a4dc5cce480388a60d1b6",
+    "app_version": "0.3.0",
+    "compute": "ane"
+  },
+  "language": "en",
+  "duration_seconds": 312.75,
+  "outcome": "speech",
+  "segments": [
+    { "speaker": "me", "start": 0.42, "end": 3.1, "text": "Let us start with the open items.", "confidence": 0.93 },
+    { "speaker": "them", "start": 3.4, "end": 7.9, "text": "The vendor contract is still blocked.", "confidence": 0.9 },
+    { "speaker": "them", "start": 301.5, "end": 304.25, "text": "Can we move it to next week?", "confidence": 0.88 },
+    { "speaker": "me", "start": 305, "end": 306.5, "text": "Yes, I will follow up.", "confidence": 0.95 }
+  ]
+}

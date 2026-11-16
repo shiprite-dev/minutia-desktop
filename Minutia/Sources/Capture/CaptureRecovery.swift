@@ -82,7 +82,30 @@ enum CaptureRecovery {
     static let manifestName = "manifest.json"
     static let recordingName = "recording.m4a"
 
-    enum RecoveryError: Error, Equatable { case unreadableRecording, audioStaysOnThisMac }
+    enum RecoveryError: Error, Equatable { case unreadableRecording, audioStaysOnThisMac, transcriptNotFinished }
+
+    static let transcriptName = "transcript.json"
+
+    /// Sends a device meeting's finished `transcript.json` again without marking the meeting pending
+    /// (a completed meeting replays as 200). Throws `transcriptNotFinished` (no request made,
+    /// directory kept) when there is no transcript.
+    static func resubmitDeviceTranscript(
+        directory: URL, meetingId: String, transport: any DeviceTranscriptTransport,
+        sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }
+    ) async throws {
+        guard let data = try? Data(contentsOf: directory.appendingPathComponent(transcriptName)),
+              (try? JSONDecoder().decode(DeviceTranscript.self, from: data)) != nil else {
+            throw RecoveryError.transcriptNotFinished
+        }
+        do {
+            try await CaptureSession.submitDeviceTranscript(meetingId: meetingId, body: data, transport: transport, sleep: sleep)
+        } catch CaptureSession.CaptureError.transcriptRejected {
+            throw CaptureSession.CaptureError.transcriptRejected
+        } catch {
+            throw CaptureSession.CaptureError.transcriptNotSent
+        }
+        try? FileManager.default.removeItem(at: directory)
+    }
 
     /// nil when the file is missing, has no audio track, or has no positive finite duration.
     static func readableAudioDuration(of url: URL) async -> Double? {
@@ -146,7 +169,7 @@ enum CaptureRecovery {
     nonisolated static func shouldRecover(
         manifest: CaptureManifest, connectedInstance: URL, connectedUserId: String?
     ) -> Bool {
-        guard manifest.audioMayLeaveMac else { return false }
+        guard manifest.audioMayLeaveMac || manifest.transcriptionMode == .device else { return false }
         let manifestInstance = InstanceConfig.normalize(manifest.instanceURL.absoluteString) ?? manifest.instanceURL
         let connected = InstanceConfig.normalize(connectedInstance.absoluteString) ?? connectedInstance
         guard manifestInstance == connected else { return false }
@@ -167,6 +190,10 @@ enum CaptureRecovery {
         directory: URL, manifest: CaptureManifest, client: MinutiaClient,
         flushNotes: @escaping @Sendable () async throws -> Void = {}
     ) async throws {
+        if manifest.transcriptionMode == .device {
+            try await resubmitDeviceTranscript(directory: directory, meetingId: manifest.meetingId, transport: client)
+            return
+        }
         guard manifest.audioMayLeaveMac else { throw RecoveryError.audioStaysOnThisMac }
         let recordingURL = directory.appendingPathComponent(recordingName)
         guard let duration = await readableAudioDuration(of: recordingURL) else { throw RecoveryError.unreadableRecording }
