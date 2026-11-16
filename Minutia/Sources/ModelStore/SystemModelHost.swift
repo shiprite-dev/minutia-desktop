@@ -35,7 +35,7 @@ final class SystemModelHost: ModelHost, @unchecked Sendable {
     func observeConditions(_ handler: @escaping @Sendable () -> Void) {
         monitor.pathUpdateHandler = { _ in handler() }
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + 60, repeating: 60)
+        timer.schedule(deadline: .now() + 60, repeating: 60, leeway: .seconds(15))
         timer.setEventHandler(handler: handler)
         timer.resume()
         self.timer = timer

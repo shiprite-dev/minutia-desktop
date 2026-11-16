@@ -140,7 +140,13 @@ final class ModelStore: ObservableObject {
 
     func recordingDidStop(resume: Bool = true) async {
         recording = false
-        if resume, let lastLanguage { await prepare(language: lastLanguage) }
+        guard resume else {
+            lastLanguage = nil
+            running?.task.cancel()
+            warmTask?.cancel()
+            return
+        }
+        if let lastLanguage { await prepare(language: lastLanguage) }
     }
 
     func conditionsDidChange() async {
