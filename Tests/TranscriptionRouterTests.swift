@@ -130,11 +130,30 @@ final class TranscriptionRouterTests: XCTestCase {
             ("de-DE", ["en-US"], "de"),
             ("", ["en-US"], "en"),
             ("xx-YY", ["en-US"], nil),
+            (nil, ["und"], nil),
+            (nil, ["mul"], nil),
+            (nil, ["zxx"], nil),
+            (nil, ["mis"], nil),
+            (nil, ["und-US"], nil),
+            ("und", ["en-US"], nil),
+            ("mul", ["en-US"], nil),
+            ("zxx", ["en-US"], nil),
+            ("mis", ["en-US"], nil),
         ]
         for (meeting, preferred, expected) in rows {
             XCTAssertEqual(
                 TranscriptionRouter.resolveLanguage(meetingLanguage: meeting, preferredLanguages: preferred),
                 expected, "meeting \(meeting ?? "nil"), preferred \(preferred)")
+        }
+    }
+
+    func test_specialISOCodes_resolveToNoLanguage_andRouteAsUnknown() {
+        for code in ["und", "mul", "zxx", "mis"] {
+            let fromMeeting = TranscriptionRouter.resolveLanguage(meetingLanguage: code, preferredLanguages: ["en-US"])
+            let fromMac = TranscriptionRouter.resolveLanguage(meetingLanguage: nil, preferredLanguages: [code])
+            XCTAssertEqual(TranscriptionRouter.decide(input(language: fromMeeting)), .cloud(.unknownLanguage), code)
+            XCTAssertEqual(TranscriptionRouter.decide(input(language: fromMac, setting: .onDeviceOnly)),
+                           .blocked(.unknownLanguage), code)
         }
     }
 
@@ -174,7 +193,7 @@ final class TranscriptionRouterTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
 
-        XCTAssertFalse(TranscriptionRouter.deviceRoutingEnabledByDefault, "device routing ships dark until MIN-215")
+        XCTAssertFalse(TranscriptionRouter.deviceRoutingEnabledByDefault, "device routing ships turned off by default")
         XCTAssertEqual(TranscriptionRouter.isDeviceRoutingEnabled(defaults), TranscriptionRouter.deviceRoutingEnabledByDefault)
         defaults.set(true, forKey: TranscriptionRouter.deviceRoutingKey)
         XCTAssertTrue(TranscriptionRouter.isDeviceRoutingEnabled(defaults))

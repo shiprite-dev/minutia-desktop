@@ -310,6 +310,8 @@ final class AppController: NSObject, ObservableObject {
     /// Record can begin only from a resting or recoverable phase. Guards a stale detection
     /// notification clicked mid-recording from starting a second server meeting and
     /// overwriting the recording meeting id (which would open the wrong recap).
+    nonisolated static func captureRefusal(for decision: TranscriptionDecision) -> String? { nil }
+
     nonisolated static func canStartRecording(from phase: AppPhase) -> Bool {
         switch phase {
         case .idle, .detected, .error: return true

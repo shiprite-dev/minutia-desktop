@@ -68,6 +68,8 @@ struct CaptureManifest: Codable, Equatable {
         deviceOnly = try c.decodeIfPresent(Bool.self, forKey: .deviceOnly) ?? false
         language = try c.decodeIfPresent(String.self, forKey: .language)
     }
+
+    var audioMayLeaveMac: Bool { true }
 }
 
 /// Startup salvage for capture directories left behind by a quit, crash, or fatal mid-recording.
@@ -78,7 +80,7 @@ enum CaptureRecovery {
     static let manifestName = "manifest.json"
     static let recordingName = "recording.m4a"
 
-    enum RecoveryError: Error, Equatable { case unreadableRecording }
+    enum RecoveryError: Error, Equatable { case unreadableRecording, audioStaysOnThisMac }
 
     /// nil when the file is missing, has no audio track, or has no positive finite duration.
     static func readableAudioDuration(of url: URL) async -> Double? {

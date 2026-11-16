@@ -39,7 +39,7 @@ final class CaptureSession: ObservableObject {
         let transcriptRequested: Bool
     }
 
-    enum CaptureError: Error { case notRunning, stalled, recordingUnfinished, alreadyRunning, invalidMeetingId }
+    enum CaptureError: Error { case notRunning, stalled, recordingUnfinished, alreadyRunning, invalidMeetingId, transcriptionBlocked(TranscriptionReason) }
 
     /// Ceiling for the stop-time network finalize (drain + upload + finalize + transcribe request).
     static let finalizeTimeout: TimeInterval = 60
