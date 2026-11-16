@@ -1,0 +1,24 @@
+Minutia Desktop
+Copyright (c) Minutia contributors. Licensed under the MIT License (see LICENSE).
+
+This product includes or may download the following third-party components.
+
+NVIDIA Parakeet TDT 0.6B v3
+  https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
+  Copyright (c) NVIDIA Corporation. Licensed under CC BY 4.0
+  (https://creativecommons.org/licenses/by/4.0/). Downloaded at runtime in its
+  Core ML form; not modified by Minutia.
+
+Parakeet TDT 0.6B v3 Core ML conversion
+  https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml
+  Converted by FluidInference. Distributed under CC BY 4.0.
+
+Parakeet Ultra
+  https://huggingface.co/moondream/parakeet-ultra, Core ML conversion
+  https://huggingface.co/FluidInference/parakeet-ultra-coreml
+  A post-training of NVIDIA Parakeet TDT 0.6B v3 by moondream. Licensed under CC BY 4.0.
+
+FluidAudio
+  https://github.com/FluidInference/FluidAudio
+  Copyright (c) FluidInference. Licensed under the Apache License, Version 2.0
+  (https://www.apache.org/licenses/LICENSE-2.0).

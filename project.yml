@@ -10,6 +10,10 @@ packages:
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
     from: 2.9.0
+  FluidAudio:
+    url: https://github.com/FluidInference/FluidAudio
+    exactVersion: 0.18.2
+    traits: []
 targets:
   Minutia:
     type: application
@@ -18,6 +22,7 @@ targets:
     dependencies:
       - package: Supabase
       - package: Sparkle
+      - package: FluidAudio
     entitlements:
       path: Minutia/Minutia.entitlements
       properties:

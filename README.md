@@ -42,7 +42,7 @@ make build  # generates the Xcode project and builds the app
 make run    # builds and opens the app
 ```
 
-This project uses [XcodeGen](https://github.com/yonaskolb/XcodeGen) to generate the Xcode project from `project.yml`, so the `.xcodeproj` is not checked in. `make gen` regenerates it on its own if you want to open it in Xcode directly.
+This project uses [XcodeGen](https://github.com/yonaskolb/XcodeGen) to generate the Xcode project from `project.yml`, so the `.xcodeproj` is not checked in. XcodeGen 2.46 or later is required (it writes the FluidAudio package traits). `make gen` regenerates it on its own if you want to open it in Xcode directly.
 
 ```bash
 make test   # generates the project and runs the test suite
@@ -76,4 +76,4 @@ Minutia Desktop connects to the managed Minutia Cloud instance by default, so th
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE). Third-party models and libraries (NVIDIA Parakeet, FluidAudio) are listed in [NOTICE](NOTICE).
