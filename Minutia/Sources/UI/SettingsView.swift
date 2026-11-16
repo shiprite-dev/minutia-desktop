@@ -98,7 +98,7 @@ struct SettingsView: View {
             }
 
             Section("Transcription") {
-                if TranscriptionRouter.isDeviceRoutingEnabled(.standard) {
+                if transcriptionSetting.pickerVisible(deviceRoutingEnabled: TranscriptionRouter.isDeviceRoutingEnabled(.standard)) {
                     Picker("Transcription", selection: $transcriptionSetting) {
                         ForEach(TranscriptionSetting.allCases, id: \.self) { Text($0.title) }
                     }

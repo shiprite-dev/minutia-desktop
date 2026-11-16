@@ -169,16 +169,35 @@ struct MinutiaClient {
     }
 
     static func awaitingDeviceUpdate(durationSeconds: Double) -> AwaitingDeviceUpdate {
-        AwaitingDeviceUpdate(transcription_status: "", transcription_provider: "", audio_duration_seconds: 0)
+        AwaitingDeviceUpdate(
+            transcription_status: "pending", transcription_provider: "device",
+            audio_duration_seconds: Int(durationSeconds.rounded()))
     }
 
     static func deviceTranscriptRequest(instance: URL, meetingId: String, body: Data, token: String) -> URLRequest {
-        URLRequest(url: instance)
+        var request = bearerRequest(
+            instance.appendingPathComponent("api/meetings/\(meetingId.lowercased())/transcript"),
+            method: "POST", token: token)
+        request.timeoutInterval = 60
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        return request
     }
 
-    func markAwaitingDeviceTranscript(meetingId: String, durationSeconds: Double) async throws {}
+    func markAwaitingDeviceTranscript(meetingId: String, durationSeconds: Double) async throws {
+        try await supabase
+            .from("meetings")
+            .update(Self.awaitingDeviceUpdate(durationSeconds: durationSeconds))
+            .eq("id", value: Self.meetingLookupId(meetingId))
+            .execute()
+    }
 
-    func submitDeviceTranscript(meetingId: String, body: Data) async throws -> Int { 0 }
+    func submitDeviceTranscript(meetingId: String, body: Data) async throws -> Int {
+        let token = try await tokenProvider()
+        let request = Self.deviceTranscriptRequest(instance: instance, meetingId: meetingId, body: body, token: token)
+        let (_, response) = try await URLSession.shared.data(for: request)
+        return (response as? HTTPURLResponse)?.statusCode ?? 0
+    }
 
     static func summaryWarmupRequest(instance: URL, meetingId: String, token: String) -> URLRequest {
         bearerRequest(

@@ -46,7 +46,7 @@ struct MenuContent: View {
                         onNotes: { controller.notepad.showAndFocus() },
                         onStop: { controller.stopRecording() })
                 case .finalizing:
-                    FinalizingView()
+                    FinalizingView(session: controller.captureSession)
                 case .error(let message):
                     ErrorView(message: message, controller: controller)
                 }
@@ -295,15 +295,34 @@ private struct DetectionBanner: View {
 }
 
 private struct FinalizingView: View {
+    @ObservedObject var session: CaptureSession
+    @State private var preparingSince: Date?
+
     var body: some View {
         HStack(spacing: 10) {
             ProgressView()
                 .controlSize(.small)
-            Text("Uploading and requesting transcript")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+            if let step = session.finishingStep {
+                Text(step.label)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                if step == .preparingModel {
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        Text("\(Int(context.date.timeIntervalSince(preparingSince ?? context.date)))s")
+                            .font(.callout.monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            } else {
+                Text("Uploading and requesting transcript")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(16)
+        .onChange(of: session.finishingStep == .preparingModel, initial: true) { _, preparing in
+            preparingSince = preparing ? Date() : nil
+        }
     }
 }
 
