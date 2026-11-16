@@ -1453,7 +1453,7 @@ final class AppController: NSObject, ObservableObject {
         let meetingId = recordingMeetingId
         let seriesId = recordingSeriesId
         let instance = recordingInstance
-        let early = Self.opensRecap(for: reason) && meetingId != nil && instance != nil
+        let early = Self.opensRecap(for: reason) && captureSession.audioMayLeaveMac && meetingId != nil && instance != nil
         earlyRecapMeetingId = early ? meetingId : nil
         if early, let meetingId, let instance {
             Task {

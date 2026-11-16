@@ -51,7 +51,7 @@ final class CaptureSession: ObservableObject {
 
     private var pipeline: CapturePipeline?
     private var queue: UploadQueue?
-    private var audioMayLeaveMac = true
+    private(set) var audioMayLeaveMac = true
     private var client: MinutiaClient?
     private var meetingId: String?
     private var directory: URL?
