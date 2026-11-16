@@ -181,6 +181,7 @@ jobs:
             --app-drop-link 450 190 \
             "$DMG" "$STAGE" || true
           test -f "$DMG"
+          codesign --timestamp -s "Developer ID Application" "$DMG"
           # The DMG is the artifact users download, so it must be notarized and stapled itself
           # (notarizing only the app zip leaves the DMG unstapled and Gatekeeper rejects it).
           echo "$ASC_KEY_P8" | base64 --decode > "$RUNNER_TEMP/asc.p8"
@@ -198,7 +199,8 @@ jobs:
           DMG="build/Minutia-${SHORT_VERSION}.dmg"
           codesign --verify --deep --strict --verbose=2 "$APP"
           spctl -a -vvv "$APP"
-          spctl -a -vvv --type install "$DMG"
+          codesign --verify --strict --verbose=2 "$DMG"
+          spctl -a -vvv --type open --context context:primary-signature "$DMG"
 
       - name: Sign update and build appcast
         env:
