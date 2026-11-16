@@ -201,6 +201,7 @@ final class CaptureSession: ObservableObject {
         if !audioMayLeaveMac, let transcriber {
             guard let finished = pipeline.finishCapture() else { throw CaptureError.recordingUnfinished }
             let tail = finished.tailPieces.isEmpty ? [finished.finalSegment].compactMap { $0 } : finished.tailPieces
+            try? await flushNotes()
             return try await Self.finishOnDevice(
                 meetingId: meetingId, directory: directory, tail: tail,
                 durationSeconds: Double(finished.recording.frames) / MixPlan.sampleRate,
@@ -210,6 +211,7 @@ final class CaptureSession: ObservableObject {
 
         if !audioMayLeaveMac {
             _ = pipeline.finishCapture()
+            try? await flushNotes()
             Task { await Self.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId) } }
             return StopResult(expectedSegments: nil, transcriptRequested: false)
         }
