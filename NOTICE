@@ -3,7 +3,7 @@ Copyright (c) Minutia contributors. Licensed under the MIT License (see LICENSE)
 
 This product includes or may download the following third-party components.
 
-Parakeet Ultra (default on-device speech model)
+Parakeet Ultra (on-device speech model)
   https://huggingface.co/moondream/parakeet-ultra
   Copyright (c) moondream. Licensed under CC BY 4.0
   (https://creativecommons.org/licenses/by/4.0/). A post-training of NVIDIA

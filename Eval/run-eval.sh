@@ -13,6 +13,7 @@ DERIVED=${MINUTIA_EVAL_DERIVED:-$EVAL/DerivedData}
 ENGINES=${ENGINES:-parakeet-v3 parakeet-ultra parakeet-ja groq-turbo}
 export MINUTIA_EVAL_FIXTURES=$FIX MINUTIA_EVAL_TOOLS=$TOOLS
 mkdir -p "$OUT" "$MODELS"
+rm -f "$OUT"/transcribe-*.json
 
 [ -f "$FIX/manifest.json" ] || "$ROOT/Eval/fetch-fixtures.sh"
 

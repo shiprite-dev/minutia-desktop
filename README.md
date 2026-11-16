@@ -76,4 +76,4 @@ Minutia Desktop connects to the managed Minutia Cloud instance by default, so th
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Third-party models and libraries (NVIDIA Parakeet, FluidAudio) are listed in [NOTICE](NOTICE).
+MIT, see [LICENSE](LICENSE). Third-party models and libraries (Parakeet Ultra, NVIDIA Parakeet, FluidAudio) are listed in [NOTICE](NOTICE).

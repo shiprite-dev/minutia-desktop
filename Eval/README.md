@@ -5,7 +5,7 @@ on the same audio. It is a developer tool, never part of CI, and the normal app 
 
 ```bash
 Eval/fetch-fixtures.sh                     # once: sha256-pinned public audio, scoring venv, fixtures + manifest.json
-export GROQ_API_KEY=...                    # optional; groq-turbo is skipped without it
+export GROQ_API_KEY=...                    # required for a passing gate; groq-turbo is skipped without it
 Eval/run-eval.sh                           # build (Release), run every engine, score
 ENGINES="parakeet-v3" Eval/run-eval.sh     # subset
 ```
