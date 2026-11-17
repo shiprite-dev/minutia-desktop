@@ -153,7 +153,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         let copy = AppController.quitAlert(capturingAudioMayLeaveMac: {
             switch AppController.shared.phase {
-            case .recording, .finalizing: AppController.shared.captureSession.audioMayLeaveMac
+            case .recording, .finalizing:
+                AppController.shared.captureSession.audioMayLeaveMac
+                    || AppController.shared.captureSession.finishingStep == .fallingBackToCloud
             default: nil
             }
         }())
@@ -462,7 +464,7 @@ final class AppController: NSObject, ObservableObject {
         if error is TimeoutError {
             return audioMayLeaveMac
                 ? "Finishing the recording timed out. Your audio is saved locally; Retry to finish uploading."
-                : "Finishing the recording timed out. Your audio is saved on this Mac; Retry to finish."
+                : "Finishing the recording timed out. Your audio is saved on this Mac. Retry to finish."
         }
         return "Could not finish recording: \(error.localizedDescription)"
     }

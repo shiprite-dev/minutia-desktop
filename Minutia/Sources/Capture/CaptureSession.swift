@@ -59,7 +59,7 @@ final class CaptureSession: ObservableObject {
     private(set) var audioMayLeaveMac = true
     private var client: MinutiaClient?
     private var transcriber: LocalTranscriber?
-    private var deviceOnly = false
+    private(set) var deviceOnly = false
     private var meetingId: String?
     private var directory: URL?
     private var startedAt: Date?
@@ -285,6 +285,7 @@ final class CaptureSession: ObservableObject {
         case submitting
         case startingOnDevice
         case uploadingRecording
+        case fallingBackToCloud
 
         var label: String {
             switch self {
@@ -293,6 +294,7 @@ final class CaptureSession: ObservableObject {
             case .submitting: "Sending the transcript"
             case .startingOnDevice: "Transcribing on this Mac"
             case .uploadingRecording: "Uploading and requesting transcript"
+            case .fallingBackToCloud: "Couldn't transcribe on this Mac. Uploading instead."
             }
         }
     }
@@ -407,7 +409,7 @@ final class CaptureSession: ObservableObject {
             }
             markLocalFailed(directory)
             await waitAtMost(seconds: notesFlushTimeout) { await notes.value }
-            await onStep(.uploadingRecording)
+            await onStep(.fallingBackToCloud)
             return try await finishInCloud(
                 meetingId: meetingId, directory: directory, durationSeconds: durationSeconds, failure: .transcriptionTimedOut,
                 transport: transport, cloud: cloud, recapOpened: recapOpened, timeout: cloudTimeout)
@@ -422,7 +424,7 @@ final class CaptureSession: ObservableObject {
             }
             markLocalFailed(directory)
             await waitAtMost(seconds: notesFlushTimeout) { await notes.value }
-            await onStep(.uploadingRecording)
+            await onStep(.fallingBackToCloud)
             return try await finishInCloud(
                 meetingId: meetingId, directory: directory, durationSeconds: durationSeconds, failure: failure,
                 transport: transport, cloud: cloud, recapOpened: recapOpened, timeout: cloudTimeout)

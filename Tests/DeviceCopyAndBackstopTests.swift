@@ -32,6 +32,7 @@ final class DeviceCopyAndBackstopTests: XCTestCase {
             (.uploadingRecording, true, "Uploading and requesting transcript"),
             (.uploadingRecording, false, "Uploading and requesting transcript"),
             (.startingOnDevice, false, "Transcribing on this Mac"),
+            (.fallingBackToCloud, false, "Couldn't transcribe on this Mac. Uploading instead."),
             (.preparingModel, false, "Preparing the speech model"),
             (.transcribing(completed: 2, total: 5), false, "Transcribing on this Mac, 2 of 5"),
             (.submitting, false, "Sending the transcript"),
@@ -108,7 +109,7 @@ final class DeviceCopyAndBackstopTests: XCTestCase {
         let result = try await finishOnDevice(await qualityGuardTranscriber(), deviceOnly: false,
                                               transport: RecordingTransport(), cloud: cloud, steps: steps)
         XCTAssertEqual(result.localFailure, .qualityGuard)
-        XCTAssertEqual(steps.steps.last, .uploadingRecording, "got \(steps.steps)")
+        XCTAssertEqual(steps.steps.last, .fallingBackToCloud, "got \(steps.steps)")
         XCTAssertEqual(cloud.log, ["uploadRecording", "finalizeMeeting", "requestTranscription"])
     }
 
@@ -120,7 +121,7 @@ final class DeviceCopyAndBackstopTests: XCTestCase {
                                          transport: RecordingTransport(), cloud: cloud, steps: steps)
             XCTFail("On this Mac only cannot finish a failed local transcription")
         } catch {}
-        XCTAssertFalse(steps.steps.contains(.uploadingRecording), "got \(steps.steps)")
+        XCTAssertFalse(steps.steps.contains(.uploadingRecording) || steps.steps.contains(.fallingBackToCloud), "got \(steps.steps)")
         XCTAssertEqual(cloud.log, [])
     }
 
@@ -137,16 +138,19 @@ final class DeviceCopyAndBackstopTests: XCTestCase {
             directory: dir, manifest: manifest, transport: RecordingTransport(), cloud: cloud, sleep: { _ in },
             onStep: { steps.record($0) })
         XCTAssertEqual(cloud.log, ["uploadRecording", "finalizeMeeting", "requestTranscription"])
-        XCTAssertEqual(steps.steps, [.uploadingRecording])
+        XCTAssertEqual(steps.steps, [.fallingBackToCloud])
     }
 
     // MARK: Recording view
 
     func test_recordingProgressLine_namesTheUploadOnlyForCloudMeetings() {
-        XCTAssertEqual(RecordingView.progressLine(uploaded: 2, total: 3, audioMayLeaveMac: true), "2 of 3 segments uploaded")
-        let device = RecordingView.progressLine(uploaded: 0, total: 3, audioMayLeaveMac: false)
-        XCTAssertEqual(device, "Transcribing on this Mac")
-        assertNoUpload(device, "recording view")
+        XCTAssertEqual(RecordingView.progressLine(uploaded: 2, total: 3, audioMayLeaveMac: true, deviceOnly: false), "2 of 3 segments uploaded")
+        let automatic = RecordingView.progressLine(uploaded: 0, total: 3, audioMayLeaveMac: false, deviceOnly: false)
+        XCTAssertEqual(automatic, "Transcribing on this Mac as you record", "Automatic promises nothing a later fallback could break")
+        let onThisMacOnly = RecordingView.progressLine(uploaded: 0, total: 3, audioMayLeaveMac: false, deviceOnly: true)
+        XCTAssertEqual(onThisMacOnly, "Transcribing as you record. Audio stays on this Mac.")
+        assertNoUpload(automatic, "recording view")
+        assertNoUpload(onThisMacOnly, "recording view")
     }
 
     // MARK: Quit alert
@@ -184,9 +188,9 @@ final class DeviceCopyAndBackstopTests: XCTestCase {
         XCTAssertEqual(AppController.finalizeFailureMessage(for: TimeoutError(), host: "minutia.example.com", audioMayLeaveMac: true),
                        "Finishing the recording timed out. Your audio is saved locally; Retry to finish uploading.")
         XCTAssertEqual(AppController.finalizeFailureMessage(for: TimeoutError(), host: "minutia.example.com", audioMayLeaveMac: false),
-                       "Finishing the recording timed out. Your audio is saved on this Mac; Retry to finish.")
+                       "Finishing the recording timed out. Your audio is saved on this Mac. Retry to finish.")
         XCTAssertEqual(AppController.refinalizeOutcome(for: TimeoutError(), host: "minutia.example.com", audioMayLeaveMac: false),
-                       .failed("Finishing the recording timed out. Your audio is saved on this Mac; Retry to finish."))
+                       .failed("Finishing the recording timed out. Your audio is saved on this Mac. Retry to finish."))
     }
 
     func test_everyFailureMessage_forADeviceMeeting_neverMentionsUploading() {

@@ -194,7 +194,7 @@ enum CaptureRecovery {
             }
         }
         let accepted = LockedFlag()
-        await onStep(.uploadingRecording)
+        await onStep(.fallingBackToCloud)
         do {
             try await withTimeout(seconds: cloudTimeout) {
                 try await CaptureSession.finalizeRecordingInCloud(
