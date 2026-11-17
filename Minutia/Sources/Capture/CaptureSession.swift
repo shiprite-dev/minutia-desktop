@@ -58,6 +58,7 @@ final class CaptureSession: ObservableObject {
     private(set) var audioMayLeaveMac = true
     private var client: MinutiaClient?
     private var transcriber: LocalTranscriber?
+    private var deviceOnly = false
     private var meetingId: String?
     private var directory: URL?
     private var startedAt: Date?
@@ -80,6 +81,7 @@ final class CaptureSession: ObservableObject {
         if case .blocked(let reason) = decision { throw CaptureError.transcriptionBlocked(reason) }
         if transcriber == nil, decision.mode != .cloud || deviceOnly { throw CaptureError.transcriptionBlocked(.modelNotReady) }
         guard pipeline == nil else { throw CaptureError.alreadyRunning }
+        self.deviceOnly = deviceOnly
         guard let canonical = UUID(uuidString: meetingId) else { throw CaptureError.invalidMeetingId }
 
         // Canonicalize to the lowercase meeting id the DB row and the storage RLS policy use;
@@ -178,7 +180,8 @@ final class CaptureSession: ObservableObject {
 
     /// Stops capture, drains fast-lane uploads, uploads the full recording, and requests the final
     /// transcription. Local files are deleted only once transcription has been accepted.
-    func stop(flushNotes: @escaping @Sendable () async throws -> Void = {}, recapOpened: Bool = false) async throws -> StopResult {
+    func stop(flushNotes: @escaping @Sendable () async throws -> Void = {}, recapOpened: Bool = false,
+              notifyLocalFailure: @escaping @Sendable (LocalTranscriber.Failure) async -> Void = { _ in }) async throws -> StopResult {
         guard let pipeline, let queue, let client, let meetingId, let directory else {
             throw CaptureError.notRunning
         }
@@ -208,7 +211,8 @@ final class CaptureSession: ObservableObject {
                 meetingId: meetingId, directory: directory, tail: tail,
                 durationSeconds: Double(finished.recording.frames) / MixPlan.sampleRate,
                 transcriber: transcriber, transport: client, recapOpened: recapOpened,
-                flushNotes: flushNotes, onStep: finishingStepReporter())
+                deviceOnly: deviceOnly, cloud: client,
+                flushNotes: flushNotes, onStep: finishingStepReporter(), notifyLocalFailure: notifyLocalFailure)
         }
 
         // Without a finished recording the server has nothing to transcribe; throwing keeps the
@@ -366,6 +370,24 @@ final class CaptureSession: ObservableObject {
         } catch CaptureError.localTranscriptionTimedOut {
             await transcriber.cancel()
             throw CaptureError.localTranscriptionTimedOut
+        } catch let failure as LocalTranscriber.Failure {
+            await transcriber.cancel()
+            guard !deviceOnly, let cloud else {
+                await notifyLocalFailure(failure)
+                throw failure
+            }
+            await notesFlushed
+            let recording = directory.appendingPathComponent(CaptureRecovery.recordingName)
+            try await withTimeout(seconds: finalizeTimeout) {
+                let path = try await cloud.uploadRecording(meetingId: meetingId, fileURL: recording)
+                let size = ((try? FileManager.default.attributesOfItem(atPath: recording.path)[.size]) as? NSNumber)?.int64Value ?? 0
+                try await cloud.finalizeMeeting(meetingId: meetingId, audioPath: path, duration: durationSeconds, sizeBytes: size)
+                try await cloud.requestTranscription(meetingId: meetingId, expectedSegments: nil, deferExtraction: true)
+            }
+            try? FileManager.default.removeItem(at: directory)
+            if !recapOpened { Task { await transport.warmSummary(meetingId: meetingId) } }
+            Task { await endMeetingIfAllowed { try await transport.endMeeting(meetingId: meetingId) } }
+            return StopResult(expectedSegments: nil, transcriptRequested: true, localFailure: failure)
         }
         guard let fitted = transcript.fitted() else { throw CaptureError.transcriptTooLarge }
         let body = try fitted.encoded()

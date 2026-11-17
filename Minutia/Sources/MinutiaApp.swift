@@ -451,6 +451,7 @@ final class AppController: NSObject, ObservableObject {
         if case CaptureRecovery.RecoveryError.transcriptNotFinished = error {
             return deviceTranscriptFailure
         }
+        if error is LocalTranscriber.Failure { return deviceTranscriptFailure }
         if error is TimeoutError {
             return "Finishing the recording timed out. Your audio is saved locally; Retry to finish uploading."
         }
@@ -634,6 +635,7 @@ final class AppController: NSObject, ObservableObject {
     /// The instance capture started against, captured at start so the recap URL survives an instance
     /// switch made while the meeting was recording.
     private var recordingInstance: URL?
+    private var recordingLanguage: String?
     private var earlyRecapMeetingId: UUID?
     private var lastFailedStart: FailedStart?
     /// The instance the detector's agenda provider is currently bound to. When it changes (an
@@ -1191,6 +1193,7 @@ final class AppController: NSObject, ObservableObject {
         recordingMeetingId = UUID(uuidString: meetingId)
         recordingSeriesId = seriesId
         recordingInstance = client.instance
+        recordingLanguage = routing.language
         resetEndDetectionState(origin: Self.detectionOrigin(for: lastConfidence))
         apply(.recordStarted)
         if announce { postRecordingStartedNotification() }
@@ -1204,7 +1207,7 @@ final class AppController: NSObject, ObservableObject {
               let model = ParakeetEngine.Model(rawValue: entry.id) else { return nil }
         let directory = modelStore.directory(for: entry)
         let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
-        return LocalTranscriber(source: .onDevice(entry, appVersion: appVersion), language: language) {
+        return LocalTranscriber(source: .onDevice(entry, appVersion: appVersion), language: language, guardFloor: model.guardFloor) {
             ModelHub.offlineMode = true
             return try await ParakeetEngine.load(model, from: directory)
         }
@@ -1511,9 +1514,14 @@ final class AppController: NSObject, ObservableObject {
                 await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance, autoRecap: true)
             }
         }
+        let onDevice = !captureSession.audioMayLeaveMac
+        let language = recordingLanguage
         Task {
             do {
-                let result = try await captureSession.stop(flushNotes: { [notepad] in try await notepad.flushNow() }, recapOpened: early)
+                let result = try await captureSession.stop(
+                    flushNotes: { [notepad] in try await notepad.flushNow() }, recapOpened: early,
+                    notifyLocalFailure: { _ in await Self.postNotification(title: "Meeting not transcribed", body: Self.deviceTranscriptFailure) })
+                if onDevice, let language { await modelStore.recordLocalTranscription(succeeded: result.localFailure == nil, language: language) }
                 recordingMeetingId = nil
                 recordingSeriesId = nil
                 recordingInstance = nil
@@ -1522,6 +1530,9 @@ final class AppController: NSObject, ObservableObject {
                     await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance)
                 }
             } catch {
+                if onDevice, let language, error is LocalTranscriber.Failure {
+                    await modelStore.recordLocalTranscription(succeeded: false, language: language)
+                }
                 // The durable directory survives a timed-out finalize, so Retry finishes the upload
                 // rather than starting a new recording.
                 lastFailedStart = meetingId.map { .finalize(meetingId: $0.uuidString) } ?? .series

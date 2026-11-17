@@ -35,10 +35,7 @@ enum QualityGuard {
     }
 
     static func passes(_ windows: [Window], floor: Double) -> Bool {
-        let fails = windows.filter(\.evaluated).map { $0.fails(floor: floor) }
-        guard !fails.isEmpty else { return true }
-        let consecutive = zip(fails, fails.dropFirst()).contains { $0 && $1 }
-        return !consecutive && Double(fails.filter { $0 }.count) / Double(fails.count) < maxFailingShare
+        passes(windows.filter(\.evaluated).map { $0.fails(floor: floor) ? .fail : .pass })
     }
 
     /// The stop-time judgment of a device meeting: one judged window per segment transcription.
@@ -50,11 +47,25 @@ enum QualityGuard {
     /// A segment's verdict from both channels' speech, or nil when the engine threw on it. A throw fails;
     /// at least `minSpeechSeconds` of speech whose duration-weighted mean confidence is under `floor`
     /// fails; less speech than that (silence included) is unjudged.
-    static func verdict(_ speech: [SpeechSegment]?, floor: Double) -> Verdict { .pass }
+    static func verdict(_ speech: [SpeechSegment]?, floor: Double) -> Verdict {
+        guard let speech else { return .fail }
+        let seconds = speech.reduce(0) { $0 + max($1.end - $1.start, 0) }
+        guard seconds >= minSpeechSeconds else { return .unjudged }
+        let confidence = speech.reduce(0) { $0 + $1.confidence * max($1.end - $1.start, 0) } / seconds
+        return confidence < floor ? .fail : .pass
+    }
 
     /// The same share and consecutive rules as `passes(_:floor:)`, over judged segment verdicts.
-    static func passes(_ verdicts: [Verdict]) -> Bool { true }
+    static func passes(_ verdicts: [Verdict]) -> Bool {
+        let fails = verdicts.filter { $0 != .unjudged }.map { $0 == .fail }
+        guard !fails.isEmpty else { return true }
+        let consecutive = zip(fails, fails.dropFirst()).contains { $0 && $1 }
+        return !consecutive && Double(fails.filter { $0 }.count) / Double(fails.count) < maxFailingShare
+    }
 
     /// True once the first `earlyAbortWindows` judged verdicts are all failures.
-    static func abortsEarly(_ verdicts: [Verdict]) -> Bool { false }
+    static func abortsEarly(_ verdicts: [Verdict]) -> Bool {
+        let judged = verdicts.filter { $0 != .unjudged }.prefix(earlyAbortWindows)
+        return judged.count == earlyAbortWindows && judged.allSatisfy { $0 == .fail }
+    }
 }
