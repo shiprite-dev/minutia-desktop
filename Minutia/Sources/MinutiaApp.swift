@@ -443,7 +443,7 @@ final class AppController: NSObject, ObservableObject {
             return "Transcription is not enabled for this account on \(host ?? "the server"). Your audio is saved. Ask your workspace admin to enable AI features."
         }
         switch error as? CaptureSession.CaptureError {
-        case .transcriptNotSent?: return "Could not send the transcript. Retry to send it again."
+        case .transcriptNotSent?, .transcriptBusy?: return "Could not send the transcript. Retry to send it again."
         case .localTranscriptionTimedOut?, .transcriptTooLarge?, .transcriptRejected?: return Self.deviceTranscriptFailure
         case .nothingRecorded?: return "Nothing was recorded, so there is no transcript to send."
         default: break
@@ -1189,7 +1189,7 @@ final class AppController: NSObject, ObservableObject {
         try captureSession.start(
             meetingId: meetingId, seriesId: seriesId, userId: userId, client: client,
             decision: routing.decision, deviceOnly: routing.deviceOnly, language: routing.language,
-            transcriber: deviceTranscriber(for: routing))
+            transcriber: routing.decision == .device ? deviceTranscriber(language: routing.language) : nil)
         notepad.begin(meetingId: meetingId, instance: client.instance, userId: userId, client: client)
         recordingMeetingId = UUID(uuidString: meetingId)
         recordingSeriesId = seriesId
@@ -1202,8 +1202,8 @@ final class AppController: NSObject, ObservableObject {
         verifySoleRecorder(meetingId: meetingId, token: captureToken, client: client)
     }
 
-    private func deviceTranscriber(for routing: CaptureRouting) -> LocalTranscriber? {
-        guard routing.decision == .device, let language = routing.language,
+    private func deviceTranscriber(language: String?) -> LocalTranscriber? {
+        guard let language,
               let entry = modelStore.routableEntry(forLanguage: language),
               let model = ParakeetEngine.Model(rawValue: entry.id) else { return nil }
         let directory = modelStore.directory(for: entry)
@@ -1612,6 +1612,7 @@ final class AppController: NSObject, ObservableObject {
             let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
             let result = await Self.recoverAll(
                 client: client, instance: instance, connectedUserId: userId, excluding: activeId,
+                makeTranscriber: { manifest in await self?.deviceTranscriber(language: manifest.language) },
                 flushNotes: { id in try await notepad.flush(meetingId: id, client: client) })
             await notepad.replayPending(client: client)
             // Recovery is otherwise silent; tell the user each rescued meeting is being finished, and
@@ -1650,11 +1651,14 @@ final class AppController: NSObject, ObservableObject {
         case unreadable
         case retryLater
         case keptOnThisMac
+        case busy
     }
 
     nonisolated static func recoveryOutcome(for error: Error?) -> RecoveryOutcome {
         guard let error else { return .recovered }
         if case MinutiaClientError.featureUnavailable = error { return .transcriptionUnavailable }
+        if case MinutiaClientError.serverError(status: 409) = error { return .busy }
+        if case CaptureSession.CaptureError.transcriptBusy? = error as? CaptureSession.CaptureError { return .busy }
         if let recoveryError = error as? CaptureRecovery.RecoveryError,
            recoveryError == .unreadableRecording { return .unreadable }
         if error as? CaptureRecovery.RecoveryError == .audioStaysOnThisMac { return .keptOnThisMac }
@@ -1695,6 +1699,8 @@ final class AppController: NSObject, ObservableObject {
         case .unreadable:
             updated.recoveryAttempts = maxRecoveryAttempts
             return SweepStep(save: updated, report: .exhausted)
+        case .busy:
+            return SweepStep(save: nil, report: nil)
         case .retryLater:
             updated.recoveryAttempts = sweep.nextAttempts
             return SweepStep(save: updated, report: sweep.notifyOnExhaustion ? .exhausted : nil)
@@ -1732,6 +1738,7 @@ final class AppController: NSObject, ObservableObject {
     /// static so it stays testable and off the main actor.
     nonisolated static func recoverAll(
         client: MinutiaClient, instance: URL, connectedUserId: String?, excluding activeMeetingId: String?,
+        makeTranscriber: @escaping @Sendable (CaptureManifest) async -> LocalTranscriber? = { _ in nil },
         flushNotes: @escaping @Sendable (String) async throws -> Void = { _ in }
     ) async -> (recovered: [CaptureManifest], transcriptionUnavailable: [CaptureManifest], keptOnThisMac: [CaptureManifest], exhausted: [CaptureManifest]) {
         var recovered: [CaptureManifest] = []
@@ -1756,7 +1763,7 @@ final class AppController: NSObject, ObservableObject {
             var caught: Error?
             do {
                 try await CaptureRecovery.recover(
-                    directory: dir, manifest: manifest, client: client,
+                    directory: dir, manifest: manifest, client: client, makeTranscriber: makeTranscriber,
                     flushNotes: { try await flushNotes(manifest.meetingId) })
             } catch {
                 caught = error
@@ -1776,7 +1783,7 @@ final class AppController: NSObject, ObservableObject {
                 logger.error("Recovery: unreadable recording for meeting \(manifest.meetingId, privacy: .public)")
             case .retryLater:
                 logger.error("Recovery deferred for meeting \(manifest.meetingId, privacy: .public) attempt \(sweep.nextAttempts, privacy: .public): \(String(describing: caught), privacy: .public)")
-            case .keptOnThisMac:
+            case .keptOnThisMac, .busy:
                 break
             }
             switch step.report {
@@ -1845,6 +1852,7 @@ final class AppController: NSObject, ObservableObject {
                 }
                 try await CaptureRecovery.recover(
                     directory: dir, manifest: manifest, client: client,
+                    makeTranscriber: { [weak self] in await self?.deviceTranscriber(language: $0.language) },
                     flushNotes: { [notepad] in try await notepad.flush(meetingId: meetingId, client: client) })
                 try? FileManager.default.removeItem(at: dir)
                 if let notesRoot = try? NotepadStore.notesRoot() {

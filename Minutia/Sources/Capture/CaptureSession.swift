@@ -43,7 +43,7 @@ final class CaptureSession: ObservableObject {
     }
 
     enum CaptureError: Error { case notRunning, stalled, recordingUnfinished, alreadyRunning, invalidMeetingId, transcriptionBlocked(TranscriptionReason),
-        transcriptNotSent, transcriptRejected, localTranscriptionTimedOut, nothingRecorded, transcriptTooLarge }
+        transcriptNotSent, transcriptBusy, transcriptRejected, localTranscriptionTimedOut, nothingRecorded, transcriptTooLarge }
 
     /// Ceiling for the stop-time network finalize (drain + upload + finalize + transcribe request).
     static let finalizeTimeout: TimeInterval = 60
@@ -349,6 +349,11 @@ final class CaptureSession: ObservableObject {
         }
     }
 
+    nonisolated static func submitFailure(_ error: Error) -> CaptureError {
+        if case MinutiaClientError.serverError(status: 409) = error { return .transcriptBusy }
+        return .transcriptNotSent
+    }
+
     /// The device-mode stop after capture has finished: finishes local transcription, writes
     /// `transcript.json`, marks the meeting as waiting for this Mac, submits it, deletes the directory on
     /// a 2xx, then warms the summary (unless the recap already opened) and ends the meeting.
@@ -359,13 +364,14 @@ final class CaptureSession: ObservableObject {
         transcribeTimeout: TimeInterval? = nil,
         sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
         flushNotes: @escaping @Sendable () async throws -> Void = {},
+        saved: [DeviceTranscript.Segment] = [],
         onStep: @escaping @Sendable (FinishingStep) async -> Void = { _ in },
         notifyLocalFailure: @escaping @Sendable (LocalTranscriber.Failure) async -> Void = { _ in },
         onLocalOutcome: @escaping @Sendable (Bool) async -> Void = { _ in }
     ) async throws -> StopResult {
         guard durationSeconds > 0 else { throw CaptureError.nothingRecorded }
         async let notesFlushed: Void = { try? await flushNotes() }()
-        let transcript: DeviceTranscript
+        var transcript: DeviceTranscript
         do {
             transcript = try await transcribeBounded(seconds: transcribeTimeout ?? localTranscriptionTimeout(durationSeconds: durationSeconds)) {
                 try await transcriber.finish(tail: tail, durationSeconds: durationSeconds, onStep: onStep)
@@ -400,6 +406,11 @@ final class CaptureSession: ObservableObject {
                 meetingId: meetingId, directory: directory, durationSeconds: durationSeconds, failure: failure,
                 transport: transport, cloud: cloud, recapOpened: recapOpened)
         }
+        if !saved.isEmpty {
+            transcript = DeviceTranscript.build(
+                source: transcript.source, language: transcript.language, durationSeconds: transcript.durationSeconds,
+                segments: transcript.segments + saved)
+        }
         guard let fitted = transcript.fitted() else { throw CaptureError.transcriptTooLarge }
         let body = try fitted.encoded()
         await notesFlushed
@@ -413,7 +424,7 @@ final class CaptureSession: ObservableObject {
         } catch CaptureError.transcriptRejected {
             throw CaptureError.transcriptRejected
         } catch {
-            throw CaptureError.transcriptNotSent
+            throw submitFailure(error)
         }
         try? FileManager.default.removeItem(at: directory)
         if !recapOpened { Task { await transport.warmSummary(meetingId: meetingId) } }

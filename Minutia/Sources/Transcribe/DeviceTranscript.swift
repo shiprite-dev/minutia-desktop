@@ -50,13 +50,16 @@ struct DeviceTranscript: Codable, Equatable, Sendable {
     static let maxDurationSeconds = 21_600.0
 
     /// Merges adjacent same-speaker segments (meeting-clock order, merged text at most
-    /// `maxSegmentText`) until the encoded body, the segment count and the total text fit the server
-    /// limits. Unchanged when it already fits; nil when it cannot fit.
+    /// `maxSegmentText`, the joining space counted) only as far as needed for the encoded body, the
+    /// segment count and the total text to fit the server limits. Unchanged when it already fits; nil
+    /// when it cannot fit.
     func fitted() -> DeviceTranscript? {
         var current = self
         while !current.fits {
             guard current.segments.reduce(0, { $0 + $1.text.utf16.count }) <= Self.maxTotalText else { return nil }
-            let merged = current.mergedPairs()
+            let bytes = (try? current.encoded().count) ?? .max
+            let wanted = max(1, current.segments.count - Self.maxSegments, (bytes - Self.maxBodyBytes) / 200)
+            let merged = current.mergedPairs(limit: wanted)
             guard merged.count < current.segments.count else { return nil }
             current = DeviceTranscript(
                 source: source, language: language, durationSeconds: durationSeconds, outcome: outcome, segments: merged)
@@ -70,11 +73,12 @@ struct DeviceTranscript: Codable, Equatable, Sendable {
             && ((try? encoded().count) ?? .max) <= Self.maxBodyBytes
     }
 
-    private func mergedPairs() -> [Segment] {
+    private func mergedPairs(limit: Int) -> [Segment] {
         var out: [Segment] = []
         var lastMergedHere = false
+        var merges = 0
         for segment in segments {
-            if let previous = out.last, !lastMergedHere, previous.speaker == segment.speaker,
+            if merges < limit, let previous = out.last, !lastMergedHere, previous.speaker == segment.speaker,
                previous.text.utf16.count + 1 + segment.text.utf16.count <= Self.maxSegmentText {
                 let weights = (Double(previous.text.utf16.count), Double(segment.text.utf16.count))
                 let confidence = previous.confidence.flatMap { a in
@@ -84,6 +88,7 @@ struct DeviceTranscript: Codable, Equatable, Sendable {
                     speaker: segment.speaker, start: previous.start, end: segment.end,
                     text: previous.text + " " + segment.text, confidence: confidence)
                 lastMergedHere = true
+                merges += 1
             } else {
                 out.append(segment)
                 lastMergedHere = false
