@@ -34,6 +34,12 @@ final class AuthManager: ObservableObject {
         let email: String?
     }
 
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
     deinit {
         authStateTask?.cancel()
     }
@@ -200,17 +206,27 @@ final class AuthManager: ObservableObject {
 
     private(set) var pendingAuth: PendingAuth? {
         get {
-            guard let data = UserDefaults.standard.data(forKey: Self.pendingAuthKey),
+            guard let data = defaults.data(forKey: Self.pendingAuthKey),
                   let decoded = try? JSONDecoder().decode(PendingAuth.self, from: data) else { return nil }
             return decoded
         }
         set {
+            objectWillChange.send()
             guard let value = newValue, let data = try? JSONEncoder().encode(value) else {
-                UserDefaults.standard.removeObject(forKey: Self.pendingAuthKey)
+                defaults.removeObject(forKey: Self.pendingAuthKey)
                 return
             }
-            UserDefaults.standard.set(data, forKey: Self.pendingAuthKey)
+            defaults.set(data, forKey: Self.pendingAuthKey)
         }
+    }
+
+    /// A browser sign-in is under way (started from the menu or opened by the first launch) and has
+    /// not failed or expired: the sign-in screen waits on it instead of offering a second attempt,
+    /// which would replace the nonce and strand the first tab.
+    var awaitingBrowserSignIn: Bool {
+        guard let pendingAuth, callbackError == nil else { return false }
+        return Self.authCallbackDecision(
+            alreadySignedIn: false, pending: pendingAuth, callbackState: pendingAuth.nonce, now: Date()) == .accept
     }
 
     /// Extracts the magic-link token hash from a `minutia://auth-callback?token_hash=...` URL.

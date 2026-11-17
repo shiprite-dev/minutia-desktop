@@ -135,6 +135,36 @@ final class SoloFirstRunTests: XCTestCase {
         XCTAssertEqual(controller.selectedSeriesId, weekly.id)
     }
 
+    private func recordTheDetectedStandup(_ controller: AppController) {
+        controller.detector.liveAgendaItem = happeningNow("Daily standup", standup)
+        controller.handleDetection(.high(.zoom))
+        XCTAssertEqual(controller.selectedSeriesId, standup.id)
+        controller.apply(.recordStarted)
+        controller.apply(.recordStopped)
+        controller.handleDetection(.none)
+        controller.detector.liveAgendaItem = nil
+    }
+
+    func test_afterRecordingTheStandup_theNextUnscheduledCallRecordsIntoTheLastUsedSeries() {
+        defaults.set(weekly.id.uuidString, forKey: AppController.lastSeriesKey)
+        let controller = signedInController(series: [weekly, standup])
+        recordTheDetectedStandup(controller)
+        controller.apply(.finalized)
+        controller.handleDetection(.high(.zoom))
+
+        XCTAssertEqual(controller.meetingPromptPanel.content?.title, "Looks like you're in a Zoom meeting")
+        XCTAssertEqual(controller.selectedSeriesId, weekly.id)
+    }
+
+    func test_whenTheStandupRecordingFailsToFinish_RecordStillReturnsToTheLastUsedSeries() {
+        defaults.set(weekly.id.uuidString, forKey: AppController.lastSeriesKey)
+        let controller = signedInController(series: [weekly, standup])
+        recordTheDetectedStandup(controller)
+        controller.apply(.failed("Could not finish the notes."))
+
+        XCTAssertEqual(controller.selectedSeriesId, weekly.id)
+    }
+
     func test_theCalendarCatchingUp_doesNotOverrideAManualPick() {
         let controller = signedInController(series: [weekly, standup])
         controller.handleDetection(.high(.zoom))
@@ -191,6 +221,25 @@ final class SoloFirstRunTests: XCTestCase {
             .queryItems?.first(where: { $0.name == "state" })?.value
         XCTAssertEqual(opened.first?.path, "/companion/authorize")
         XCTAssertEqual(state, controller.authManager.pendingAuth?.nonce, "the opened page is the sign-in this app is waiting on")
+    }
+
+    func test_onFirstLaunch_theSignInScreenWaitsOnTheBrowserTabItOpened_insteadOfOfferingAnotherSignIn() async {
+        XCTAssertTrue(FirstRun.isFirstLaunch(defaults))
+        let controller = makeController()
+        XCTAssertFalse(controller.authManager.awaitingBrowserSignIn)
+        await connect(controller)
+
+        XCTAssertEqual(opened.count, 1)
+        XCTAssertTrue(controller.authManager.awaitingBrowserSignIn, "the menu shows Check your browser and Start over")
+        controller.authManager.cancelBrowserSignIn()
+        XCTAssertFalse(controller.authManager.awaitingBrowserSignIn, "Start over brings back Sign in with browser")
+    }
+
+    func test_signInTestsNeverTouchTheInstalledAppsPendingSignIn() async {
+        let before = UserDefaults.standard.data(forKey: "app.minutia.pendingAuth")
+        XCTAssertTrue(FirstRun.isFirstLaunch(defaults))
+        await connect(makeController())
+        XCTAssertEqual(UserDefaults.standard.data(forKey: "app.minutia.pendingAuth"), before)
     }
 
     func test_anOfflineFirstLaunch_opensSignInWhenTheConnectionComesBack_onlyOnce() async {

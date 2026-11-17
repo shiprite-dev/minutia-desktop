@@ -290,8 +290,11 @@ final class AppController: NSObject, ObservableObject {
     @Published private(set) var selectedSeriesId: UUID?
     /// The user chose a series during the current detected meeting; detection then leaves it alone.
     private var seriesPickedThisMeeting = false
+    /// Record points at a calendar meeting's series rather than the user's own choice; once that
+    /// meeting is over it goes back to last-used.
+    private var seriesFromDetection = false
 
-    let authManager = AuthManager()
+    let authManager: AuthManager
     let captureSession = CaptureSession()
     let notepad = NotepadController()
     let detector = MeetingDetector()
@@ -740,6 +743,7 @@ final class AppController: NSObject, ObservableObject {
         }
     ) {
         self.defaults = defaults
+        self.authManager = AuthManager(defaults: defaults)
         self.openURL = openURL
         self.micCheck = micCheck
         super.init()
@@ -819,6 +823,7 @@ final class AppController: NSObject, ObservableObject {
         guard next != phase else { return }
         let previous = phase
         phase = next
+        restoreLastUsedAfterDetectedMeeting()
         switch Self.modelStoreCue(from: previous, to: next, signedIn: authManager.sessionIdentity.email != nil) {
         case .pause: modelStore.recordingDidStart()
         case .resume: Task { await modelStore.recordingDidStop() }
@@ -969,11 +974,8 @@ final class AppController: NSObject, ObservableObject {
             // prompt session so the next meeting can prompt again.
             if case .detected = phase { apply(.dismissedDetection) }
             resetMeetingPromptSession()
-            if !seriesPickedThisMeeting, MeetingPrompt.canPrompt(phase: phase) {
-                let ids = series.map(\.id)
-                selectedSeriesId = lastUsedSeriesId.flatMap { ids.contains($0) ? $0 : nil } ?? ids.first
-            }
             seriesPickedThisMeeting = false
+            restoreLastUsedAfterDetectedMeeting()
         case .soft:
             // Quiet by design: no phase change, no prompt, just the menu bar hint.
             break
@@ -987,6 +989,17 @@ final class AppController: NSObject, ObservableObject {
         guard !seriesPickedThisMeeting, let id = live?.seriesId,
               series.contains(where: { $0.id == id }) else { return }
         selectedSeriesId = id
+        seriesFromDetection = true
+    }
+
+    /// Runs when the mic session ends and again when the phase settles after a recording's
+    /// finalize (the mic releases mid-finalize), so recording the meeting still lands back here.
+    private func restoreLastUsedAfterDetectedMeeting() {
+        guard seriesFromDetection, Self.canStartRecording(from: phase) else { return }
+        if case .high = lastConfidence { return }
+        let ids = series.map(\.id)
+        selectedSeriesId = lastUsedSeriesId.flatMap { ids.contains($0) ? $0 : nil } ?? ids.first
+        seriesFromDetection = false
     }
 
     /// The calendar caught up with a meeting already detected (joined early, or the agenda poll
@@ -1005,6 +1018,7 @@ final class AppController: NSObject, ObservableObject {
     /// The Series picker: the user's own choice, remembered as last-used.
     func pickSeries(_ id: UUID?) {
         selectedSeriesId = id
+        seriesFromDetection = false
         if case .high = lastConfidence { seriesPickedThisMeeting = true }
         defaults.set(id?.uuidString, forKey: Self.lastSeriesKey)
     }
