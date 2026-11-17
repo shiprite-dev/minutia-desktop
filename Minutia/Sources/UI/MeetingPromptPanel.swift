@@ -105,57 +105,58 @@ final class MeetingPromptPanel {
     }
 }
 
-/// The capsule content: a glyph, the headline, a prominent primary action, and a quiet secondary.
-/// The primary label and the secondary shape come from the content, so the same shell renders both
-/// the start ("Start taking notes" + xmark dismiss) and end ("Wrap up my notes" + "Keep recording")
-/// variants. System materials and SF Pro defaults; both actions carry VoiceOver labels.
-private struct MeetingPromptView: View {
+/// The capsule content: the brand mark, the headline, a prominent primary action, and a quiet
+/// secondary. The primary label and the secondary shape come from the content, so the same shell
+/// renders both the start ("Start taking notes" + xmark dismiss) and end ("Wrap up my notes" +
+/// "Keep recording") variants. Glass on macOS 26 and later, a thick material below.
+struct MeetingPromptView: View {
     let content: MeetingPromptContent
     let onStart: () -> Void
     let onDismiss: () -> Void
 
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
     var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: content.symbol)
-                .font(.title2)
-                .foregroundStyle(.tint)
-                .symbolEffect(.variableColor.iterative, isActive: !reduceMotion)
-                .accessibilityHidden(true)
+        HStack(spacing: Space.x3) {
+            MarkView(barHeight: 18, rises: true)
+                .foregroundStyle(Color(nsColor: .labelColor))
 
             Text(content.title)
-                .font(.callout.weight(.medium))
+                .font(Typo.bodyStrong)
+                .foregroundStyle(Color(nsColor: .labelColor))
                 .fixedSize()
 
             Button(action: onStart) {
-                Text(content.primaryTitle)
-                    .fontWeight(.semibold)
+                Text(content.primaryTitle).padding(.horizontal, Space.x3)
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.regular)
+            .buttonStyle(PrimaryButtonStyle())
+            .fixedSize()
 
             if let secondaryTitle = content.secondaryTitle {
-                Button(action: onDismiss) {
-                    Text(secondaryTitle)
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel(secondaryTitle)
+                Button(secondaryTitle, action: onDismiss)
+                    .buttonStyle(QuietButtonStyle())
+                    .accessibilityLabel(secondaryTitle)
             } else {
                 Button(action: onDismiss) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(.secondary)
+                    Image(systemName: "xmark").font(.system(size: 11, weight: .semibold))
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(QuietButtonStyle())
                 .accessibilityLabel("Dismiss")
             }
         }
         .padding(.horizontal, 18)
-        .padding(.vertical, 12)
-        .background(.thickMaterial, in: Capsule())
-        .overlay(Capsule().strokeBorder(.quaternary, lineWidth: 0.5))
+        .padding(.vertical, Space.x3)
+        .modifier(CapsuleSurface())
         .fixedSize()
+    }
+}
+
+private struct CapsuleSurface: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26, *) {
+            content.glassEffect(.regular, in: Capsule())
+        } else {
+            content
+                .background(.thickMaterial, in: Capsule())
+                .overlay(Capsule().strokeBorder(.quaternary, lineWidth: 0.5))
+        }
     }
 }

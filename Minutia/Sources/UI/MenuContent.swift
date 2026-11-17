@@ -1,10 +1,42 @@
 import SwiftUI
 
-/// Opens the Microphone privacy pane in System Settings. Shared by the idle mic banner and the
-/// mic-denial ErrorView affordance so both use the identical deep link.
 private func openMicrophoneSettings() {
     if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
         NSWorkspace.shared.open(url)
+    }
+}
+
+enum Celebration {
+    static func hold(reduceMotion: Bool) -> TimeInterval {
+        (reduceMotion ? 0 : 0.18 + CheckReveal.drawDuration + CheckReveal.popHold) + 1.6
+    }
+
+    static func visible(cue: RecapCue?, phase: AppPhase) -> Bool {
+        cue != nil && phase == .idle
+    }
+}
+
+enum PanelHaptic {
+    static func feedback(from old: AppPhase, to new: AppPhase) -> SensoryFeedback? {
+        switch (old, new) {
+        case (.idle, .recording), (.detected, .recording), (.error, .recording), (.recording, .finalizing): .levelChange
+        default: nil
+        }
+    }
+}
+
+enum FinishingProgress {
+    static func fraction(_ step: CaptureSession.FinishingStep?) -> Double? {
+        guard case .transcribing(let completed, let total) = step, total > 0 else { return nil }
+        return min(1, max(0, Double(completed) / Double(total)))
+    }
+}
+
+enum ErrorActions {
+    enum Action { case retry, dismiss, openSettings }
+
+    static func resolve(isMicError: Bool) -> (primary: Action, secondary: Action) {
+        isMicError ? (.openSettings, .retry) : (.retry, .dismiss)
     }
 }
 
@@ -13,51 +45,68 @@ private func openMicrophoneSettings() {
 struct MenuContent: View {
     @ObservedObject var controller: AppController
     @ObservedObject var updater: UpdaterController
+    @Environment(\.motionReduced) private var reduceMotion
+    @State private var visible = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Above the phase switch so the consent affordance is reachable in every phase a
-            // web-record can be pending (idle, detected, error), not only the idle layout. This
-            // is the guaranteed fallback when notification permission is denied.
             if controller.pendingRecordConsent != nil {
-                WebRecordConsentBanner(controller: controller)
-                    .padding(12)
+                ConsentNotice(
+                    hasClaim: controller.pendingRecordConsent?.claim != nil,
+                    onAlways: { controller.answerWebStart(.always) },
+                    onOnce: { controller.answerWebStart(.once) },
+                    onIgnoreClaim: { controller.answerWebStart(.ignore) },
+                    onStart: { controller.confirmPendingRecord() },
+                    onIgnore: { controller.dismissPendingRecord() })
             }
 
-            // Transient feedback (e.g. a rejected web-record) surfaced in-menu, so it reaches the
-            // user even when notification permission is denied. Auto-clears on the next phase change.
             if let feedback = controller.recordFeedback {
-                FeedbackBanner(message: feedback)
-                    .padding(.horizontal, 12)
-                    .padding(.top, 12)
+                FeedbackNotice(message: feedback)
             }
 
             Group {
                 switch controller.phase {
                 case .signedOut:
                     SignInView(authManager: controller.authManager, showsMenuBarHint: controller.showsMenuBarHint)
+                case .idle where Celebration.visible(cue: controller.recapCue, phase: controller.phase):
+                    DoneContent(onOpenRecap: { controller.openRecapFromCue() })
                 case .idle:
-                    IdleView(controller: controller, detectedVia: nil)
+                    IdleHost(controller: controller, detectedVia: nil)
                 case .detected(let app):
-                    IdleView(controller: controller, detectedVia: app ?? "Calendar")
+                    IdleHost(controller: controller, detectedVia: app ?? "Calendar")
                 case .recording:
                     RecordingView(
                         session: controller.captureSession,
+                        seriesName: controller.recordingSeriesName,
                         onNotes: { controller.notepad.showAndFocus() },
                         onStop: { controller.stopRecording() })
                 case .finalizing:
                     FinalizingView(session: controller.captureSession)
                 case .error(let message):
-                    ErrorView(message: message, controller: controller)
+                    ErrorScreen(
+                        message: message,
+                        isMicError: AppController.isMicPermissionError(message: message),
+                        onRetry: { controller.retry() },
+                        onDismiss: { controller.dismissError() },
+                        onOpenSettings: openMicrophoneSettings)
                 }
             }
+            .padding(.top, controller.pendingRecordConsent != nil || controller.recordFeedback != nil ? -Space.x1 : 0)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .transition(.opacity)
 
             ModelStatusRow(store: controller.modelStore)
-            Divider()
+            HairlineRule()
             Footer(updater: updater)
         }
-        .frame(width: 320)
+        .frame(width: Space.panelWidth)
+        .environment(\.panelVisible, visible)
+        .environment(\.consentPending, controller.pendingRecordConsent != nil)
+        .animation(Motion.resolved(Motion.settle, reduce: reduceMotion), value: controller.phase)
+        .animation(Motion.resolved(Motion.settle, reduce: reduceMotion), value: controller.recapCue)
+        .sensoryFeedback(trigger: controller.phase) { old, new in PanelHaptic.feedback(from: old, to: new) }
+        .onAppear { visible = true }
+        .onDisappear { visible = false }
     }
 }
 
@@ -76,233 +125,283 @@ private struct ModelStatusRow: View {
     @ObservedObject var store: ModelStore
 
     var body: some View {
-        if let label = store.status.menuLabel {
-            Text(label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 12)
-                .padding(.bottom, 8)
-                .frame(maxWidth: .infinity, alignment: .leading)
+        if let label = store.status.menuLabel, case .downloading(let received, let total) = store.status {
+            ModelDownloadRow(label: label, fraction: Double(received) / Double(max(total, 1)))
         }
     }
 }
 
-/// Idle and detected phases share one layout; detection adds the highlighted banner.
-private struct IdleView: View {
+struct ModelDownloadRow: View {
+    let label: String
+    let fraction: Double
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.x1) {
+            Text(label)
+                .font(Typo.caption)
+                .foregroundStyle(Brand.ink2)
+                .contentTransition(.numericText())
+            ProgressHairline(fraction: fraction)
+        }
+        .padding(.horizontal, Space.x4)
+        .padding(.bottom, Space.x2)
+        .frame(width: Space.panelWidth, alignment: .leading)
+    }
+}
+
+struct IdleModel {
+    var series: [Series]
+    var selected: UUID?
+    var detectedVia: String?
+    var softHint: Bool
+    var micBanner: Bool
+    var recovering: Bool
+    var instance: URL
+}
+
+private struct IdleHost: View {
     @ObservedObject var controller: AppController
     let detectedVia: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if controller.micBannerVisible {
-                MicPermissionBanner()
+        IdleScreen(
+            model: IdleModel(
+                series: controller.series,
+                selected: controller.selectedSeriesId,
+                detectedVia: detectedVia,
+                softHint: controller.softHint,
+                micBanner: controller.micBannerVisible,
+                recovering: controller.recoveryActive,
+                instance: controller.authManager.instance ?? InstanceConfig.resolvedInstance),
+            onSelect: controller.pickSeries,
+            onRecord: { controller.startRecording() },
+            onDismissDetection: { controller.dismissDetection() },
+            onOpenURL: { NSWorkspace.shared.open($0) },
+            onOpenMicSettings: openMicrophoneSettings)
+            .onAppear {
+                controller.refreshPermissionState()
+                controller.reloadSeries()
             }
-
-            if let detectedVia {
-                DetectionBanner(via: detectedVia, controller: controller)
-            } else if controller.softHint {
-                SoftHintRow()
-            }
-
-            if controller.recoveryActive {
-                RecoveryRow()
-            }
-
-            if controller.series.isEmpty {
-                let links = MenuLink.emptySeries(instance: controller.authManager.instance ?? InstanceConfig.resolvedInstance)
-                VStack(alignment: .leading, spacing: 6) {
-                    Button {
-                        NSWorkspace.shared.open(links.primary.url)
-                    } label: {
-                        Label(links.primary.title, systemImage: "calendar")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    Button(links.secondary.title) { NSWorkspace.shared.open(links.secondary.url) }
-                        .buttonStyle(.link)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                Picker("Series", selection: Binding(get: { controller.selectedSeriesId }, set: controller.pickSeries)) {
-                    ForEach(controller.series) { series in
-                        Text(series.name).tag(Optional(series.id))
-                    }
-                }
-            }
-
-            Button {
-                controller.startRecording()
-            } label: {
-                Label("Record", systemImage: "record.circle")
-                    .frame(maxWidth: .infinity)
-            }
-            .controlSize(.large)
-            .buttonStyle(.borderedProminent)
-            .keyboardShortcut(.defaultAction)
-            .disabled(controller.selectedSeriesId == nil)
-        }
-        .padding(12)
-        .onAppear {
-            controller.refreshPermissionState()
-            controller.reloadSeries()
-        }
     }
 }
 
-/// Shown when mic access is not granted: recording is impossible without it, so guide the user
-/// straight to the System Settings pane. System audio TCC cannot be queried, so it is only noted.
-private struct MicPermissionBanner: View {
+/// Idle and detected phases share one layout; detection adds the highlighted notice.
+struct IdleScreen: View {
+    let model: IdleModel
+    var onSelect: (UUID?) -> Void = { _ in }
+    var onRecord: () -> Void = {}
+    var onDismissDetection: () -> Void = {}
+    var onOpenURL: (URL) -> Void = { _ in }
+    var onOpenMicSettings: () -> Void = {}
+    @Environment(\.motionReduced) private var reduceMotion
+    @Environment(\.consentPending) private var consentPending
+
+    private var selectedName: String? { model.series.first { $0.id == model.selected }?.name }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Image(systemName: "mic.slash")
-                    .foregroundStyle(.yellow)
-                Text("Microphone access needed to record")
-                    .font(.callout)
-                    .fontWeight(.medium)
-                    .fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: Space.x3) {
+            if model.micBanner {
+                MicPermissionNotice(onOpenSettings: onOpenMicSettings)
             }
-            Text("System audio is requested the first time you record.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Button("Open System Settings", action: openMicrophoneSettings)
-                .buttonStyle(.bordered)
-                .controlSize(.small)
+
+            if let via = model.detectedVia {
+                DetectionNotice(via: via, onDismiss: onDismissDetection)
+                    .transition(.opacity.combined(with: .offset(y: -6)))
+            } else if model.softHint {
+                QuietRow(systemImage: "mic", text: "In a meeting? Record picks it up from here.")
+            }
+
+            if model.recovering {
+                HStack(spacing: Space.x2) {
+                    MarkView(barHeight: 12, breathing: true)
+                    Text(AppController.recoveryRowLabel)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .font(Typo.body)
+                .foregroundStyle(Brand.ink3)
+            }
+
+            if model.series.isEmpty {
+                emptyState
+            } else {
+                Eyebrow(text: "Series")
+                Picker("Series", selection: Binding(get: { model.selected }, set: onSelect)) {
+                    ForEach(model.series) { series in
+                        Text(series.name).lineLimit(1).truncationMode(.tail).tag(Optional(series.id))
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(maxWidth: .infinity)
+                .help(selectedName ?? "")
+                .accessibilityLabel("Series")
+
+                RecordButton(consentPending: consentPending, action: onRecord)
+                    .disabled(model.selected == nil)
+                    .accessibilityLabel(selectedName.map { "Record \($0)" } ?? "Record")
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
-        .background(.yellow.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .padding(Space.x4)
+        .frame(width: Space.panelWidth, alignment: .leading)
+        .animation(Motion.resolved(Motion.settle, reduce: reduceMotion), value: model.detectedVia)
+    }
+
+    private var emptyState: some View {
+        let links = MenuLink.emptySeries(instance: model.instance)
+        return VStack(alignment: .leading, spacing: Space.x3) {
+            Text("No series yet").font(Typo.title)
+            Text("Connect a calendar or create a series in Minutia on the web, then record here.")
+                .font(Typo.body)
+                .foregroundStyle(Brand.ink2)
+                .fixedSize(horizontal: false, vertical: true)
+            ConnectButton(title: links.primary.title, consentPending: consentPending) { onOpenURL(links.primary.url) }
+            Button(links.secondary.title) { onOpenURL(links.secondary.url) }
+                .buttonStyle(QuietButtonStyle())
+        }
     }
 }
 
-/// Small transient banner for controller feedback that must surface without notifications.
-private struct FeedbackBanner: View {
+private struct ConnectButton: View {
+    let title: String
+    let consentPending: Bool
+    let action: () -> Void
+
+    var body: some View {
+        if consentPending {
+            Button(action: action) { Label(title, systemImage: "calendar") }.buttonStyle(SecondaryButtonStyle())
+        } else {
+            Button(action: action) { Label(title, systemImage: "calendar") }.buttonStyle(PrimaryButtonStyle())
+        }
+    }
+}
+
+private struct RecordButton: View {
+    let consentPending: Bool
+    let action: () -> Void
+
+    var body: some View {
+        if consentPending {
+            Button(action: action) { Label("Record", systemImage: "record.circle") }
+                .buttonStyle(SecondaryButtonStyle())
+        } else {
+            Button(action: action) { Label("Record", systemImage: "record.circle") }
+                .buttonStyle(PrimaryButtonStyle())
+                .keyboardShortcut(.defaultAction)
+        }
+    }
+}
+
+struct QuietRow: View {
+    let systemImage: String
+    let text: String
+
+    var body: some View {
+        HStack(spacing: Space.x2) {
+            Image(systemName: systemImage)
+            Text(text).fixedSize(horizontal: false, vertical: true)
+        }
+        .font(Typo.body)
+        .foregroundStyle(Brand.ink3)
+    }
+}
+
+private struct MicPermissionNotice: View {
+    let onOpenSettings: () -> Void
+
+    var body: some View {
+        NoticeRow(kind: .warn) {
+            Image(systemName: "mic.slash").foregroundStyle(Brand.warn)
+        } content: {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Microphone access needed to record").font(Typo.bodyStrong)
+                Text("System audio is requested the first time you record.")
+                    .font(Typo.caption)
+                    .foregroundStyle(Brand.ink2)
+                Button("Open System Settings", action: onOpenSettings)
+                    .buttonStyle(SecondaryButtonStyle())
+                    .fixedSize()
+            }
+        }
+    }
+}
+
+struct FeedbackNotice: View {
     let message: String
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "exclamationmark.circle")
-                .foregroundStyle(.secondary)
-            Text(message)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+        NoticeRow(kind: .neutral) {
+            Image(systemName: "exclamationmark.circle").foregroundStyle(Brand.ink2)
+        } content: {
+            Text(message).foregroundStyle(Brand.ink2)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
-        .background(.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, Space.x4)
+        .padding(.top, Space.x4)
+        .frame(width: Space.panelWidth)
     }
 }
 
-/// Quiet soft-detection nudge: mic active but no corroborating meeting signal. Deliberately
-/// styled secondary (not the accent banner) so it reads as a whisper, not an alert.
-private struct SoftHintRow: View {
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "mic")
-            Text("In a meeting? Record picks it up from here.")
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .font(.callout)
-        .foregroundStyle(.secondary)
-    }
-}
-
-/// Quiet secondary row shown while the startup recovery sweep finalizes a prior recording's
-/// orphaned upload, so the work is visible instead of happening silently in the background.
-private struct RecoveryRow: View {
-    var body: some View {
-        HStack(spacing: 8) {
-            ProgressView()
-                .controlSize(.small)
-            Text(AppController.recoveryRowLabel)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .font(.callout)
-        .foregroundStyle(.secondary)
-    }
-}
-
-/// Consent gate for a browser-triggered `minutia://record`. The guaranteed fallback when
-/// notifications are denied, so it must be reachable from the menu: capture starts only when the
-/// user taps Start recording here (or in the notification).
-private struct WebRecordConsentBanner: View {
-    @ObservedObject var controller: AppController
+/// Consent gate for a browser-triggered `minutia://record`: capture starts only when the user
+/// answers here (or in the notification), so a web page can never start a covert recording.
+struct ConsentNotice: View {
+    let hasClaim: Bool
+    var onAlways: () -> Void = {}
+    var onOnce: () -> Void = {}
+    var onIgnoreClaim: () -> Void = {}
+    var onStart: () -> Void = {}
+    var onIgnore: () -> Void = {}
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Image(systemName: "record.circle")
-                    .foregroundStyle(.tint)
-                Text("Record this meeting from your browser?")
-                    .font(.callout)
-                    .fontWeight(.medium)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if controller.pendingRecordConsent?.claim != nil {
-                VStack(spacing: 6) {
-                    Button {
-                        controller.answerWebStart(.always)
-                    } label: {
-                        Text("Always start automatically").frame(maxWidth: .infinity)
+        NoticeRow(kind: .accent) {
+            Image(systemName: "record.circle").foregroundStyle(Brand.vermilion)
+        } content: {
+            VStack(alignment: .leading, spacing: Space.x2) {
+                Text("Record this meeting from your browser?").font(Typo.bodyStrong)
+                if hasClaim {
+                    Button("Always start automatically", action: onAlways)
+                        .buttonStyle(PrimaryButtonStyle())
+                    HStack(spacing: Space.x2) {
+                        Button("Just this once", action: onOnce).buttonStyle(SecondaryButtonStyle())
+                        Button("Ignore", action: onIgnoreClaim).buttonStyle(SecondaryButtonStyle())
                     }
-                    .buttonStyle(.borderedProminent)
-                    HStack(spacing: 8) {
-                        Button {
-                            controller.answerWebStart(.once)
-                        } label: {
-                            Text("Just this once").frame(maxWidth: .infinity)
-                        }
-                        Button("Ignore") { controller.answerWebStart(.ignore) }
+                } else {
+                    HStack(spacing: Space.x2) {
+                        Button("Start recording", action: onStart)
+                            .buttonStyle(PrimaryButtonStyle())
+                            .keyboardShortcut(.defaultAction)
+                        Button("Ignore", action: onIgnore).buttonStyle(SecondaryButtonStyle())
                     }
-                    .buttonStyle(.bordered)
-                }
-            } else {
-                HStack(spacing: 8) {
-                    Button {
-                        controller.confirmPendingRecord()
-                    } label: {
-                        Text("Start recording")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
-                    Button("Ignore") {
-                        controller.dismissPendingRecord()
-                    }
-                    .buttonStyle(.bordered)
                 }
             }
         }
-        .padding(10)
-        .background(.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, Space.x4)
+        .padding(.top, Space.x4)
+        .frame(width: Space.panelWidth)
     }
 }
 
-private struct DetectionBanner: View {
+private struct DetectionNotice: View {
     let via: String
-    @ObservedObject var controller: AppController
+    let onDismiss: () -> Void
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "sparkles")
-                .foregroundStyle(.tint)
-            Text(AppController.detectionBannerText(via: via))
-                .font(.callout)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-            Button {
-                controller.dismissDetection()
-            } label: {
-                Image(systemName: "xmark")
+        NoticeRow(kind: .accent) {
+            MarkView(barHeight: 14, rises: true)
+        } content: {
+            HStack(alignment: .top, spacing: Space.x2) {
+                Text(AppController.detectionBannerText(via: via))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .padding(-4)
+                .buttonStyle(QuietButtonStyle())
+                .keyboardShortcut(.cancelAction)
+                .accessibilityLabel("Dismiss detection")
             }
-            .buttonStyle(.borderless)
-            .keyboardShortcut(.cancelAction)
-            .accessibilityLabel("Dismiss detection")
         }
-        .padding(10)
-        .background(.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
     }
 }
 
@@ -311,60 +410,129 @@ private struct FinalizingView: View {
     @State private var preparingSince: Date?
 
     var body: some View {
-        HStack(spacing: 10) {
-            ProgressView()
-                .controlSize(.small)
-            if let step = session.finishingStep {
-                Text(step.label)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                if step == .preparingModel {
-                    TimelineView(.periodic(from: .now, by: 1)) { context in
-                        Text("\(Int(context.date.timeIntervalSince(preparingSince ?? context.date)))s")
-                            .font(.callout.monospacedDigit())
-                            .foregroundStyle(.tertiary)
+        FinishingContent(
+            label: CaptureSession.finishingLabel(step: session.finishingStep, audioMayLeaveMac: session.audioMayLeaveMac),
+            progress: FinishingProgress.fraction(session.finishingStep),
+            preparingSince: preparingSince)
+            .onChange(of: session.finishingStep == .preparingModel, initial: true) { _, preparing in
+                preparingSince = preparing ? Date() : nil
+            }
+    }
+}
+
+struct FinishingContent: View {
+    let label: String
+    let progress: Double?
+    let preparingSince: Date?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.x3) {
+            HStack(alignment: .top, spacing: Space.x3) {
+                MarkView(barHeight: 20, breathing: true)
+                VStack(alignment: .leading, spacing: Space.x1) {
+                    Text(label)
+                        .font(Typo.title)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .contentTransition(.numericText())
+                    if let preparingSince {
+                        TimelineView(.periodic(from: .now, by: 1)) { context in
+                            Text("\(Int(context.date.timeIntervalSince(preparingSince)))s")
+                                .font(Typo.caption.monospacedDigit())
+                                .foregroundStyle(Brand.ink3)
+                                .contentTransition(.numericText())
+                        }
                     }
+                    Text("You can close this. Minutia finishes in the background.")
+                        .font(Typo.caption)
+                        .foregroundStyle(Brand.ink2)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-            } else {
-                Text(CaptureSession.finishingLabel(step: session.finishingStep, audioMayLeaveMac: session.audioMayLeaveMac))
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+            }
+            if let progress {
+                ProgressHairline(fraction: progress)
             }
         }
-        .padding(16)
-        .onChange(of: session.finishingStep == .preparingModel, initial: true) { _, preparing in
-            preparingSince = preparing ? Date() : nil
+        .padding(Space.x4)
+        .frame(width: Space.panelWidth, alignment: .leading)
+    }
+}
+
+struct DoneContent: View {
+    var onOpenRecap: () -> Void = {}
+    @Environment(\.motionReduced) private var reduceMotion
+    @State private var progress: CGFloat = 0
+    @State private var popped = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: Space.x3) {
+            MarkView(barHeight: 20, includesCheck: true, checkProgress: reduceMotion ? 1 : progress, popped: popped)
+            VStack(alignment: .leading, spacing: Space.x1) {
+                Text("Sent. Your recap is on its way")
+                    .font(Typo.title)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Open recap", action: onOpenRecap)
+                    .buttonStyle(QuietButtonStyle())
+            }
+        }
+        .padding(Space.x4)
+        .frame(width: Space.panelWidth, alignment: .leading)
+        .sensoryFeedback(.alignment, trigger: progress == 1)
+        .task {
+            guard !reduceMotion else { return }
+            try? await Task.sleep(nanoseconds: 180_000_000)
+            withAnimation(.timingCurve(0.2, 0.8, 0.2, 1, duration: CheckReveal.drawDuration)) { progress = 1 }
+            try? await Task.sleep(nanoseconds: UInt64(CheckReveal.drawDuration * 1_000_000_000))
+            popped = true
+            try? await Task.sleep(nanoseconds: UInt64(CheckReveal.popHold * 1_000_000_000))
+            popped = false
         }
     }
 }
 
-private struct ErrorView: View {
+struct ErrorScreen: View {
     let message: String
-    @ObservedObject var controller: AppController
+    let isMicError: Bool
+    var onRetry: () -> Void = {}
+    var onDismiss: () -> Void = {}
+    var onOpenSettings: () -> Void = {}
+    @Environment(\.consentPending) private var consentPending
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Label {
+        let actions = ErrorActions.resolve(isMicError: isMicError)
+        VStack(alignment: .leading, spacing: Space.x3) {
+            NoticeRow(kind: .warn) {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Brand.warn)
+            } content: {
                 Text(message)
-                    .font(.callout)
-                    .fixedSize(horizontal: false, vertical: true)
-            } icon: {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.yellow)
             }
-            if AppController.isMicPermissionError(message: message) {
-                Button("Open System Settings", action: openMicrophoneSettings)
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-            }
-            HStack {
-                Button("Retry") { controller.retry() }
-                    .keyboardShortcut(.defaultAction)
-                Button("Dismiss") { controller.dismissError() }
-                    .keyboardShortcut(.cancelAction)
+            button(actions.primary, primary: true)
+            button(actions.secondary, primary: false)
+            if isMicError {
+                button(.dismiss, primary: false)
             }
         }
-        .padding(12)
+        .padding(Space.x4)
+        .frame(width: Space.panelWidth, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func button(_ action: ErrorActions.Action, primary: Bool) -> some View {
+        switch action {
+        case .retry: leading("Retry", action: onRetry, primary: primary)
+        case .openSettings: leading("Open System Settings", action: onOpenSettings, primary: primary)
+        case .dismiss:
+            Button("Dismiss", action: onDismiss).buttonStyle(QuietButtonStyle()).keyboardShortcut(.cancelAction)
+                .frame(maxWidth: .infinity)
+        }
+    }
+
+    @ViewBuilder
+    private func leading(_ title: String, action: @escaping () -> Void, primary: Bool) -> some View {
+        if primary && !consentPending {
+            Button(title, action: action).buttonStyle(PrimaryButtonStyle()).keyboardShortcut(.defaultAction)
+        } else {
+            Button(title, action: action).buttonStyle(SecondaryButtonStyle())
+        }
     }
 }
 
@@ -373,34 +541,54 @@ private struct Footer: View {
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
-        HStack {
-            Button {
+        FooterBar(
+            updateAvailable: updater.updateAvailable,
+            onSettings: {
                 NSApp.activate(ignoringOtherApps: true)
                 openSettings()
-            } label: {
-                Image(systemName: "gearshape")
+            },
+            onUpdate: { updater.checkForUpdates() },
+            onQuit: { NSApp.terminate(nil) })
+    }
+}
+
+struct FooterBar: View {
+    let updateAvailable: Bool
+    var onSettings: () -> Void = {}
+    var onUpdate: () -> Void = {}
+    var onQuit: () -> Void = {}
+    @State private var chipShown = false
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Button(action: onSettings) {
+                Image(systemName: "gearshape").frame(minWidth: 28, minHeight: 28).contentShape(Rectangle())
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(QuietButtonStyle())
             .accessibilityLabel("Settings")
             Spacer()
-            // A scheduled update found in the background can't rely on Sparkle's own alert in an
-            // LSUIElement app (it opens behind other windows); this subtle affordance surfaces it and
-            // hands control back to Sparkle's standard UI when tapped.
-            if updater.updateAvailable {
-                Button {
-                    updater.checkForUpdates()
-                } label: {
-                    Label("Update available", systemImage: "sparkles")
-                        .font(.callout)
-                }
-                .buttonStyle(.borderless)
-                Spacer()
+            Button(action: onQuit) {
+                Text("Quit").frame(minWidth: 28, minHeight: 28).contentShape(Rectangle())
             }
-            Button("Quit") { NSApp.terminate(nil) }
-                .buttonStyle(.borderless)
-                .keyboardShortcut("q")
+            .buttonStyle(QuietButtonStyle())
+            .keyboardShortcut("q")
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .overlay {
+            if updateAvailable {
+                Button(action: onUpdate) {
+                    HStack(spacing: Space.x2 - 2) {
+                        Circle().fill(Brand.vermilion).frame(width: 6, height: 6)
+                        Text("Update available")
+                    }
+                    .frame(minHeight: 28)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(QuietButtonStyle())
+                .opacity(chipShown ? 1 : 0)
+                .onAppear { withAnimation(Motion.fade) { chipShown = true } }
+            }
+        }
+        .padding(.horizontal, Space.x4)
+        .frame(width: Space.panelWidth, height: 28)
     }
 }

@@ -44,6 +44,7 @@ targets:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSUIElement: true
+        ATSApplicationFontsPath: "."
         LSMinimumSystemVersion: "14.4"
         SUFeedURL: https://github.com/shiprite-dev/minutia-desktop/releases/latest/download/appcast.xml
         SUPublicEDKey: ZIRhh+E4mEHEUfEmv9ak1Qu5C4aDjCDkpftl7tCYlv4=

@@ -32,111 +32,31 @@ struct SignInView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                Image(nsImage: NSApp.applicationIconImage)
-                    .resizable()
-                    .frame(width: 28, height: 28)
-                Text("Minutia").font(.headline)
-            }
-            .padding(12)
-
-            if showsMenuBarHint {
-                Label(FirstRun.menuBarHint, systemImage: "menubar.arrow.up.rectangle")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 8)
-            }
-
-            form
-        }
-        .fixedSize(horizontal: false, vertical: true)
-    }
-
-    private var form: some View {
-        Form {
-            if authManager.isConnected {
-                if authManager.awaitingBrowserSignIn {
-                    // The browser was opened for magic-link sign-in: wait for the callback, but
-                    // never trap the user here. "Start over" clears this and the pending flow.
-                    Section("Signing in") {
-                        HStack(spacing: 10) {
-                            ProgressView().controlSize(.small)
-                            Text("Check your browser to finish signing in.")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                        }
-                        Button("Start over") { cancelBrowserSignIn() }
-                            .buttonStyle(.link)
-                    }
-                } else {
-                    Section("Sign in") {
-                        Button("Sign in with browser", action: signInWithBrowser)
-                            .keyboardShortcut(.defaultAction)
-                            .disabled(busy)
-                        DisclosureGroup("Use email instead", isExpanded: $showEmailForm) {
-                            TextField("Email", text: $email)
-                                .textContentType(.username)
-                            SecureField("Password", text: $password)
-                                .textContentType(.password)
-                            Button("Sign in", action: signIn)
-                                .disabled(busy || !Self.canSubmit(email: email, password: password))
-                            Button("Sign in with Google", action: signInWithGoogle)
-                                .disabled(busy)
-                        }
-                    }
-                }
-            } else if connecting {
-                Section {
-                    HStack(spacing: 10) {
-                        ProgressView().controlSize(.small)
-                        Text("Connecting to Minutia")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
-                    // Never a dead, uncancellable spinner: Cancel stops the connect and drops to
-                    // the failure/self-host UI immediately.
-                    Button("Cancel") { cancelConnect() }
-                        .buttonStyle(.link)
-                }
-            }
-
-            if !authManager.isConnected, !connecting, let message = errorMessage {
-                // Connection failure (not a sign-in failure): a first-run user most often hits this
-                // because the network was not ready at launch, so lead with a warm retry rather than
-                // a raw transport error, and keep the self-host option as a quiet secondary link.
-                Section {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text(message)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        if retryable {
-                            Button("Try again") { startConnect() }
-                                .buttonStyle(.borderedProminent)
-                                .keyboardShortcut(.defaultAction)
-                        }
-                        Button("Using a self-hosted server?") {
-                            NSApp.activate(ignoringOtherApps: true)
-                            openSettings()
-                        }
-                        .buttonStyle(.link)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    }
-                }
-            } else if authManager.isConnected, let message = errorMessage ?? authManager.callbackError {
-                Section {
-                    Text(message)
-                        .foregroundStyle(.red)
-                        .font(.callout)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-        }
-        .formStyle(.grouped)
-        .task { await autoConnect() }
+        SignInScreen(
+            stage: SignInStage.resolve(
+                isConnected: authManager.isConnected,
+                awaitingBrowser: authManager.awaitingBrowserSignIn,
+                connecting: connecting,
+                errorMessage: errorMessage,
+                retryable: retryable),
+            showsMenuBarHint: showsMenuBarHint,
+            signInError: authManager.isConnected ? (errorMessage ?? authManager.callbackError) : nil,
+            email: $email,
+            password: $password,
+            showEmailForm: $showEmailForm,
+            busy: busy,
+            actions: SignInActions(
+                signInWithBrowser: signInWithBrowser,
+                cancelConnect: cancelConnect,
+                cancelBrowserSignIn: cancelBrowserSignIn,
+                retry: startConnect,
+                openSelfHost: {
+                    NSApp.activate(ignoringOtherApps: true)
+                    openSettings()
+                },
+                signIn: signIn,
+                signInWithGoogle: signInWithGoogle))
+            .task { await autoConnect() }
     }
 
     /// Connect to the resolved instance the moment the sign-in screen appears. Idempotent with
@@ -230,6 +150,150 @@ struct SignInView: View {
                 errorMessage = error.localizedDescription
             }
             busy = false
+        }
+    }
+}
+
+enum SignInStage: Equatable {
+    case connecting
+    case ready
+    case browserPending
+    case failed(message: String, retryable: Bool)
+
+    static func resolve(isConnected: Bool, awaitingBrowser: Bool, connecting: Bool, errorMessage: String?, retryable: Bool) -> SignInStage {
+        if isConnected { return awaitingBrowser ? .browserPending : .ready }
+        if connecting { return .connecting }
+        if let errorMessage { return .failed(message: errorMessage, retryable: retryable) }
+        return .connecting
+    }
+}
+
+struct SignInActions {
+    var signInWithBrowser: () -> Void = {}
+    var cancelConnect: () -> Void = {}
+    var cancelBrowserSignIn: () -> Void = {}
+    var retry: () -> Void = {}
+    var openSelfHost: () -> Void = {}
+    var signIn: () -> Void = {}
+    var signInWithGoogle: () -> Void = {}
+}
+
+struct SignInScreen: View {
+    let stage: SignInStage
+    let showsMenuBarHint: Bool
+    let signInError: String?
+    @Binding var email: String
+    @Binding var password: String
+    @Binding var showEmailForm: Bool
+    let busy: Bool
+    var actions = SignInActions()
+
+    private var markBreathes: Bool { stage == .connecting || stage == .browserPending }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.x3) {
+            HStack(spacing: Space.x3) {
+                MarkView(barHeight: 22, breathing: markBreathes, rises: true)
+                Text("Minutia").font(Typo.masthead)
+            }
+
+            switch stage {
+            case .ready: ready
+            case .browserPending: browserPending
+            case .connecting: connecting
+            case .failed(let message, let retryable): failed(message: message, retryable: retryable)
+            }
+
+            if showsMenuBarHint {
+                QuietRow(systemImage: "arrow.up.right", text: FirstRun.menuBarHint)
+            }
+        }
+        .padding(Space.x4)
+        .frame(width: Space.panelWidth, alignment: .leading)
+    }
+
+    private var ready: some View {
+        VStack(alignment: .leading, spacing: Space.x3) {
+            Text("Record a meeting. Get the issues log.")
+                .font(Typo.body)
+                .foregroundStyle(Brand.ink2)
+            if let signInError {
+                NoticeRow(kind: .warn) {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Brand.warn)
+                } content: {
+                    Text(signInError)
+                }
+            }
+            Button("Sign in with browser", action: actions.signInWithBrowser)
+                .buttonStyle(PrimaryButtonStyle())
+                .keyboardShortcut(.defaultAction)
+                .disabled(busy)
+            Button {
+                withAnimation(Motion.settle) { showEmailForm.toggle() }
+            } label: {
+                HStack(spacing: Space.x2) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .rotationEffect(showEmailForm ? .degrees(90) : .zero)
+                    Text("Use email instead")
+                }
+            }
+            .buttonStyle(QuietButtonStyle())
+            .accessibilityValue(showEmailForm ? "Expanded" : "Collapsed")
+            if showEmailForm {
+                VStack(spacing: Space.x2) {
+                    TextField("Email", text: $email)
+                        .textContentType(.username)
+                    SecureField("Password", text: $password)
+                        .textContentType(.password)
+                    Button("Sign in", action: actions.signIn)
+                        .buttonStyle(SecondaryButtonStyle())
+                        .disabled(busy || !SignInView.canSubmit(email: email, password: password))
+                    Button("Sign in with Google", action: actions.signInWithGoogle)
+                        .buttonStyle(SecondaryButtonStyle())
+                        .disabled(busy)
+                }
+                .textFieldStyle(.roundedBorder)
+            }
+        }
+    }
+
+    private var browserPending: some View {
+        VStack(alignment: .leading, spacing: Space.x3) {
+            Text("Check your browser to finish signing in.")
+                .font(Typo.body)
+                .foregroundStyle(Brand.ink2)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Start over", action: actions.cancelBrowserSignIn)
+                .buttonStyle(QuietButtonStyle())
+        }
+    }
+
+    private var connecting: some View {
+        VStack(alignment: .leading, spacing: Space.x3) {
+            Text("Connecting to Minutia")
+                .font(Typo.body)
+                .foregroundStyle(Brand.ink2)
+            Button("Cancel", action: actions.cancelConnect)
+                .buttonStyle(QuietButtonStyle())
+        }
+    }
+
+    private func failed(message: String, retryable: Bool) -> some View {
+        VStack(alignment: .leading, spacing: Space.x3) {
+            NoticeRow(kind: .warn) {
+                Image(systemName: "wifi.exclamationmark").foregroundStyle(Brand.warn)
+            } content: {
+                Text(message)
+            }
+            if retryable {
+                Button("Try again", action: actions.retry)
+                    .buttonStyle(PrimaryButtonStyle())
+                    .keyboardShortcut(.defaultAction)
+            }
+            Button("Using a self-hosted server?", action: actions.openSelfHost)
+                .buttonStyle(QuietButtonStyle())
+                .font(Typo.caption)
         }
     }
 }
