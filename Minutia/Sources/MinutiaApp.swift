@@ -961,7 +961,7 @@ final class AppController: NSObject, ObservableObject {
         lastConfidence = confidence
         switch confidence {
         case .high(let app):
-            if MeetingPrompt.canPrompt(phase: phase) { selectLiveMeetingSeries() }
+            if MeetingPrompt.canPrompt(phase: phase) { selectLiveMeetingSeries(detector.liveAgendaItem) }
             apply(.meetingDetected(Self.detectionLabel(app)))
             showMeetingPromptIfNeeded(MeetingPrompt.content(for: app, meeting: detector.liveAgendaItem?.title))
         case .none:
@@ -983,8 +983,8 @@ final class AppController: NSObject, ObservableObject {
 
     /// Point Record at the calendar meeting happening now, unless the user already chose a series
     /// for this meeting. Never persisted: last-used stays the user's own choice.
-    private func selectLiveMeetingSeries() {
-        guard !seriesPickedThisMeeting, let id = detector.liveAgendaItem?.seriesId,
+    private func selectLiveMeetingSeries(_ live: AgendaItem?) {
+        guard !seriesPickedThisMeeting, let id = live?.seriesId,
               series.contains(where: { $0.id == id }) else { return }
         selectedSeriesId = id
     }
@@ -993,7 +993,7 @@ final class AppController: NSObject, ObservableObject {
     /// landed late): name it on the prompt still on screen and point Record at it.
     private func liveMeetingChanged(_ item: AgendaItem?) {
         guard case .high(let app) = lastConfidence, MeetingPrompt.canPrompt(phase: phase) else { return }
-        selectLiveMeetingSeries()
+        selectLiveMeetingSeries(item)
         guard meetingPromptPanel.content != nil, let item else { return }
         presentMeetingPrompt(MeetingPrompt.content(for: app, meeting: item.title))
     }
@@ -1189,7 +1189,7 @@ final class AppController: NSObject, ObservableObject {
         series = fetched
         let ids = fetched.map(\.id)
         selectedSeriesId = [selectedSeriesId, lastUsedSeriesId].compactMap { $0 }.first(where: ids.contains) ?? ids.first
-        if case .high = lastConfidence, MeetingPrompt.canPrompt(phase: phase) { selectLiveMeetingSeries() }
+        if case .high = lastConfidence, MeetingPrompt.canPrompt(phase: phase) { selectLiveMeetingSeries(detector.liveAgendaItem) }
     }
 
     /// Re-fetch the recordable series so a series created on the web while the app was already open is
