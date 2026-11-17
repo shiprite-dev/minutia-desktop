@@ -108,6 +108,7 @@ enum CaptureRecovery {
 
     static func recoverDeviceMeeting(
         directory: URL, manifest: CaptureManifest, transport: any DeviceTranscriptTransport, cloud: any CloudFinalizeTransport,
+        makeTranscriber: @escaping @Sendable (CaptureManifest) async -> LocalTranscriber? = { _ in nil },
         flushNotes: @escaping @Sendable () async throws -> Void = {},
         sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }
     ) async throws {

@@ -180,6 +180,26 @@ final class DeviceTranscriptTests: XCTestCase {
         XCTAssertEqual(fitted.durationSeconds, 21_600)
     }
 
+    /// Five segments over the count with 599,990 UTF-16 units of text: every merge adds a joining space,
+    /// so merging every pair would push the text past 600,000 and refuse a meeting that fits after five.
+    func test_fitted_justOverTheCountNearTheTextLimit_mergesOnlyThePairsItNeeds_andIsNotRefused() throws {
+        let segments = (0..<(DeviceTranscript.maxSegments + 5)).map { i in
+            DeviceTranscript.Segment(speaker: "me", start: Double(i), end: Double(i) + 0.5,
+                                     text: String(repeating: i < 10 ? "y" : "x", count: i < 10 ? 14 : 30), confidence: nil)
+        }
+        let transcript = DeviceTranscript(source: DeviceFixtures.source, language: "en", durationSeconds: 21_600, outcome: "speech", segments: segments)
+        let text = { (t: DeviceTranscript) in t.segments.reduce(0) { $0 + $1.text.utf16.count } }
+        XCTAssertEqual(text(transcript), 599_990, "precondition: just under the text limit")
+        XCTAssertLessThanOrEqual(try transcript.encoded().count, DeviceTranscript.maxBodyBytes, "precondition: only the count is over")
+
+        let fitted = try XCTUnwrap(transcript.fitted(), "five merges fit every limit, so the transcript is never refused")
+        XCTAssertEqual(fitted.segments.count, DeviceTranscript.maxSegments, "exactly the five merges it needs, no more")
+        XCTAssertLessThanOrEqual(text(fitted), DeviceTranscript.maxTotalText)
+        XCTAssertLessThanOrEqual(try fitted.encoded().count, DeviceTranscript.maxBodyBytes)
+        XCTAssertEqual(fitted.segments.map(\.text).joined(separator: " "), segments.map(\.text).joined(separator: " "),
+                       "no text is lost or reordered")
+    }
+
     // MARK: The server counts UTF-16 code units (Zod .max, String.length)
 
     func test_build_splitsEmojiTextByUTF16Units_keepingEveryWord() {
