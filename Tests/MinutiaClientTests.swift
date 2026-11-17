@@ -436,10 +436,10 @@ final class RequestTranscriptionStatusTests: XCTestCase {
         }
     }
 
-    /// Only 2xx and the terminal 503 are non-throwing. Anything else must throw so the stop path
-    /// never treats a rejected request as accepted and deletes the local audio (data loss).
-    func test_requestTranscription_doesNotThrowOnlyFor2xxAnd503() async {
-        for status in [200, 204, 503] {
+    /// Only a 2xx is accepted. Anything else must throw so the stop path never treats a rejected
+    /// request as accepted and deletes the local audio (data loss).
+    func test_requestTranscription_doesNotThrowOnlyFor2xx() async {
+        for status in [200, 204] {
             stub(status: status)
             do {
                 try await makeStubbedClient().requestTranscription(meetingId: "m1", expectedSegments: nil)
@@ -468,23 +468,17 @@ final class RequestTranscriptionStatusTests: XCTestCase {
         }
     }
 
-    /// A device meeting's cloud fallback has no fast-lane segments to assemble a transcript from, so
-    /// strict treats the "not configured" 503 as a failure and the caller keeps the recording.
-    func test_requestTranscription_strict_throwsOn503_andStillAcceptsA2xx() async {
+    /// The server answers 503 when transcription is not set up (no provider, no API key, provider
+    /// auth failure). Nothing was transcribed, so the request is never accepted: it throws the
+    /// distinct not-configured error and the caller keeps the recording for a later retry.
+    func test_requestTranscription_503_throwsTranscriptionNotConfigured() async {
         stub(status: 503)
         do {
-            try await makeStubbedClient().requestTranscription(meetingId: "m1", expectedSegments: nil, strict: true)
-            XCTFail("a strict 503 must throw")
-        } catch MinutiaClientError.serverError(let status) {
-            XCTAssertEqual(status, 503)
+            try await makeStubbedClient().requestTranscription(meetingId: "m1", expectedSegments: 3, deferExtraction: true)
+            XCTFail("a 503 must never count as accepted")
+        } catch MinutiaClientError.transcriptionNotConfigured {
         } catch {
             XCTFail("unexpected error \(error)")
-        }
-        stub(status: 200)
-        do {
-            try await makeStubbedClient().requestTranscription(meetingId: "m1", expectedSegments: nil, strict: true)
-        } catch {
-            XCTFail("a strict 200 unexpectedly threw \(error)")
         }
     }
 }
@@ -740,4 +734,58 @@ final class InstanceConfigResolvedTests: XCTestCase {
         _ = InstanceConfig.resolvedInstance
         XCTAssertEqual(InstanceConfig.stored?.instance, instance)
     }
+}
+
+/// The record picker lists every series the signed-in user can record in. meeting_series RLS shows a
+/// row exactly when start_or_join_meeting would accept it (owner, facilitator or participant), so the
+/// query carries no owner filter and needs no session lookup of its own.
+final class RecordableSeriesTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        URLProtocol.registerClass(URLProtocolStub.self)
+    }
+
+    override func tearDown() {
+        URLProtocolStub.responseHandler = nil
+        URLProtocol.unregisterClass(URLProtocolStub.self)
+        super.tearDown()
+    }
+
+    func test_recordableSeries_listsMemberSeries_withNoOwnerFilter() async throws {
+        let owned = UUID()
+        let member = UUID()
+        let requests = LockedRequests()
+        URLProtocolStub.responseHandler = { request in
+            requests.append(request)
+            let body = Data("[{\"id\":\"\(owned.uuidString)\",\"name\":\"Design review\"},{\"id\":\"\(member.uuidString)\",\"name\":\"Weekly sync\"}]".utf8)
+            return (body, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+
+        let series = try await makeStubbedClient().recordableSeries()
+
+        XCTAssertEqual(series.map(\.id), [owned, member])
+        XCTAssertEqual(series.map(\.name), ["Design review", "Weekly sync"])
+        XCTAssertEqual(requests.all.count, 1, "a single PostgREST query")
+        let url = try XCTUnwrap(requests.all.first?.url)
+        XCTAssertEqual(url.path, "/rest/v1/meeting_series")
+        let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        XCTAssertEqual(query.first { $0.name == "select" }?.value, "id,name")
+        XCTAssertTrue(query.first { $0.name == "order" }?.value?.hasPrefix("name.asc") == true)
+        XCTAssertNil(query.first { $0.name == "owner_id" }, "members and facilitators record too")
+    }
+
+    func test_recordableSeries_noneVisible_isEmpty() async throws {
+        URLProtocolStub.responseHandler = { request in
+            (Data("[]".utf8), HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        let series = try await makeStubbedClient().recordableSeries()
+        XCTAssertTrue(series.isEmpty)
+    }
+}
+
+private final class LockedRequests: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests: [URLRequest] = []
+    var all: [URLRequest] { lock.withLock { requests } }
+    func append(_ request: URLRequest) { lock.withLock { requests.append(request) } }
 }

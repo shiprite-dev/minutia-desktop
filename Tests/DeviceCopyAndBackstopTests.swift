@@ -256,6 +256,20 @@ final class DeviceCopyAndBackstopTests: XCTestCase {
         XCTAssertTrue(dirExists)
     }
 
+    /// A server without transcription answers 503. The fast-lane stop must throw, so `stop` never
+    /// reaches the directory delete and the recording stays for recovery.
+    func test_fastLane_whenTheServerHasNoTranscription_throws_soTheRecordingIsKept() async {
+        let cloud = RecordingCloud(transcribeStatus: 503)
+        do {
+            _ = try await fastLane(audioMayLeaveMac: true, cloud: cloud, log: FastLaneLog())
+            XCTFail("a 503 must never count as an accepted transcription")
+        } catch {
+            XCTAssertEqual(error as? MinutiaClientError, .transcriptionNotConfigured, "got \(error)")
+        }
+        XCTAssertEqual(cloud.log, ["uploadRecording", "finalizeMeeting", "requestTranscription"])
+        XCTAssertTrue(dirExists)
+    }
+
     func test_fastLane_forACloudMeeting_enqueuesTheTail_uploads_finalizes_andAnnouncesTheRegisteredSegments() async throws {
         let cloud = RecordingCloud()
         let log = FastLaneLog()
@@ -265,7 +279,6 @@ final class DeviceCopyAndBackstopTests: XCTestCase {
         XCTAssertEqual(log.drains, 1)
         XCTAssertEqual(cloud.log, ["uploadRecording", "finalizeMeeting", "requestTranscription"])
         XCTAssertEqual(cloud.expectedSegments, [3])
-        XCTAssertEqual(cloud.strict, [false], "a 503 still counts: the transcript assembles from fast-lane segments")
     }
 
     func test_fastLane_withDroppedSegments_announcesNone() async throws {

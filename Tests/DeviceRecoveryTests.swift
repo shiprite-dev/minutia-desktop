@@ -339,7 +339,7 @@ final class DeviceRecoveryTests: XCTestCase {
         }
     }
 
-    /// A cloud manifest goes through `recover`'s upload, finalize and non-strict transcribe on a live
+    /// A cloud manifest goes through `recover`'s upload, finalize and transcribe on a live
     /// client; these rows feed the sweep the result each server answer produces there.
     func test_recoveryMatrix_cloudManifests_decideAttemptsAndNotice() {
         let manifest = CaptureManifest(
@@ -347,7 +347,7 @@ final class DeviceRecoveryTests: XCTestCase {
             userId: "u1", createdAt: Date(timeIntervalSince1970: 0))
         let rows: [(label: String, error: Error?, attempts: Attempts, report: AppController.SweepReport?)] = [
             ("2xx", nil, .unchanged, .recovered),
-            ("503, assembled from the fast-lane segments", nil, .unchanged, .recovered),
+            ("503, transcription not set up", MinutiaClientError.transcriptionNotConfigured, .plusOne, nil),
             ("409", MinutiaClientError.serverError(status: 409), .plusOne, nil),
             ("cancelled by a starting recording", CancellationError(), .unchanged, nil),
             ("500", MinutiaClientError.serverError(status: 500), .plusOne, nil),
