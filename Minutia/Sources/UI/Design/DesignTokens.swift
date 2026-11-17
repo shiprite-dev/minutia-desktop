@@ -19,7 +19,7 @@ enum Contrast {
         return (high + 0.05) / (low + 0.05)
     }
 
-    private static func luminance(_ hex: UInt32) -> Double {
+    static func luminance(_ hex: UInt32) -> Double {
         func channel(_ shift: UInt32) -> Double {
             let c = Double((hex >> shift) & 0xFF) / 255
             return c <= 0.03928 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
@@ -31,13 +31,12 @@ enum Contrast {
 enum Brand {
     static let vermilion = Token(light: 0xE23A00, dark: 0xE23A00)
     static let vermilionFill = Token(light: 0xD43500, dark: 0xD43500)
-    static let vermilionText = Token(light: 0xB92D00, dark: 0xFF643D)
-    static let accentSoft = Token(light: 0xFFE4DB, dark: 0x431105)
-    static let ink3 = Token(light: 0x706B66, dark: 0x908B86)
-    static let warn = Token(light: 0x8D6000, dark: 0xAC8011)
-    static let warnSoft = Token(light: 0xFFF1CC, dark: 0x2E2200)
-    static let success = Token(light: 0x006836, dark: 0x3E9765)
-    static let danger = Token(light: 0x90101A, dark: 0xD06966)
+    static let vermilionText = Token(light: 0xB92D00, dark: 0xFF7452)
+    static let accentSoft = Token(light: 0xFFE4DB, dark: 0x4A2A22)
+    static let ink2 = Token(light: 0x5F5A55, dark: 0xA8A39E)
+    static let ink3 = Token(light: 0x706B66, dark: 0x98938E)
+    static let warn = Token(light: 0x8D6000, dark: 0xD4A62A)
+    static let warnSoft = Token(light: 0xFFF1CC, dark: 0x3F3420)
 }
 
 enum Typo {

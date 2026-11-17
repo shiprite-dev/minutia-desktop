@@ -8,6 +8,7 @@ struct RecordingModel {
     var reconnecting = false
     var systemAudioDegraded = false
     var micUnavailable = false
+    var levelHistory: [Float] = []
 }
 
 struct RecordingView: View {
@@ -50,6 +51,8 @@ struct RecordingView: View {
         return deviceOnly ? "Transcribing as you record. Audio stays on this Mac." : "Transcribing on this Mac as you record"
     }
 
+    @State private var history: [Float] = []
+
     var body: some View {
         RecordingContent(
             model: RecordingModel(
@@ -59,9 +62,11 @@ struct RecordingView: View {
                 progress: Self.progressLine(uploaded: session.segmentsUploaded, total: session.segmentsTotal, audioMayLeaveMac: session.audioMayLeaveMac, deviceOnly: session.deviceOnly),
                 reconnecting: session.reconnecting,
                 systemAudioDegraded: session.systemAudioDegraded,
-                micUnavailable: session.micUnavailable),
+                micUnavailable: session.micUnavailable,
+                levelHistory: history),
             onNotes: onNotes,
             onStop: onStop)
+            .onChange(of: session.level) { _, level in history = LevelHistory.push(history, level) }
     }
 }
 
@@ -69,19 +74,13 @@ struct RecordingContent: View {
     let model: RecordingModel
     var onNotes: () -> Void = {}
     var onStop: () -> Void = {}
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.motionReduced) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.x3) {
-            Eyebrow(text: "Recording", live: true)
-
-            HStack(alignment: .firstTextBaseline, spacing: Space.x2) {
-                Text(model.seriesName ?? "Recording")
-                    .font(Typo.title)
-                    .lineLimit(2)
-                    .truncationMode(.tail)
-                    .help(model.seriesName ?? "")
-                    .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(alignment: .firstTextBaseline) {
+                Eyebrow(text: "Recording", live: true)
+                Spacer(minLength: Space.x2)
                 Text(RecordingView.clock(model.elapsed))
                     .font(Typo.timer)
                     .contentTransition(.numericText(value: model.elapsed))
@@ -92,17 +91,24 @@ struct RecordingContent: View {
                     .accessibilityAddTraits(.updatesFrequently)
             }
 
-            LevelBars(level: model.level)
+            Text(model.seriesName ?? "Recording")
+                .font(Typo.title)
+                .lineLimit(2)
+                .truncationMode(.tail)
+                .help(model.seriesName ?? "")
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            LevelBars(levels: LevelHistory.perBar(model.levelHistory, current: model.level))
 
             Text(model.progress)
                 .font(Typo.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Brand.ink2)
                 .fixedSize(horizontal: false, vertical: true)
 
             if model.reconnecting {
                 Text("Reconnecting…")
                     .font(Typo.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Brand.ink2)
             }
 
             if model.systemAudioDegraded {
@@ -123,7 +129,7 @@ struct RecordingContent: View {
 
             Button(action: onNotes) {
                 Label("Notes", systemImage: "note.text")
-                    .frame(maxWidth: .infinity)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             .buttonStyle(QuietButtonStyle())
             .accessibilityLabel("Show meeting notes")
@@ -138,6 +144,5 @@ struct RecordingContent: View {
         }
         .padding(Space.x4)
         .frame(width: Space.panelWidth)
-        .onAppear { AccessibilityNotification.Announcement("Recording started").post() }
     }
 }

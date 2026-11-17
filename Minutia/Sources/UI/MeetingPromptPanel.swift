@@ -116,10 +116,12 @@ struct MeetingPromptView: View {
 
     var body: some View {
         HStack(spacing: Space.x3) {
-            MarkView(side: 24, rises: true)
+            MarkView(barHeight: 18, rises: true)
+                .foregroundStyle(Color(nsColor: .labelColor))
 
             Text(content.title)
                 .font(Typo.bodyStrong)
+                .foregroundStyle(Color(nsColor: .labelColor))
                 .fixedSize()
 
             Button(action: onStart) {

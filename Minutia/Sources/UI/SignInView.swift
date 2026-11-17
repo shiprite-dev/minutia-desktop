@@ -193,13 +193,8 @@ struct SignInScreen: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Space.x3) {
             HStack(spacing: Space.x3) {
-                MarkView(side: 28, breathing: markBreathes, rises: true)
+                MarkView(barHeight: 22, breathing: markBreathes, rises: true)
                 Text("Minutia").font(Typo.masthead)
-            }
-
-            if showsMenuBarHint {
-                Eyebrow(text: FirstRun.menuBarHint)
-                    .fixedSize(horizontal: false, vertical: true)
             }
 
             switch stage {
@@ -207,6 +202,10 @@ struct SignInScreen: View {
             case .browserPending: browserPending
             case .connecting: connecting
             case .failed(let message, let retryable): failed(message: message, retryable: retryable)
+            }
+
+            if showsMenuBarHint {
+                QuietRow(systemImage: "arrow.up.right", text: FirstRun.menuBarHint)
             }
         }
         .padding(Space.x4)
@@ -217,7 +216,7 @@ struct SignInScreen: View {
         VStack(alignment: .leading, spacing: Space.x3) {
             Text("Record a meeting. Get the issues log.")
                 .font(Typo.body)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Brand.ink2)
             if let signInError {
                 NoticeRow(kind: .warn) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Brand.warn)
@@ -229,7 +228,19 @@ struct SignInScreen: View {
                 .buttonStyle(PrimaryButtonStyle())
                 .keyboardShortcut(.defaultAction)
                 .disabled(busy)
-            DisclosureGroup("Use email instead", isExpanded: $showEmailForm) {
+            Button {
+                withAnimation(Motion.settle) { showEmailForm.toggle() }
+            } label: {
+                HStack(spacing: Space.x2) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .rotationEffect(showEmailForm ? .degrees(90) : .zero)
+                    Text("Use email instead")
+                }
+            }
+            .buttonStyle(QuietButtonStyle())
+            .accessibilityValue(showEmailForm ? "Expanded" : "Collapsed")
+            if showEmailForm {
                 VStack(spacing: Space.x2) {
                     TextField("Email", text: $email)
                         .textContentType(.username)
@@ -243,10 +254,7 @@ struct SignInScreen: View {
                         .disabled(busy)
                 }
                 .textFieldStyle(.roundedBorder)
-                .padding(.top, Space.x2)
             }
-            .font(Typo.body)
-            .foregroundStyle(.secondary)
         }
     }
 
@@ -254,7 +262,7 @@ struct SignInScreen: View {
         VStack(alignment: .leading, spacing: Space.x3) {
             Text("Check your browser to finish signing in.")
                 .font(Typo.body)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Brand.ink2)
                 .fixedSize(horizontal: false, vertical: true)
             Button("Start over", action: actions.cancelBrowserSignIn)
                 .buttonStyle(QuietButtonStyle())
@@ -265,7 +273,7 @@ struct SignInScreen: View {
         VStack(alignment: .leading, spacing: Space.x3) {
             Text("Connecting to Minutia")
                 .font(Typo.body)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Brand.ink2)
             Button("Cancel", action: actions.cancelConnect)
                 .buttonStyle(QuietButtonStyle())
         }

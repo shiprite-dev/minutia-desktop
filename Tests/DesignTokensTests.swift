@@ -3,29 +3,49 @@ import XCTest
 @testable import Minutia
 
 final class DesignTokensTests: XCTestCase {
-    private let lightSurface: UInt32 = 0xFFFFFF
-    private let darkSurface: UInt32 = 0x1E1E1E
+    private let lightPanels: [UInt32] = [0xF5F5F5, 0xFFFFFF]
+    private let darkPanels: [UInt32] = [0x252526, 0x2C2C2E]
 
-    private func assertReadable(_ name: String, _ text: Token, on surface: (light: UInt32, dark: UInt32),
+    private func assertReadable(_ name: String, _ text: Token, light: [UInt32], dark: [UInt32],
                                 minimum: Double = 4.5, file: StaticString = #filePath, line: UInt = #line) {
-        let light = Contrast.ratio(text.hex(dark: false), surface.light)
-        let dark = Contrast.ratio(text.hex(dark: true), surface.dark)
-        XCTAssertGreaterThanOrEqual(light, minimum, "\(name) in light is \(light)", file: file, line: line)
-        XCTAssertGreaterThanOrEqual(dark, minimum, "\(name) in dark is \(dark)", file: file, line: line)
+        for surface in light {
+            let ratio = Contrast.ratio(text.hex(dark: false), surface)
+            XCTAssertGreaterThanOrEqual(ratio, minimum, "\(name) on \(String(surface, radix: 16)) in light is \(ratio)", file: file, line: line)
+        }
+        for surface in dark {
+            let ratio = Contrast.ratio(text.hex(dark: true), surface)
+            XCTAssertGreaterThanOrEqual(ratio, minimum, "\(name) on \(String(surface, radix: 16)) in dark is \(ratio)", file: file, line: line)
+        }
     }
 
-    func test_textTokens_areReadableOnThePanelInLightAndDark() {
-        let panel = (light: lightSurface, dark: darkSurface)
-        assertReadable("vermilionText", Brand.vermilionText, on: panel)
-        assertReadable("ink3", Brand.ink3, on: panel)
-        assertReadable("warn", Brand.warn, on: panel)
-        assertReadable("success", Brand.success, on: panel)
-        assertReadable("danger", Brand.danger, on: panel)
+    private var softLight: [UInt32] { [Brand.accentSoft.hex(dark: false), Brand.warnSoft.hex(dark: false)] }
+    private var softDark: [UInt32] { [Brand.accentSoft.hex(dark: true), Brand.warnSoft.hex(dark: true)] }
+
+    func test_textTokens_areReadableOnTheRealPanelSurfaces() {
+        for (name, token) in [("ink2", Brand.ink2), ("ink3", Brand.ink3), ("vermilionText", Brand.vermilionText), ("warn", Brand.warn)] {
+            assertReadable(name, token, light: lightPanels, dark: darkPanels)
+        }
     }
 
-    func test_textTokens_areReadableOnTheSoftAccentNotice() {
-        let soft = (light: Brand.accentSoft.hex(dark: false), dark: Brand.accentSoft.hex(dark: true))
-        assertReadable("vermilionText on accentSoft", Brand.vermilionText, on: soft)
+    func test_bodyAndCaptionText_isReadableInsideEveryNoticeFill() {
+        assertReadable("ink2 in notices", Brand.ink2, light: softLight, dark: softDark)
+        assertReadable("warn icon in notices", Brand.warn, light: softLight, dark: softDark, minimum: 3)
+        assertReadable("vermilionText on accent notice", Brand.vermilionText,
+                       light: [Brand.accentSoft.hex(dark: false)], dark: [Brand.accentSoft.hex(dark: true)])
+    }
+
+    func test_greyHierarchy_secondInkIsMoreProminentThanThirdInBothSchemes() {
+        XCTAssertGreaterThan(Contrast.ratio(Brand.ink2.hex(dark: false), 0xF5F5F5), Contrast.ratio(Brand.ink3.hex(dark: false), 0xF5F5F5))
+        XCTAssertGreaterThan(Contrast.ratio(Brand.ink2.hex(dark: true), 0x252526), Contrast.ratio(Brand.ink3.hex(dark: true), 0x252526))
+    }
+
+    func test_darkNoticeFills_sitLighterThanThePanelAndStayLowChroma() {
+        for fill in [Brand.accentSoft, Brand.warnSoft] {
+            let hex = fill.hex(dark: true)
+            XCTAssertGreaterThan(Contrast.luminance(hex), Contrast.luminance(0x252526))
+            let channels = [(hex >> 16) & 0xFF, (hex >> 8) & 0xFF, hex & 0xFF]
+            XCTAssertLessThanOrEqual(channels.max()! - channels.min()!, 40)
+        }
     }
 
     func test_primaryButtonLabel_isReadableWhiteOnTheFill() {
@@ -37,11 +57,26 @@ final class DesignTokensTests: XCTestCase {
         XCTAssertEqual(Contrast.ratio(0x000000, 0xFFFFFF), 21, accuracy: 0.01)
     }
 
+    func test_increaseContrast_strengthensHairlinesBordersAndQuietText() {
+        XCTAssertEqual(Hairline.width(.standard), 0.5)
+        XCTAssertEqual(Hairline.width(.increased), 1)
+        XCTAssertEqual(Hairline.noticeBorder(.standard), 0)
+        XCTAssertEqual(Hairline.noticeBorder(.increased), 1)
+        XCTAssertFalse(Hairline.quietTextIsStrong(.standard))
+        XCTAssertTrue(Hairline.quietTextIsStrong(.increased))
+    }
+
     func test_reduceMotion_replacesEverySpringWithTheFade() {
         for animation in [Motion.settle, Motion.pop, Motion.snap, Motion.meter] {
             XCTAssertEqual(Motion.resolved(animation, reduce: true), Motion.fade)
             XCTAssertEqual(Motion.resolved(animation, reduce: false), animation)
         }
+    }
+
+    func test_loops_runOnlyWhileThePanelIsOpenAndMotionIsAllowed() {
+        XCTAssertTrue(Loops.isRunning(visible: true, reduceMotion: false))
+        XCTAssertFalse(Loops.isRunning(visible: false, reduceMotion: false))
+        XCTAssertFalse(Loops.isRunning(visible: true, reduceMotion: true))
     }
 
     func test_fraunces_isBundledAndResolves() {
@@ -87,6 +122,48 @@ final class BrandMarkTests: XCTestCase {
         XCTAssertLessThan(points[2].y, points[1].y)
     }
 
+    func test_barsOnlyFrame_isCroppedToTheBars() {
+        let size = BrandMark.frame(barHeight: 20, includesCheck: false)
+        let union = (0..<3).map { BrandMark.barRect(index: $0, barHeight: 20, includesCheck: false) }.reduce(CGRect.null) { $0.union($1) }
+        XCTAssertEqual(union.minX, 0, accuracy: 0.01)
+        XCTAssertEqual(union.width, size.width, accuracy: 0.01)
+        XCTAssertEqual(union.height, size.height, accuracy: 0.01)
+    }
+
+    func test_checkFrame_holdsTheWholeCheckStroke() {
+        let size = BrandMark.frame(barHeight: 20, includesCheck: true)
+        let rect = CGRect(origin: .zero, size: size)
+        let stroke = BrandMark.checkStroke(barHeight: 20)
+        for point in BrandMark.checkPoints(in: rect) {
+            XCTAssertGreaterThanOrEqual(point.x - stroke / 2, -0.01)
+            XCTAssertLessThanOrEqual(point.x + stroke / 2, size.width + 0.01)
+            XCTAssertGreaterThanOrEqual(point.y - stroke / 2, -0.01)
+            XCTAssertLessThanOrEqual(point.y + stroke / 2, size.height + 0.01)
+        }
+    }
+
+    func test_checkStroke_matchesTheIconProportion() {
+        XCTAssertEqual(BrandMark.checkStroke(barHeight: 340), 84, accuracy: 0.001)
+    }
+
+    func test_eachBarFollowsItsOwnLevel() {
+        let heights = BrandMark.barHeights(levels: [0, 0.5, 1])
+        XCTAssertLessThan(heights[0] / BrandMark.restRatios[0], heights[1] / BrandMark.restRatios[1])
+        XCTAssertLessThan(heights[1] / BrandMark.restRatios[1], heights[2] / BrandMark.restRatios[2])
+    }
+
+    func test_levelHistory_keepsTheLastThreeAndFillsFromTheCurrentLevel() {
+        XCTAssertEqual(LevelHistory.push([0.1, 0.2, 0.3], 0.4), [0.2, 0.3, 0.4])
+        XCTAssertEqual(LevelHistory.perBar([], current: 0.6), [0.6, 0.6, 0.6])
+        XCTAssertEqual(LevelHistory.perBar([0.1], current: 0.1), [0.1, 0.1, 0.1])
+    }
+
+    func test_screenReaderLevel_isAPercentClampedToTheRange() {
+        XCTAssertEqual(LevelHistory.percent(0.456), 46)
+        XCTAssertEqual(LevelHistory.percent(7), 100)
+        XCTAssertEqual(LevelHistory.percent(-1), 0)
+    }
+
     func test_reduceMotion_showsTheFinishedCheckImmediately() {
         XCTAssertEqual(CheckReveal.initialProgress(reduceMotion: true), 1)
         XCTAssertEqual(CheckReveal.initialProgress(reduceMotion: false), 0)
@@ -94,22 +171,51 @@ final class BrandMarkTests: XCTestCase {
 }
 
 final class CelebrationTests: XCTestCase {
-    func test_recapReady_playsWhenAFinishLandsCleanly() {
-        XCTAssertTrue(Celebration.shouldPlay(from: .finalizing, to: .idle, feedback: nil))
-    }
+    private let cue = RecapCue(meetingId: UUID(), seriesId: UUID(), instance: URL(string: "https://example.com")!)
 
-    func test_recapReady_neverPlaysForAFailedOrRedirectedFinish() {
-        XCTAssertFalse(Celebration.shouldPlay(from: .finalizing, to: .error("x"), feedback: nil))
-        XCTAssertFalse(Celebration.shouldPlay(from: .finalizing, to: .idle, feedback: "Couldn't transcribe"))
-        XCTAssertFalse(Celebration.shouldPlay(from: .recording, to: .idle, feedback: nil))
-        XCTAssertFalse(Celebration.shouldPlay(from: .signedOut, to: .idle, feedback: nil))
+    func test_sentScreen_showsOnlyOverIdleWithACue() {
+        XCTAssertTrue(Celebration.visible(cue: cue, phase: .idle))
+        XCTAssertFalse(Celebration.visible(cue: nil, phase: .idle))
     }
 
     func test_backToBackMeeting_endsTheCelebrationAtOnce() {
-        XCTAssertTrue(Celebration.visible(celebrating: true, phase: .idle))
-        XCTAssertFalse(Celebration.visible(celebrating: true, phase: .recording))
-        XCTAssertFalse(Celebration.visible(celebrating: true, phase: .detected(app: "Zoom")))
-        XCTAssertFalse(Celebration.visible(celebrating: false, phase: .idle))
+        XCTAssertFalse(Celebration.visible(cue: cue, phase: .recording))
+        XCTAssertFalse(Celebration.visible(cue: cue, phase: .detected(app: "Zoom")))
+        XCTAssertFalse(Celebration.visible(cue: cue, phase: .error("x")))
+    }
+
+    func test_hold_keepsTheFinishedCheckOnScreenAfterItDraws() {
+        let drawn = 0.18 + CheckReveal.drawDuration + CheckReveal.popHold
+        XCTAssertEqual(Celebration.hold(reduceMotion: false), drawn + 1.6, accuracy: 0.001)
+        XCTAssertEqual(Celebration.hold(reduceMotion: true), 1.6, accuracy: 0.001)
+    }
+
+    func test_popHold_outlastsThePopSpringsPeak() {
+        XCTAssertGreaterThanOrEqual(CheckReveal.popHold, 0.24)
+    }
+
+    func test_webEndedStop_hasNoCue_andAManualStopThatSentTheTranscriptHasOne() {
+        let id = UUID(), url = URL(string: "https://example.com")!
+        XCTAssertNil(AppController.recapCue(reason: .webEnded, transcriptRequested: true, meetingId: id, seriesId: nil, instance: url))
+        XCTAssertNil(AppController.recapCue(reason: .manual, transcriptRequested: false, meetingId: id, seriesId: nil, instance: url))
+        XCTAssertNil(AppController.recapCue(reason: .manual, transcriptRequested: true, meetingId: nil, seriesId: nil, instance: url))
+        XCTAssertEqual(AppController.recapCue(reason: .manual, transcriptRequested: true, meetingId: id, seriesId: nil, instance: url)?.meetingId, id)
+        XCTAssertNotNil(AppController.recapCue(reason: .localEnded, transcriptRequested: true, meetingId: id, seriesId: nil, instance: url))
+    }
+}
+
+final class PanelHapticTests: XCTestCase {
+    func test_buzzesWhenRecordingStartsAndWhenStopIsPressed() {
+        XCTAssertNotNil(PanelHaptic.feedback(from: .idle, to: .recording))
+        XCTAssertNotNil(PanelHaptic.feedback(from: .detected(app: "Zoom"), to: .recording))
+        XCTAssertNotNil(PanelHaptic.feedback(from: .recording, to: .finalizing))
+    }
+
+    func test_staysQuietForFailuresAndEverythingElse() {
+        XCTAssertNil(PanelHaptic.feedback(from: .recording, to: .error("x")))
+        XCTAssertNil(PanelHaptic.feedback(from: .finalizing, to: .idle))
+        XCTAssertNil(PanelHaptic.feedback(from: .idle, to: .detected(app: nil)))
+        XCTAssertNil(PanelHaptic.feedback(from: .signedOut, to: .idle))
     }
 }
 

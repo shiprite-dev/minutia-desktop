@@ -2,7 +2,7 @@ import SwiftUI
 
 struct PrimaryButtonStyle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.motionReduced) private var reduceMotion
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -24,6 +24,7 @@ struct SecondaryButtonStyle: ButtonStyle {
         configuration.label
             .font(Typo.body)
             .foregroundStyle(.primary)
+            .padding(.horizontal, Space.x3)
             .frame(maxWidth: .infinity, minHeight: 28)
             .background(.primary.opacity(configuration.isPressed ? 0.1 : 0.04), in: RoundedRectangle(cornerRadius: Radius.control))
             .overlay(RoundedRectangle(cornerRadius: Radius.control).strokeBorder(Hairline.style(contrast), lineWidth: Hairline.width(contrast)))
@@ -37,7 +38,7 @@ struct QuietButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(Typo.body)
-            .foregroundStyle(contrast == .increased ? AnyShapeStyle(.secondary) : AnyShapeStyle(Brand.ink3))
+            .foregroundStyle(contrast == .increased ? AnyShapeStyle(Brand.ink2) : AnyShapeStyle(Brand.ink3))
             .opacity(configuration.isPressed ? 0.6 : 1)
             .contentShape(Rectangle())
     }
@@ -45,6 +46,8 @@ struct QuietButtonStyle: ButtonStyle {
 
 enum Hairline {
     static func width(_ contrast: ColorSchemeContrast) -> CGFloat { contrast == .increased ? 1 : 0.5 }
+    static func noticeBorder(_ contrast: ColorSchemeContrast) -> CGFloat { contrast == .increased ? 1 : 0 }
+    static func quietTextIsStrong(_ contrast: ColorSchemeContrast) -> Bool { contrast == .increased }
     static func style(_ contrast: ColorSchemeContrast) -> AnyShapeStyle {
         contrast == .increased ? AnyShapeStyle(Brand.ink3) : AnyShapeStyle(.quaternary)
     }
@@ -63,27 +66,28 @@ struct HairlineRule: View {
 struct Eyebrow: View {
     let text: String
     var live = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.motionReduced) private var reduceMotion
     @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.panelVisible) private var visible
 
     var body: some View {
         HStack(spacing: Space.x2 - 2) {
             if live {
                 let dot = Circle().fill(Brand.vermilion).frame(width: 6, height: 6)
-                if reduceMotion {
-                    dot
-                } else {
+                if Loops.isRunning(visible: visible, reduceMotion: reduceMotion) {
                     dot.phaseAnimator([1.0, 0.45]) { view, opacity in
                         view.opacity(opacity)
                     } animation: { _ in
                         .easeInOut(duration: 1)
                     }
+                } else {
+                    dot
                 }
             }
             Text(text.uppercased())
                 .font(Typo.eyebrow)
                 .tracking(1.4)
-                .foregroundStyle(live ? AnyShapeStyle(Brand.vermilionText) : contrast == .increased ? AnyShapeStyle(.secondary) : AnyShapeStyle(Brand.ink3))
+                .foregroundStyle(live ? AnyShapeStyle(Brand.vermilionText) : Hairline.quietTextIsStrong(contrast) ? AnyShapeStyle(Brand.ink2) : AnyShapeStyle(Brand.ink3))
         }
     }
 }
@@ -98,7 +102,7 @@ struct NoticeRow<Icon: View, Content: View>: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: Space.x2) {
-            icon
+            icon.frame(width: 20, height: 17)
             content
                 .font(Typo.body)
                 .fixedSize(horizontal: false, vertical: true)
@@ -108,8 +112,8 @@ struct NoticeRow<Icon: View, Content: View>: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(fill, in: RoundedRectangle(cornerRadius: Radius.notice))
         .overlay {
-            if contrast == .increased {
-                RoundedRectangle(cornerRadius: Radius.notice).strokeBorder(Brand.ink3, lineWidth: 1)
+            if Hairline.noticeBorder(contrast) > 0 {
+                RoundedRectangle(cornerRadius: Radius.notice).strokeBorder(Brand.ink3, lineWidth: Hairline.noticeBorder(contrast))
             }
         }
     }
@@ -125,7 +129,7 @@ struct NoticeRow<Icon: View, Content: View>: View {
 
 struct ProgressHairline: View {
     let fraction: Double
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.motionReduced) private var reduceMotion
 
     var body: some View {
         let clamped = min(1, max(0, fraction))

@@ -7,14 +7,21 @@ private func openMicrophoneSettings() {
 }
 
 enum Celebration {
-    static let hold: TimeInterval = 1.6
-
-    static func shouldPlay(from old: AppPhase, to new: AppPhase, feedback: String?) -> Bool {
-        old == .finalizing && new == .idle && feedback == nil
+    static func hold(reduceMotion: Bool) -> TimeInterval {
+        (reduceMotion ? 0 : 0.18 + CheckReveal.drawDuration + CheckReveal.popHold) + 1.6
     }
 
-    static func visible(celebrating: Bool, phase: AppPhase) -> Bool {
-        celebrating && phase == .idle
+    static func visible(cue: RecapCue?, phase: AppPhase) -> Bool {
+        cue != nil && phase == .idle
+    }
+}
+
+enum PanelHaptic {
+    static func feedback(from old: AppPhase, to new: AppPhase) -> SensoryFeedback? {
+        switch (old, new) {
+        case (.idle, .recording), (.detected, .recording), (.error, .recording), (.recording, .finalizing): .levelChange
+        default: nil
+        }
     }
 }
 
@@ -38,9 +45,9 @@ enum ErrorActions {
 struct MenuContent: View {
     @ObservedObject var controller: AppController
     @ObservedObject var updater: UpdaterController
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var celebrating = false
-    @State private var celebrationTask: Task<Void, Never>?
+    @Environment(\.motionReduced) private var reduceMotion
+    @State private var visible = true
+    @State private var holdTask: Task<Void, Never>?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -52,22 +59,18 @@ struct MenuContent: View {
                     onIgnoreClaim: { controller.answerWebStart(.ignore) },
                     onStart: { controller.confirmPendingRecord() },
                     onIgnore: { controller.dismissPendingRecord() })
-                    .padding(.horizontal, Space.x4)
-                    .padding(.top, Space.x4)
             }
 
             if let feedback = controller.recordFeedback {
                 FeedbackNotice(message: feedback)
-                    .padding(.horizontal, Space.x4)
-                    .padding(.top, Space.x4)
             }
 
             Group {
                 switch controller.phase {
                 case .signedOut:
                     SignInView(authManager: controller.authManager, showsMenuBarHint: controller.showsMenuBarHint)
-                case .idle where Celebration.visible(celebrating: celebrating, phase: controller.phase):
-                    DoneContent()
+                case .idle where Celebration.visible(cue: controller.recapCue, phase: controller.phase):
+                    DoneContent(onOpenRecap: { controller.openRecapFromCue() })
                 case .idle:
                     IdleHost(controller: controller, detectedVia: nil)
                 case .detected(let app):
@@ -75,7 +78,7 @@ struct MenuContent: View {
                 case .recording:
                     RecordingView(
                         session: controller.captureSession,
-                        seriesName: controller.series.first { $0.id == controller.selectedSeriesId }?.name,
+                        seriesName: controller.recordingSeriesName,
                         onNotes: { controller.notepad.showAndFocus() },
                         onStop: { controller.stopRecording() })
                 case .finalizing:
@@ -89,6 +92,7 @@ struct MenuContent: View {
                         onOpenSettings: openMicrophoneSettings)
                 }
             }
+            .padding(.top, controller.pendingRecordConsent != nil || controller.recordFeedback != nil ? -Space.x1 : 0)
             .frame(maxWidth: .infinity, alignment: .leading)
             .transition(.opacity)
 
@@ -97,19 +101,19 @@ struct MenuContent: View {
             Footer(updater: updater)
         }
         .frame(width: Space.panelWidth)
+        .environment(\.panelVisible, visible)
+        .environment(\.consentPending, controller.pendingRecordConsent != nil)
         .animation(Motion.resolved(Motion.settle, reduce: reduceMotion), value: controller.phase)
-        .animation(Motion.resolved(Motion.settle, reduce: reduceMotion), value: celebrating)
-        .sensoryFeedback(.levelChange, trigger: controller.phase == .recording)
-        .onChange(of: controller.phase) { old, new in
-            celebrationTask?.cancel()
-            guard Celebration.shouldPlay(from: old, to: new, feedback: controller.recordFeedback) else {
-                celebrating = false
-                return
-            }
-            celebrating = true
-            celebrationTask = Task {
-                try? await Task.sleep(nanoseconds: UInt64(Celebration.hold * 1_000_000_000))
-                if !Task.isCancelled { celebrating = false }
+        .animation(Motion.resolved(Motion.settle, reduce: reduceMotion), value: controller.recapCue)
+        .sensoryFeedback(trigger: controller.phase) { old, new in PanelHaptic.feedback(from: old, to: new) }
+        .onAppear { visible = true }
+        .onDisappear { visible = false }
+        .onChange(of: controller.recapCue, initial: true) { _, cue in
+            holdTask?.cancel()
+            guard cue != nil else { return }
+            holdTask = Task {
+                try? await Task.sleep(nanoseconds: UInt64(Celebration.hold(reduceMotion: reduceMotion) * 1_000_000_000))
+                if !Task.isCancelled { controller.clearRecapCue() }
             }
         }
     }
@@ -144,7 +148,7 @@ struct ModelDownloadRow: View {
         VStack(alignment: .leading, spacing: Space.x1) {
             Text(label)
                 .font(Typo.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Brand.ink2)
                 .contentTransition(.numericText())
             ProgressHairline(fraction: fraction)
         }
@@ -198,7 +202,8 @@ struct IdleScreen: View {
     var onDismissDetection: () -> Void = {}
     var onOpenURL: (URL) -> Void = { _ in }
     var onOpenMicSettings: () -> Void = {}
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.motionReduced) private var reduceMotion
+    @Environment(\.consentPending) private var consentPending
 
     private var selectedName: String? { model.series.first { $0.id == model.selected }?.name }
 
@@ -217,7 +222,7 @@ struct IdleScreen: View {
 
             if model.recovering {
                 HStack(spacing: Space.x2) {
-                    MarkView(side: 14, breathing: true)
+                    MarkView(barHeight: 12, breathing: true)
                     Text(AppController.recoveryRowLabel)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -240,13 +245,9 @@ struct IdleScreen: View {
                 .help(selectedName ?? "")
                 .accessibilityLabel("Series")
 
-                Button(action: onRecord) {
-                    Label("Record", systemImage: "record.circle")
-                }
-                .buttonStyle(PrimaryButtonStyle())
-                .keyboardShortcut(.defaultAction)
-                .disabled(model.selected == nil)
-                .accessibilityLabel(selectedName.map { "Record \($0)" } ?? "Record")
+                RecordButton(consentPending: consentPending, action: onRecord)
+                    .disabled(model.selected == nil)
+                    .accessibilityLabel(selectedName.map { "Record \($0)" } ?? "Record")
             }
         }
         .padding(Space.x4)
@@ -260,7 +261,7 @@ struct IdleScreen: View {
             Text("No series yet").font(Typo.title)
             Text("Connect a calendar or create a series in Minutia on the web, then record here.")
                 .font(Typo.body)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Brand.ink2)
                 .fixedSize(horizontal: false, vertical: true)
             Button { onOpenURL(links.primary.url) } label: {
                 Label(links.primary.title, systemImage: "calendar")
@@ -268,6 +269,22 @@ struct IdleScreen: View {
             .buttonStyle(PrimaryButtonStyle())
             Button(links.secondary.title) { onOpenURL(links.secondary.url) }
                 .buttonStyle(QuietButtonStyle())
+        }
+    }
+}
+
+private struct RecordButton: View {
+    let consentPending: Bool
+    let action: () -> Void
+
+    var body: some View {
+        if consentPending {
+            Button(action: action) { Label("Record", systemImage: "record.circle") }
+                .buttonStyle(SecondaryButtonStyle())
+        } else {
+            Button(action: action) { Label("Record", systemImage: "record.circle") }
+                .buttonStyle(PrimaryButtonStyle())
+                .keyboardShortcut(.defaultAction)
         }
     }
 }
@@ -297,7 +314,7 @@ private struct MicPermissionNotice: View {
                 Text("Microphone access needed to record").font(Typo.bodyStrong)
                 Text("System audio is requested the first time you record.")
                     .font(Typo.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Brand.ink2)
                 Button("Open System Settings", action: onOpenSettings)
                     .buttonStyle(SecondaryButtonStyle())
                     .fixedSize()
@@ -311,10 +328,13 @@ struct FeedbackNotice: View {
 
     var body: some View {
         NoticeRow(kind: .neutral) {
-            Image(systemName: "exclamationmark.circle").foregroundStyle(.secondary)
+            Image(systemName: "exclamationmark.circle").foregroundStyle(Brand.ink2)
         } content: {
-            Text(message).foregroundStyle(.secondary)
+            Text(message).foregroundStyle(Brand.ink2)
         }
+        .padding(.horizontal, Space.x4)
+        .padding(.top, Space.x4)
+        .frame(width: Space.panelWidth)
     }
 }
 
@@ -351,6 +371,9 @@ struct ConsentNotice: View {
                 }
             }
         }
+        .padding(.horizontal, Space.x4)
+        .padding(.top, Space.x4)
+        .frame(width: Space.panelWidth)
     }
 }
 
@@ -360,14 +383,18 @@ private struct DetectionNotice: View {
 
     var body: some View {
         NoticeRow(kind: .accent) {
-            MarkView(side: 20, rises: true)
+            MarkView(barHeight: 14, rises: true)
         } content: {
             HStack(alignment: .top, spacing: Space.x2) {
                 Text(AppController.detectionBannerText(via: via))
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Button(action: onDismiss) {
-                    Image(systemName: "xmark").font(.system(size: 11, weight: .semibold))
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
                 }
+                .padding(-4)
                 .buttonStyle(QuietButtonStyle())
                 .keyboardShortcut(.cancelAction)
                 .accessibilityLabel("Dismiss detection")
@@ -399,7 +426,7 @@ struct FinishingContent: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Space.x3) {
             HStack(alignment: .top, spacing: Space.x3) {
-                MarkView(side: 36, breathing: true)
+                MarkView(barHeight: 20, breathing: true)
                 VStack(alignment: .leading, spacing: Space.x1) {
                     Text(label)
                         .font(Typo.title)
@@ -415,7 +442,7 @@ struct FinishingContent: View {
                     }
                     Text("You can close this. Minutia finishes in the background.")
                         .font(Typo.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Brand.ink2)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -429,33 +456,34 @@ struct FinishingContent: View {
 }
 
 struct DoneContent: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var progress: CGFloat
+    var onOpenRecap: () -> Void = {}
+    @Environment(\.motionReduced) private var reduceMotion
+    @State private var progress: CGFloat = 0
     @State private var popped = false
 
-    init() {
-        _progress = State(initialValue: CheckReveal.initialProgress(reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion))
-    }
-
     var body: some View {
-        HStack(spacing: Space.x3) {
-            MarkView(side: 36, checkProgress: progress, popped: popped)
-            Text("Recap is ready").font(Typo.title)
+        HStack(alignment: .top, spacing: Space.x3) {
+            MarkView(barHeight: 20, includesCheck: true, checkProgress: reduceMotion ? 1 : progress, popped: popped)
+            VStack(alignment: .leading, spacing: Space.x1) {
+                Text("Sent. Your recap is on its way")
+                    .font(Typo.title)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Open recap", action: onOpenRecap)
+                    .buttonStyle(QuietButtonStyle())
+            }
         }
         .padding(Space.x4)
         .frame(width: Space.panelWidth, alignment: .leading)
         .sensoryFeedback(.alignment, trigger: progress == 1)
         .task {
-            AccessibilityNotification.Announcement("Recap is ready").post()
-            guard !reduceMotion else { progress = 1; return }
+            guard !reduceMotion else { return }
             try? await Task.sleep(nanoseconds: 180_000_000)
-            withAnimation(.timingCurve(0.2, 0.8, 0.2, 1, duration: 0.42)) { progress = 1 }
-            try? await Task.sleep(nanoseconds: 420_000_000)
+            withAnimation(.timingCurve(0.2, 0.8, 0.2, 1, duration: CheckReveal.drawDuration)) { progress = 1 }
+            try? await Task.sleep(nanoseconds: UInt64(CheckReveal.drawDuration * 1_000_000_000))
             popped = true
-            try? await Task.sleep(nanoseconds: 120_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(CheckReveal.popHold * 1_000_000_000))
             popped = false
         }
-        .accessibilityElement(children: .combine)
     }
 }
 
@@ -465,6 +493,7 @@ struct ErrorScreen: View {
     var onRetry: () -> Void = {}
     var onDismiss: () -> Void = {}
     var onOpenSettings: () -> Void = {}
+    @Environment(\.consentPending) private var consentPending
 
     var body: some View {
         let actions = ErrorActions.resolve(isMicError: isMicError)
@@ -487,17 +516,20 @@ struct ErrorScreen: View {
     @ViewBuilder
     private func button(_ action: ErrorActions.Action, primary: Bool) -> some View {
         switch action {
-        case .retry:
-            if primary {
-                Button("Retry", action: onRetry).buttonStyle(PrimaryButtonStyle()).keyboardShortcut(.defaultAction)
-            } else {
-                Button("Retry", action: onRetry).buttonStyle(SecondaryButtonStyle())
-            }
-        case .openSettings:
-            Button("Open System Settings", action: onOpenSettings).buttonStyle(PrimaryButtonStyle()).keyboardShortcut(.defaultAction)
+        case .retry: leading("Retry", action: onRetry, primary: primary)
+        case .openSettings: leading("Open System Settings", action: onOpenSettings, primary: primary)
         case .dismiss:
             Button("Dismiss", action: onDismiss).buttonStyle(QuietButtonStyle()).keyboardShortcut(.cancelAction)
                 .frame(maxWidth: .infinity)
+        }
+    }
+
+    @ViewBuilder
+    private func leading(_ title: String, action: @escaping () -> Void, primary: Bool) -> some View {
+        if primary && !consentPending {
+            Button(title, action: action).buttonStyle(PrimaryButtonStyle()).keyboardShortcut(.defaultAction)
+        } else {
+            Button(title, action: action).buttonStyle(SecondaryButtonStyle())
         }
     }
 }
@@ -526,28 +558,33 @@ struct FooterBar: View {
     @State private var chipShown = false
 
     var body: some View {
-        HStack {
+        HStack(spacing: 0) {
             Button(action: onSettings) {
-                Image(systemName: "gearshape")
+                Image(systemName: "gearshape").frame(minWidth: 28, minHeight: 28).contentShape(Rectangle())
             }
             .buttonStyle(QuietButtonStyle())
             .accessibilityLabel("Settings")
             Spacer()
+            Button(action: onQuit) {
+                Text("Quit").frame(minWidth: 28, minHeight: 28).contentShape(Rectangle())
+            }
+            .buttonStyle(QuietButtonStyle())
+            .keyboardShortcut("q")
+        }
+        .overlay {
             if updateAvailable {
                 Button(action: onUpdate) {
                     HStack(spacing: Space.x2 - 2) {
                         Circle().fill(Brand.vermilion).frame(width: 6, height: 6)
                         Text("Update available")
                     }
+                    .frame(minHeight: 28)
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(QuietButtonStyle())
                 .opacity(chipShown ? 1 : 0)
                 .onAppear { withAnimation(Motion.fade) { chipShown = true } }
-                Spacer()
             }
-            Button("Quit", action: onQuit)
-                .buttonStyle(QuietButtonStyle())
-                .keyboardShortcut("q")
         }
         .padding(.horizontal, Space.x4)
         .frame(width: Space.panelWidth, height: 28)

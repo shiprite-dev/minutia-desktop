@@ -1,3 +1,4 @@
+#if DEBUG
 import AppKit
 import SwiftUI
 import XCTest
@@ -23,7 +24,11 @@ final class GalleryShotsTests: XCTestCase {
                 window.contentView = hosting
                 RunLoop.current.run(until: Date().addingTimeInterval(1.0))
                 hosting.layoutSubtreeIfNeeded()
-                let rep = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
+                let rep = try XCTUnwrap(NSBitmapImageRep(
+                    bitmapDataPlanes: nil, pixelsWide: Int(size.width) * 2, pixelsHigh: Int(size.height) * 2,
+                    bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                    colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+                rep.size = size
                 hosting.cacheDisplay(in: hosting.bounds, to: rep)
                 let data = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
                 try data.write(to: URL(fileURLWithPath: directory).appendingPathComponent("\(entry.name)-\(dark ? "dark" : "light").png"))
@@ -31,3 +36,4 @@ final class GalleryShotsTests: XCTestCase {
         }
     }
 }
+#endif

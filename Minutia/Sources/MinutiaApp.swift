@@ -247,6 +247,12 @@ struct MenuBarIcon: View {
 /// An outstanding request to record, triggered by the browser via `minutia://record`. Capture
 /// never starts from the deep link itself: this pending consent gates it behind an explicit user
 /// confirm (notification action or in-menu banner).
+struct RecapCue: Equatable {
+    let meetingId: UUID
+    let seriesId: UUID?
+    let instance: URL
+}
+
 struct PendingRecordConsent: Equatable {
     let meetingId: String
     let requestedAt: Date
@@ -287,6 +293,10 @@ final class AppController: NSObject, ObservableObject {
     /// True while the startup recovery sweep is finalizing a prior recording's orphaned upload.
     /// Drives a quiet in-menu row and folds recovery into the quit guard.
     @Published private(set) var recoveryActive: Bool = false
+    /// Set when a stop the user can follow up on has been handed to the server, so the panel can say
+    /// so and offer the recap. Cleared by the panel after its hold and by any phase change.
+    @Published private(set) var recapCue: RecapCue?
+    var announce: (String) -> Void = { AccessibilityNotification.Announcement($0).post() }
     @Published private(set) var selectedSeriesId: UUID?
     /// The user chose a series during the current detected meeting; detection then leaves it alone.
     private var seriesPickedThisMeeting = false
@@ -662,7 +672,8 @@ final class AppController: NSObject, ObservableObject {
     private var cancellables: Set<AnyCancellable> = []
     private var lastConfidence: DetectionConfidence = .none
     private var recordingMeetingId: UUID?
-    private var recordingSeriesId: UUID?
+    var recordingSeriesId: UUID?
+    var recordingSeriesName: String? { series.first { $0.id == recordingSeriesId }?.name }
     /// The instance capture started against, captured at start so the recap URL survives an instance
     /// switch made while the meeting was recording.
     private var recordingInstance: URL?
@@ -823,6 +834,8 @@ final class AppController: NSObject, ObservableObject {
         guard next != phase else { return }
         let previous = phase
         phase = next
+        recapCue = nil
+        if next == .recording, previous != .recording { announce("Recording started") }
         restoreLastUsedAfterDetectedMeeting()
         switch Self.modelStoreCue(from: previous, to: next, signedIn: authManager.sessionIdentity.email != nil) {
         case .pause: modelStore.recordingDidStart()
@@ -1641,6 +1654,24 @@ final class AppController: NSObject, ObservableObject {
 
     func stopRecording() { stopRecording(reason: .manual) }
 
+    nonisolated static func recapCue(reason: StopReason, transcriptRequested: Bool, meetingId: UUID?, seriesId: UUID?, instance: URL?) -> RecapCue? {
+        guard opensRecap(for: reason), transcriptRequested, let meetingId, let instance else { return nil }
+        return RecapCue(meetingId: meetingId, seriesId: seriesId, instance: instance)
+    }
+
+    func presentRecapCue(_ cue: RecapCue?) {
+        guard let cue, phase == .idle else { return }
+        recapCue = cue
+        announce("Sent. Your recap is on its way")
+    }
+
+    func clearRecapCue() { recapCue = nil }
+
+    func openRecapFromCue() {
+        guard let cue = recapCue else { return }
+        Task { await openRecap(meetingId: cue.meetingId, seriesId: cue.seriesId, instance: cue.instance) }
+    }
+
     /// Stop and finalize the recording. `reason` decides whether the recap opens: a manual or
     /// locally-detected end lands the user on the fresh notes; a web-end stop suppresses the recap
     /// (the user is already on the web app).
@@ -1678,6 +1709,9 @@ final class AppController: NSObject, ObservableObject {
                 recordingSeriesId = nil
                 recordingInstance = nil
                 apply(.finalized)
+                presentRecapCue(Self.recapCue(
+                    reason: reason, transcriptRequested: result.transcriptRequested,
+                    meetingId: meetingId, seriesId: seriesId, instance: instance))
                 runRecovery()
                 if !early, result.transcriptRequested, let meetingId, let instance, Self.opensRecap(for: reason) {
                     await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance)
@@ -2086,8 +2120,7 @@ final class AppController: NSObject, ObservableObject {
                 body: "Open Minutia on the web to see the recap.")
             return
         }
-        NSWorkspace.shared.open(
-            MinutiaClient.recapURL(instance: instance, seriesId: resolvedSeries, meetingId: meetingId, autoRecap: autoRecap))
+        openURL(MinutiaClient.recapURL(instance: instance, seriesId: resolvedSeries, meetingId: meetingId, autoRecap: autoRecap))
     }
 
     // MARK: - URL callback

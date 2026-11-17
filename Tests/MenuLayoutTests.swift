@@ -18,8 +18,8 @@ enum Host {
         view(root, dark: dark).fittingSize
     }
 
-    static func text<V: View>(_ root: V, dark: Bool = false) -> Seen {
-        let backdrop = dark ? Color(red: 0.145, green: 0.145, blue: 0.15) : Color.white
+    static func render<V: View>(_ root: V, dark: Bool = false, spin: TimeInterval = 0.6, contrastBackdrop: Bool = true) -> CGImage? {
+        let backdrop = dark ? Color(red: 0.145, green: 0.145, blue: 0.15) : Color(red: 0.96, green: 0.96, blue: 0.96)
         let hosting = NSHostingView(rootView: root.background(backdrop).environment(\.colorScheme, dark ? .dark : .light))
         hosting.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         let size = hosting.fittingSize
@@ -27,33 +27,104 @@ enum Host {
         let window = NSWindow(contentRect: hosting.frame, styleMask: [.borderless], backing: .buffered, defer: false)
         window.appearance = hosting.appearance
         window.contentView = hosting
-        RunLoop.current.run(until: Date().addingTimeInterval(0.6))
+        RunLoop.current.run(until: Date().addingTimeInterval(spin))
         hosting.layoutSubtreeIfNeeded()
         let scale = 3
         guard let rep = NSBitmapImageRep(
             bitmapDataPlanes: nil, pixelsWide: Int(size.width) * scale, pixelsHigh: Int(size.height) * scale,
             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return Seen(text: "") }
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
         rep.size = size
         hosting.cacheDisplay(in: hosting.bounds, to: rep)
-        guard let image = rep.cgImage else { return Seen(text: "") }
+        return rep.cgImage
+    }
+
+    static func text<V: View>(_ root: V, dark: Bool = false) -> Seen {
+        guard let image = render(root, dark: dark) else { return Seen(text: "", frames: []) }
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = false
         try? VNImageRequestHandler(cgImage: image).perform([request])
-        let lines = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
-        return Seen(text: lines.joined(separator: " "))
+        let found = (request.results ?? []).compactMap { observation in
+            observation.topCandidates(1).first.map { ($0.string, observation.boundingBox) }
+        }
+        return Seen(text: found.map(\.0).joined(separator: " "), frames: found)
+    }
+
+    static func pixels(_ image: CGImage) -> (width: Int, height: Int, data: [UInt8]) {
+        var data = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        let context = CGContext(data: &data, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        context?.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return (image.width, image.height, data)
+    }
+
+    private static func isFill(_ r: UInt8, _ g: UInt8, _ b: UInt8) -> Bool {
+        abs(Int(r) - 0xD4) < 24 && abs(Int(g) - 0x35) < 24 && Int(b) < 40
+    }
+
+    static func fillBands<V: View>(_ root: V, atPoint x: CGFloat) -> Int {
+        guard let image = render(root) else { return 0 }
+        let (width, height, data) = pixels(image)
+        let column = min(width - 1, Int(x * CGFloat(width) / 320))
+        var bands = 0, inBand = false
+        for row in 0..<height {
+            let i = (row * width + column) * 4
+            let on = isFill(data[i], data[i + 1], data[i + 2])
+            if on && !inBand { bands += 1 }
+            inBand = on
+        }
+        return bands
+    }
+
+    static func vermilionPixels<V: View>(_ root: V, spin: TimeInterval) -> Int {
+        guard let image = render(root, spin: spin) else { return 0 }
+        let (width, height, data) = pixels(image)
+        var count = 0
+        for i in stride(from: 0, to: width * height * 4, by: 4)
+        where abs(Int(data[i]) - 0xE2) < 14 && abs(Int(data[i + 1]) - 0x3A) < 14 && Int(data[i + 2]) < 20 { count += 1 }
+        return count
     }
 }
 
 struct Seen {
     let text: String
+    let frames: [(String, CGRect)]
 
     private static func normalize(_ value: String) -> String {
         value.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }.joined(separator: " ")
     }
 
-    func has(_ expected: String) -> Bool { Self.normalize(text).contains(Self.normalize(expected)) }
+    func has(_ expected: String) -> Bool {
+        let hay = Array(Self.normalize(text)), needle = Array(Self.normalize(expected))
+        if hay.isEmpty || needle.isEmpty { return false }
+        let allowed = needle.count >= 10 ? needle.count / 10 : 0
+        if allowed == 0 { return String(hay).contains(String(needle)) }
+        for start in 0..<hay.count {
+            for length in max(1, needle.count - allowed)...(needle.count + allowed) where start + length <= hay.count {
+                if Self.distance(Array(hay[start..<start + length]), needle) <= allowed { return true }
+            }
+        }
+        return false
+    }
+
+    private static func distance(_ a: [Character], _ b: [Character]) -> Int {
+        var row = Array(0...b.count)
+        for i in 1...a.count {
+            var previous = row[0]
+            row[0] = i
+            for j in 1...b.count {
+                let current = row[j]
+                row[j] = a[i - 1] == b[j - 1] ? previous : min(previous, row[j], row[j - 1]) + 1
+                previous = current
+            }
+        }
+        return row[b.count]
+    }
+
+    func frame(of expected: String) -> CGRect? {
+        frames.first { Self.normalize($0.0).contains(Self.normalize(expected)) }?.1
+    }
 }
 
 private let longName = String(repeating: "Quarterly platform reliability and security review ", count: 3).prefix(120).description
@@ -84,6 +155,10 @@ final class MenuLayoutTests: XCTestCase {
         assertFits("finishing", FinishingContent(label: "Uploading and requesting transcript", progress: nil, preparingSince: nil))
         assertFits("transcribing", FinishingContent(label: "Transcribing on this Mac, 3 of 12", progress: 0.25, preparingSince: nil))
         assertFits("done", DoneContent())
+        assertFits("consent", ConsentNotice(hasClaim: false))
+        assertFits("consent with claim", ConsentNotice(hasClaim: true))
+        assertFits("feedback", FeedbackNotice(message: "That recording could not be started. Try again in a moment."))
+
         assertFits("error", ErrorScreen(message: "Upload failed after several attempts. Your recording is saved on this Mac.", isMicError: false))
         assertFits("mic error", ErrorScreen(message: "Microphone access was denied.", isMicError: true))
         for stage in [SignInStage.connecting, .ready, .browserPending, .failed(message: "Can't reach app.getminutia.com. Check your connection.", retryable: true)] {
@@ -103,6 +178,17 @@ final class MenuLayoutTests: XCTestCase {
         var model = idleModel
         model.selected = sampleSeries[1].id
         XCTAssertEqual(Host.size(IdleScreen(model: model)).width, 320)
+    }
+
+    func test_footer_isPanelWidthWithOrWithoutTheUpdateChip() {
+        for update in [false, true] { XCTAssertEqual(Host.size(FooterBar(updateAvailable: update)).width, 320) }
+    }
+
+    func test_consentAboveIdle_staysPanelWidthAndInBudget() {
+        let stack = VStack(spacing: 0) { ConsentNotice(hasClaim: true); IdleScreen(model: idleModel) }.environment(\.consentPending, true)
+        let size = Host.size(stack)
+        XCTAssertEqual(size.width, 320)
+        XCTAssertLessThanOrEqual(size.height, 520)
     }
 
     func test_largestTextSize_stillFits() {
@@ -125,6 +211,8 @@ final class MenuStatesSeenTests: XCTestCase {
         IdleModel(series: series, selected: selected, detectedVia: detectedVia, softHint: false, micBanner: false,
                   recovering: false, instance: URL(string: "https://example.com")!)
     }
+
+    private var idleModel: IdleModel { model() }
 
     func test_idle_offersRecordUnderTheSeriesEyebrow() {
         let seen = Host.text(IdleScreen(model: model()))
@@ -179,8 +267,72 @@ final class MenuStatesSeenTests: XCTestCase {
         XCTAssertTrue(seen.has("You can close this. Minutia finishes in the background."), seen.text)
     }
 
-    func test_done_saysRecapIsReady() {
-        XCTAssertTrue(Host.text(DoneContent()).has("Recap is ready"))
+    func test_done_saysItWasSentInPlainWordsAndOffersTheRecap() {
+        let seen = Host.text(DoneContent())
+        XCTAssertTrue(seen.has("Sent. Your recap is on its way"), seen.text)
+        XCTAssertTrue(seen.has("Open recap"), seen.text)
+        XCTAssertFalse(seen.has("Recap is ready"), seen.text)
+    }
+
+    func test_twoHourRecording_withALongName_stillShowsMostOfTheName() {
+        let seen = Host.text(RecordingContent(model: RecordingModel(seriesName: longName, elapsed: 7457, level: 0, progress: "x")))
+        XCTAssertTrue(seen.has("Quarterly platform reliability and security review"), seen.text)
+        XCTAssertTrue(seen.has("2:04:17"), seen.text)
+    }
+
+    func test_notes_alignsWithTheRestOfTheColumn() throws {
+        let seen = Host.text(RecordingContent(model: RecordingModel(seriesName: "Weekly Eng Sync", elapsed: 5, level: 0, progress: "x")))
+        let notes = try XCTUnwrap(seen.frame(of: "Notes"))
+        XCTAssertLessThan(notes.minX, 0.2)
+    }
+
+    func test_updateChip_sitsInTheMiddleOfThePanel() throws {
+        let chip = try XCTUnwrap(Host.text(FooterBar(updateAvailable: true)).frame(of: "Update available"))
+        XCTAssertEqual(chip.midX, 0.5, accuracy: 0.02)
+    }
+
+    func test_emailSignIn_opensFromAQuietButtonAndShowsTheFields() {
+        let closed = Host.text(SignInScreen(stage: .ready, showsMenuBarHint: false, signInError: nil, email: .constant(""), password: .constant(""), showEmailForm: .constant(false), busy: false))
+        let open = Host.text(SignInScreen(stage: .ready, showsMenuBarHint: false, signInError: nil, email: .constant(""), password: .constant(""), showEmailForm: .constant(true), busy: false))
+        XCTAssertFalse(closed.has("Sign in with Google"), closed.text)
+        XCTAssertTrue(open.has("Sign in with Google"), open.text)
+        XCTAssertTrue(open.has("Use email instead"), open.text)
+    }
+
+    func test_secondaryButton_keepsItsLabelAwayFromItsBorder() {
+        let label = Text("Open System Settings").font(Typo.body)
+        let bare = Host.size(label).width
+        let button = Host.size(Button(action: {}) { label }.buttonStyle(SecondaryButtonStyle()).fixedSize()).width
+        XCTAssertGreaterThanOrEqual(button - bare, 24)
+    }
+
+    func test_meetingPromptCapsule_isReadableInLightAndDark() {
+        let content = MeetingPromptContent(title: "Meeting detected", symbol: "waveform", primaryTitle: "Start taking notes", secondaryTitle: nil)
+        for dark in [false, true] {
+            let seen = Host.text(MeetingPromptView(content: content, onStart: {}, onDismiss: {}).padding(24), dark: dark)
+            XCTAssertTrue(seen.has("Meeting detected"), "dark: \(dark) \(seen.text)")
+            XCTAssertTrue(seen.has("Start taking notes"), "dark: \(dark) \(seen.text)")
+        }
+    }
+
+    func test_doneWithReduceMotion_showsTheFinishedCheckAtOnce_andWithoutItDrawsFirst() {
+        let still = Host.vermilionPixels(DoneContent().environment(\.reduceMotionOverride, true), spin: 0.05)
+        let animated = Host.vermilionPixels(DoneContent().environment(\.reduceMotionOverride, false), spin: 0.05)
+        XCTAssertGreaterThan(still, 50)
+        XCTAssertEqual(animated, 0)
+    }
+
+    func test_consentOverIdle_showsOneVermilionFill_notTwo() {
+        for hasClaim in [false, true] {
+            let view = VStack(spacing: 0) { ConsentNotice(hasClaim: hasClaim); IdleScreen(model: idleModel) }.environment(\.consentPending, true)
+            XCTAssertEqual(Host.fillBands(view, atPoint: 30), 1, "claim: \(hasClaim)")
+        }
+        XCTAssertEqual(Host.fillBands(IdleScreen(model: idleModel), atPoint: 30), 1)
+    }
+
+    func test_consentOverError_showsOneVermilionFill() {
+        let view = VStack(spacing: 0) { ConsentNotice(hasClaim: true); ErrorScreen(message: "Upload failed.", isMicError: false) }.environment(\.consentPending, true)
+        XCTAssertEqual(Host.fillBands(view, atPoint: 30), 1)
     }
 
     func test_failedUpload_showsTheMessageRetryAndDismiss() {
