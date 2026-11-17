@@ -213,6 +213,7 @@ struct SettingsView: View {
     }
 
     private func setLaunchAtLogin(_ enabled: Bool) {
+        FirstRun.recordLaunchAtLoginChoice(.standard)
         do {
             if enabled {
                 try SMAppService.mainApp.register()

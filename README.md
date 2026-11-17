@@ -17,7 +17,6 @@ Minutia Desktop records meeting audio directly on your Mac, microphone plus syst
 ## Requirements
 
 - macOS 14.4 or later
-- A running Minutia instance to connect to
 
 ## Permissions
 
@@ -28,11 +27,9 @@ macOS prompts for two permissions the first time you record, never before:
 
 ## Download
 
-Grab the latest `Minutia-<version>.dmg` from the [Releases](https://github.com/shiprite-dev/minutia-desktop/releases/latest) page, open it, and drag **Minutia** into **Applications**. Launch it from Applications; it lives in the menu bar (no Dock icon).
+Grab the latest `Minutia-<version>.dmg` from the [Releases](https://github.com/shiprite-dev/minutia-desktop/releases/latest) page, open it, and drag **Minutia** into **Applications**. The app is signed and notarized, so it opens like any other Mac app, and it updates itself. It lives in the menu bar, top right (no Dock icon).
 
 The first time you record, macOS prompts once for **Microphone** and once for **System audio recording** (never before). Grant both so the other participants' audio makes it into the transcript.
-
-> **Current builds are unsigned previews.** Until a Developer ID certificate is in place, releases are ad-hoc signed and not notarized, so macOS blocks the first launch. Right-click **Minutia** in Applications and choose **Open**; if macOS calls the app damaged instead, clear the download flag with `xattr -dr com.apple.quarantine /Applications/Minutia.app`. These builds do not update themselves. The release pipeline already produces signed, notarized, self-updating builds once signing credentials exist.
 
 ## Building from source
 
@@ -65,7 +62,7 @@ Then: `git tag v0.2.0 && git push origin v0.2.0`.
 
 ## Configuration
 
-Minutia Desktop connects to the managed Minutia Cloud instance by default, so there is nothing to configure: launch it and sign in. Self-hosters point it at their own instance in Settings: paste the instance URL, hit Reconnect, and a status line confirms the connection. Launch-at-login, sign out, and the app version (0.1.0) live in the same Settings window.
+Minutia Desktop signs in to Minutia Cloud by default, so there is nothing to configure: launch it and sign in. To use a self-hosted instance, paste its URL in Settings and hit Reconnect. Launch at Login (on after your first sign-in), sign out, and the app version live in the same Settings window.
 
 ## Privacy
 

@@ -7,6 +7,7 @@ import SwiftUI
 /// fallback. Instance changes live in Settings, for self-hosters only.
 struct SignInView: View {
     @ObservedObject var authManager: AuthManager
+    var showsMenuBarHint = false
     @Environment(\.openSettings) private var openSettings
 
     @State private var email = ""
@@ -42,6 +43,14 @@ struct SignInView: View {
                 Text("Minutia").font(.headline)
             }
             .padding(12)
+
+            if showsMenuBarHint {
+                Label(FirstRun.menuBarHint, systemImage: "menubar.arrow.up.rectangle")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
+            }
 
             form
         }

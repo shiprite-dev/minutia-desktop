@@ -328,7 +328,7 @@ final class CaptureSession: ObservableObject {
             try await cloud.finalizeMeeting(meetingId: meetingId, audioPath: path, duration: durationSeconds, sizeBytes: size)
             _ = try await NotepadFinalize.flushThenTranscribe(
                 flush: flushNotes,
-                requestTranscription: { try await cloud.requestTranscription(meetingId: meetingId, expectedSegments: expected, deferExtraction: true, strict: false) })
+                requestTranscription: { try await cloud.requestTranscription(meetingId: meetingId, expectedSegments: expected, deferExtraction: true) })
             return (counts: counts, expected: expected)
         }
     }
@@ -494,7 +494,7 @@ final class CaptureSession: ObservableObject {
         _ = try await NotepadFinalize.flushThenTranscribe(
             flush: flushNotes,
             requestTranscription: {
-                let result = try await cloud.requestTranscription(meetingId: meetingId, expectedSegments: nil, deferExtraction: deferExtraction, strict: true)
+                let result = try await cloud.requestTranscription(meetingId: meetingId, expectedSegments: nil, deferExtraction: deferExtraction)
                 accepted?.set()
                 return result
             })
@@ -672,7 +672,7 @@ final class CaptureSession: ObservableObject {
 protocol CloudFinalizeTransport {
     func uploadRecording(meetingId: String, fileURL: URL) async throws -> String
     func finalizeMeeting(meetingId: String, audioPath: String, duration: Double, sizeBytes: Int64) async throws
-    func requestTranscription(meetingId: String, expectedSegments: Int?, deferExtraction: Bool, strict: Bool) async throws
+    func requestTranscription(meetingId: String, expectedSegments: Int?, deferExtraction: Bool) async throws
 }
 
 extension MinutiaClient: CloudFinalizeTransport {}

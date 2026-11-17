@@ -145,7 +145,6 @@ final class DeviceFallbackTests: XCTestCase {
                 continue
             }
             XCTAssertEqual(cloud.log, ["uploadRecording", "finalizeMeeting", "requestTranscription"], "status \(status)")
-            XCTAssertEqual(cloud.strict, [true], "status \(status): the fallback asks for a strict answer")
             XCTAssertTrue(dirExists, "status \(status): no transcription accepted, so the directory stays")
             XCTAssertTrue(recordingExists, "status \(status)")
         }
@@ -405,7 +404,6 @@ final class DeviceFallbackTests: XCTestCase {
         XCTAssertEqual(cloud.log, ["uploadRecording", "finalizeMeeting", "requestTranscription"])
         XCTAssertEqual(cloud.uploaded, [recording], "the full recording on disk is what goes up")
         XCTAssertEqual(cloud.expectedSegments, [nil])
-        XCTAssertEqual(cloud.strict, [true], "a 503 must not count as accepted")
         XCTAssertFalse(transport.log.contains("mark") || transport.log.contains("submit"), "got \(transport.log)")
         XCTAssertFalse(dirExists, "the cloud 2xx deletes the capture directory")
         let ended = await eventually { transport.log.contains("endMeeting") }

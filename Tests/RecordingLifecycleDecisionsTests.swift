@@ -115,6 +115,28 @@ final class RecordingLifecycleDecisionsTests: XCTestCase {
         XCTAssertEqual(AppController.recoveryOutcome(for: MinutiaClientError.serverError(status: 500)), .retryLater)
     }
 
+    // MARK: - Transcription not set up on the server
+
+    func test_finalizeFailureMessage_transcriptionNotConfigured_saysTheRecordingIsSaved() {
+        XCTAssertEqual(
+            AppController.finalizeFailureMessage(for: MinutiaClientError.transcriptionNotConfigured, host: "minutia.example.com"),
+            "Transcription isn't set up on this server yet. Your recording is saved on this Mac.")
+    }
+
+    /// A server without transcription keeps the recording and is retried by later sweeps, each one
+    /// counting toward the attempt ceiling, so it is never a hot loop and never silently deleted.
+    func test_recoveryOutcome_transcriptionNotConfigured_retriesWithinTheAttemptCeiling() {
+        let outcome = AppController.recoveryOutcome(for: MinutiaClientError.transcriptionNotConfigured)
+        XCTAssertEqual(outcome, .retryLater)
+        let manifest = CaptureManifest(
+            meetingId: meeting, seriesId: nil, instanceURL: URL(string: "https://minutia.example.com")!,
+            userId: "u1", createdAt: Date(timeIntervalSince1970: 0), recoveryAttempts: 1)
+        let step = AppController.sweepStep(
+            manifest: manifest, outcome: outcome, sweep: AppController.recoverySweep(priorAttempts: 1))
+        XCTAssertEqual(step.save?.recoveryAttempts, 2)
+        XCTAssertNil(step.report)
+    }
+
     // MARK: - Startup recovery attempt bound
 
     /// A fresh or mid-way capture is still attempted, incrementing the persisted count; the count that

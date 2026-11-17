@@ -177,15 +177,14 @@ final class RecordingTransport: DeviceTranscriptTransport, @unchecked Sendable {
 
 /// Records every cloud-finalize call. A device meeting that stays on this Mac must leave `log` empty.
 /// `failure` makes the recording upload throw it. `transcribeStatus` is the transcribe route's answer,
-/// mapped the way `MinutiaClient.requestTranscription` maps it: 2xx returns, a 503 returns unless
-/// `strict`, anything else throws. `uploadHangs` makes the upload wait until cancelled, like a stalled
+/// mapped the way `MinutiaClient.requestTranscription` maps it: 2xx returns, a 503 throws
+/// `transcriptionNotConfigured`, anything else throws `serverError`. `uploadHangs` makes the upload wait until cancelled, like a stalled
 /// network; `onTranscribe` runs before the transcribe request answers.
 final class RecordingCloud: CloudFinalizeTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var _log: [String] = []
     private var _uploaded: [URL] = []
     private var _expectedSegments: [Int?] = []
-    private var _strict: [Bool] = []
     private let failure: Error?
     private let transcribeStatus: Int
     private let uploadHangs: Bool
@@ -202,7 +201,6 @@ final class RecordingCloud: CloudFinalizeTransport, @unchecked Sendable {
     var log: [String] { lock.withLock { _log } }
     var uploaded: [URL] { lock.withLock { _uploaded } }
     var expectedSegments: [Int?] { lock.withLock { _expectedSegments } }
-    var strict: [Bool] { lock.withLock { _strict } }
 
     func uploadRecording(meetingId: String, fileURL: URL) async throws -> String {
         lock.withLock { _log.append("uploadRecording"); _uploaded.append(fileURL) }
@@ -215,10 +213,11 @@ final class RecordingCloud: CloudFinalizeTransport, @unchecked Sendable {
         lock.withLock { _log.append("finalizeMeeting") }
     }
 
-    func requestTranscription(meetingId: String, expectedSegments: Int?, deferExtraction: Bool, strict: Bool) async throws {
-        lock.withLock { _log.append("requestTranscription"); _expectedSegments.append(expectedSegments); _strict.append(strict) }
+    func requestTranscription(meetingId: String, expectedSegments: Int?, deferExtraction: Bool) async throws {
+        lock.withLock { _log.append("requestTranscription"); _expectedSegments.append(expectedSegments) }
         onTranscribe()
-        if (200...299).contains(transcribeStatus) || (transcribeStatus == 503 && !strict) { return }
+        if (200...299).contains(transcribeStatus) { return }
+        if transcribeStatus == 503 { throw MinutiaClientError.transcriptionNotConfigured }
         throw MinutiaClientError.serverError(status: transcribeStatus)
     }
 }
