@@ -125,8 +125,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // AuthManager.ensureConnected is single-flight and idempotent, so this racing MenuContent's
         // own restoreSession() is safe.
         guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
-        if FirstRun.isFirstLaunch(.standard) { AppController.shared.welcomeFirstLaunch() }
-        Task { @MainActor in await AppController.shared.restoreSession() }
+        let firstLaunch = FirstRun.isFirstLaunch(.standard)
+        if firstLaunch { AppController.shared.welcomeFirstLaunch() }
+        Task { @MainActor in await AppController.shared.restoreSession(firstLaunch: firstLaunch) }
     }
 
     @objc func handleGetURLEvent(_ event: NSAppleEventDescriptor, withReplyEvent: NSAppleEventDescriptor) {
@@ -787,8 +788,12 @@ final class AppController: NSObject, ObservableObject {
     /// Rehydrate the Supabase client from the stored instance (or the managed cloud
     /// default on first run) so a Keychain session lands the app signed in with no
     /// Connect step. Idempotent with SignInView's on-appear auto-connect.
-    func restoreSession() async {
+    func restoreSession(firstLaunch: Bool = false) async {
         try? await authManager.ensureConnected()
+        if authManager.client() != nil,
+           FirstRun.opensSignIn(firstLaunch: firstLaunch, signedIn: authManager.sessionIdentity.email != nil) {
+            NSWorkspace.shared.open(authManager.beginBrowserSignIn(device: Host.current().localizedName ?? "Mac"))
+        }
         if authManager.sessionIdentity.email != nil { Task { await modelStore.prepare(language: "en") } }
         // Recover orphaned captures on every launch, not only on a sign-in transition: a warm launch
         // restoring a Keychain session emits no signedIn transition, so a recording orphaned by a
@@ -884,10 +889,6 @@ final class AppController: NSObject, ObservableObject {
     /// The first launch of a fresh install: point at the menu bar, since nothing else appears.
     func welcomeFirstLaunch() {
         showsMenuBarHint = true
-        Task {
-            let granted = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
-            if granted == true { Self.postNotification(title: "Minutia", body: FirstRun.menuBarHint) }
-        }
     }
 
     private func handleAuthChange(signedIn: Bool) {
@@ -899,7 +900,11 @@ final class AppController: NSObject, ObservableObject {
             // so rebind the detector explicitly: syncDetector re-points its agenda provider at the
             // new instance's client. loadSeries and runRecovery likewise re-run for the new instance.
             syncDetector()
-            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+            let pointsAtMenuBar = showsMenuBarHint
+            Task {
+                let granted = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+                if granted == true, pointsAtMenuBar { Self.postNotification(title: "Minutia", body: FirstRun.menuBarHint) }
+            }
             Task { await loadSeries() }
             Task { await modelStore.prepare(language: "en") }
             runRecovery()
@@ -936,8 +941,12 @@ final class AppController: NSObject, ObservableObject {
         lastConfidence = confidence
         switch confidence {
         case .high(let app):
+            let live = detector.liveAgendaItem
+            if canBeginRecording {
+                selectedSeriesId = Self.defaultSeries(available: series.map(\.id), live: live, last: selectedSeriesId)
+            }
             apply(.meetingDetected(Self.detectionLabel(app)))
-            showMeetingPromptIfNeeded(app: app)
+            showMeetingPromptIfNeeded(app: app, meeting: live?.title)
         case .none:
             // The corroborating signal is gone (mic released): retire a stale banner and reset the
             // prompt session so the next meeting can prompt again.
@@ -957,12 +966,12 @@ final class AppController: NSObject, ObservableObject {
     /// promptable state. Confirming starts capture via the same `startRecording` path the in-menu
     /// banner uses (mic preflight included); dismissing suppresses re-prompt for the rest of the
     /// session.
-    private func showMeetingPromptIfNeeded(app: MeetingApp?) {
+    private func showMeetingPromptIfNeeded(app: MeetingApp?, meeting: String?) {
         guard MeetingPrompt.shouldShow(
             isHigh: true, phase: phase, suppressedForSession: promptSuppressedForSession) else { return }
         promptSuppressedForSession = true
         meetingPromptPanel.show(
-            content: MeetingPrompt.content(for: app),
+            content: MeetingPrompt.content(for: app, meeting: meeting),
             onStart: { [weak self] in
                 self?.dismissMeetingPrompt()
                 self?.startRecording()
@@ -1120,11 +1129,12 @@ final class AppController: NSObject, ObservableObject {
         guard let fetched = try? await client.recordableSeries() else { return }
         series = fetched
         let last = UserDefaults.standard.string(forKey: Self.lastSeriesKey).flatMap(UUID.init(uuidString:))
-        if let last, fetched.contains(where: { $0.id == last }) {
-            selectedSeriesId = last
-        } else if selectedSeriesId == nil || !fetched.contains(where: { $0.id == selectedSeriesId }) {
-            selectedSeriesId = fetched.first?.id
-        }
+        selectedSeriesId = Self.defaultSeries(available: fetched.map(\.id), live: nil, last: last)
+    }
+
+    /// The series a recording goes into: the meeting happening now, else the last used, else the first.
+    nonisolated static func defaultSeries(available: [UUID], live: AgendaItem?, last: UUID?) -> UUID? {
+        [live?.seriesId, last].compactMap { $0 }.first(where: available.contains) ?? available.first
     }
 
     /// Re-fetch the recordable series so a series created on the web while the app was already open is

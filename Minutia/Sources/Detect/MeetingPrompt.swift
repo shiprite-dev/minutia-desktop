@@ -41,9 +41,10 @@ enum MeetingPrompt {
 
     /// The start variant: offer to begin taking notes on a freshly detected meeting. The compact
     /// xmark dismiss is rendered when `secondaryTitle` is nil.
-    static func content(for app: MeetingApp?) -> MeetingPromptContent {
+    /// A calendar event happening now names the meeting itself.
+    static func content(for app: MeetingApp?, meeting: String? = nil) -> MeetingPromptContent {
         MeetingPromptContent(
-            title: title(for: app), symbol: "waveform",
+            title: meeting.map { "Looks like you're in \($0)" } ?? title(for: app), symbol: "waveform",
             primaryTitle: "Start taking notes", secondaryTitle: nil)
     }
 

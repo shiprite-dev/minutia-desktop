@@ -98,16 +98,19 @@ private struct IdleView: View {
             }
 
             if controller.series.isEmpty {
+                let instance = controller.authManager.instance ?? InstanceConfig.resolvedInstance
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("No series yet. Create one in Minutia on the web.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Button("Open Minutia") {
-                        NSWorkspace.shared.open(controller.authManager.instance ?? InstanceConfig.resolvedInstance)
+                    Button {
+                        NSWorkspace.shared.open(MinutiaClient.connectCalendarURL(instance: instance))
+                    } label: {
+                        Label("Connect Google Calendar", systemImage: "calendar")
+                            .frame(maxWidth: .infinity)
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
+                    .buttonStyle(.borderedProminent)
+                    Button("Create a series") {
+                        NSWorkspace.shared.open(MinutiaClient.createSeriesURL(instance: instance))
+                    }
+                    .buttonStyle(.link)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             } else {

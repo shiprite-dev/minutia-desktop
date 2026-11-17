@@ -38,6 +38,9 @@ final class MeetingDetector: ObservableObject {
     private var cachedAgendaAt: Date?
     private let agendaCacheTTL: TimeInterval = 60
 
+    /// The calendar event the latest poll found happening now, if any.
+    private(set) var liveAgendaItem: AgendaItem?
+
     private var micActive = false
     /// The previous poll's raw browser-input hit, so a browser meeting must persist across two
     /// consecutive polls before it counts. Reset to false whenever the mic goes inactive, alongside
@@ -225,9 +228,9 @@ final class MeetingDetector: ObservableObject {
             previousPollHit: lastBrowserHit, currentPollHit: browserHit)
         lastBrowserHit = browserHit
         let agenda = await agendaSnapshot()
-        let calendarLive = DetectionRules.liveAgendaItem(agenda, now: Date()) != nil
+        liveAgendaItem = DetectionRules.liveAgendaItem(agenda, now: Date())
         confidence = DetectionRules.assess(
-            micActive: micActive, app: app, calendarLive: calendarLive, browserActive: browserConfirmed)
+            micActive: micActive, app: app, calendarLive: liveAgendaItem != nil, browserActive: browserConfirmed)
     }
 
     private func agendaSnapshot() async -> [AgendaItem] {

@@ -21,6 +21,11 @@ enum FirstRun {
         return true
     }
 
+    /// A fresh install opens browser sign-in by itself once its instance connection is ready.
+    static func opensSignIn(firstLaunch: Bool, signedIn: Bool) -> Bool {
+        firstLaunch && !signedIn
+    }
+
     /// Turns Launch at Login on at the first sign-in, once ever, unless the user already chose.
     static func defaultLaunchAtLogin(_ defaults: UserDefaults, status: SMAppService.Status, register: () throws -> Void) {
         guard !defaults.bool(forKey: launchAtLoginDecidedKey), status != .notFound else { return }
