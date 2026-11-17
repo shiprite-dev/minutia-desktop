@@ -155,6 +155,13 @@ final class DeviceCopyAndBackstopTests: XCTestCase {
 
     // MARK: Quit alert
 
+    func test_quitAlertUploads_followsTheMeetingAndItsCloudFallback() {
+        XCTAssertEqual(AppController.quitAlertUploads(phase: .recording, audioMayLeaveMac: true, step: nil), true)
+        XCTAssertEqual(AppController.quitAlertUploads(phase: .finalizing, audioMayLeaveMac: false, step: .startingOnDevice), false)
+        XCTAssertEqual(AppController.quitAlertUploads(phase: .finalizing, audioMayLeaveMac: false, step: .fallingBackToCloud), true)
+        XCTAssertNil(AppController.quitAlertUploads(phase: .idle, audioMayLeaveMac: false, step: nil))
+    }
+
     func test_quitAlert_perMeetingKind() {
         let cloud = AppController.quitAlert(capturingAudioMayLeaveMac: true)
         XCTAssertEqual(cloud.title, "Finishing upload")

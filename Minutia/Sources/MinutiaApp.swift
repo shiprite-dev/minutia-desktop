@@ -151,14 +151,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        let copy = AppController.quitAlert(capturingAudioMayLeaveMac: {
-            switch AppController.shared.phase {
-            case .recording, .finalizing:
-                AppController.shared.captureSession.audioMayLeaveMac
-                    || AppController.shared.captureSession.finishingStep == .fallingBackToCloud
-            default: nil
-            }
-        }())
+        let session = AppController.shared.captureSession
+        let copy = AppController.quitAlert(capturingAudioMayLeaveMac: AppController.quitAlertUploads(
+            phase: AppController.shared.phase, audioMayLeaveMac: session.audioMayLeaveMac, step: session.finishingStep))
         alert.messageText = copy.title
         alert.informativeText = copy.message
         alert.addButton(withTitle: "Finish & Quit")
@@ -492,6 +487,13 @@ final class AppController: NSObject, ObservableObject {
     /// Quitting must prompt when there is unfinished durable work: a recording in flight (or
     /// finalizing its upload), or a startup recovery sweep still rescuing a prior recording. Leaving
     /// without finishing would defer the upload to the next-launch recovery at best.
+    nonisolated static func quitAlertUploads(phase: AppPhase, audioMayLeaveMac: Bool, step: CaptureSession.FinishingStep?) -> Bool? {
+        switch phase {
+        case .recording, .finalizing: audioMayLeaveMac || step == .fallingBackToCloud
+        default: nil
+        }
+    }
+
     nonisolated static func quitAlert(capturingAudioMayLeaveMac: Bool?) -> (title: String, message: String) {
         switch capturingAudioMayLeaveMac {
         case true?: ("Finishing upload", "Minutia is still finishing a recording upload. Finish and quit, or keep it running?")
@@ -1586,6 +1588,7 @@ final class AppController: NSObject, ObservableObject {
                     await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance)
                 }
             } catch {
+                captureSession.endFinishing()
                 // The durable directory survives a timed-out finalize, so Retry finishes the upload
                 // rather than starting a new recording.
                 lastFailedStart = meetingId.map { .finalize(meetingId: $0.uuidString) } ?? .series
@@ -1936,6 +1939,7 @@ final class AppController: NSObject, ObservableObject {
             let dir = try? CaptureStore.capturesRoot()
                 .appendingPathComponent(meetingId.lowercased(), isDirectory: true)
             let manifest = dir.flatMap { CaptureRecovery.loadManifest(from: $0) }
+            if let manifest { captureSession.beginFinishing(audioMayLeaveMac: manifest.audioMayLeaveMac) }
             do {
                 guard let dir, let manifest else { throw CaptureSession.CaptureError.notRunning }
                 try await CaptureRecovery.recover(

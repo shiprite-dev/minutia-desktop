@@ -384,9 +384,9 @@ final class DeviceStopTests: XCTestCase {
     /// written before the app exits; a cloud stop keeps the finalize window.
     func test_quitDeadline_coversLocalTranscription_onlyWhenTheAudioStaysOnThisMac() {
         XCTAssertEqual(CaptureSession.quitDeadline(audioMayLeaveMac: true, elapsedSeconds: 3_600), 65)
-        XCTAssertEqual(CaptureSession.quitDeadline(audioMayLeaveMac: false, elapsedSeconds: 600), 245)
-        XCTAssertEqual(CaptureSession.quitDeadline(audioMayLeaveMac: false, elapsedSeconds: 3_600), 425)
-        XCTAssertEqual(CaptureSession.quitDeadline(audioMayLeaveMac: false, elapsedSeconds: 3_600, finalizeTimeout: 10), 375)
+        XCTAssertEqual(CaptureSession.quitDeadline(audioMayLeaveMac: false, elapsedSeconds: 600), 255)
+        XCTAssertEqual(CaptureSession.quitDeadline(audioMayLeaveMac: false, elapsedSeconds: 3_600), 435)
+        XCTAssertEqual(CaptureSession.quitDeadline(audioMayLeaveMac: false, elapsedSeconds: 3_600, finalizeTimeout: 10), 385)
         for elapsed in [0.0, 1_800, 7_200, 21_600] {
             XCTAssertGreaterThan(
                 CaptureSession.quitDeadline(audioMayLeaveMac: false, elapsedSeconds: elapsed),

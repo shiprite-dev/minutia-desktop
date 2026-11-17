@@ -390,6 +390,7 @@ final class CaptureSession: ObservableObject {
     ) async throws -> StopResult {
         guard durationSeconds > 0 else { throw CaptureError.nothingRecorded }
         let notes = Task { try? await flushNotes() }
+        defer { notes.cancel() }
         var transcript: DeviceTranscript
         do {
             transcript = try await transcribeBounded(seconds: transcribeTimeout ?? localTranscriptionTimeout(durationSeconds: durationSeconds)) {
@@ -514,7 +515,7 @@ final class CaptureSession: ObservableObject {
     /// How long Quit waits for a stop already in flight.
     nonisolated static func quitDeadline(audioMayLeaveMac: Bool, elapsedSeconds: TimeInterval,
                                          finalizeTimeout: TimeInterval = CaptureSession.finalizeTimeout) -> TimeInterval {
-        (audioMayLeaveMac ? 0 : localTranscriptionTimeout(durationSeconds: elapsedSeconds)) + finalizeTimeout + 5
+        (audioMayLeaveMac ? 0 : localTranscriptionTimeout(durationSeconds: elapsedSeconds) + notesFlushTimeout) + finalizeTimeout + 5
     }
 
     /// How long a cancelled stop waits for the engine to stand down before giving up on it.
