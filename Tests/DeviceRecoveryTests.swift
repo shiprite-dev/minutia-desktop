@@ -29,16 +29,20 @@ final class DeviceRecoveryTests: XCTestCase {
         return dir
     }
 
-    private func savedSegment(_ seq: Int) throws -> Data {
+    /// Five seconds of "Item N." on the mic channel; `lowConfidence` decodes under the parakeet-ultra floor.
+    private func savedSegment(_ seq: Int, lowConfidence: Bool = false) throws -> Data {
         try JSONEncoder().encode(LocalTranscriber.SegmentTranscript(
             seq: seq, modelId: DeviceFixtures.ultra.id,
             segments: [.init(speaker: "me", start: Double(seq) * SegmentWriter.segmentSeconds,
-                             end: Double(seq) * SegmentWriter.segmentSeconds + 5, text: "Item \(seq).", confidence: 0.92)]))
+                             end: Double(seq) * SegmentWriter.segmentSeconds + 5, text: "Item \(seq).",
+                             confidence: lowConfidence ? 0.5 : 0.92)]))
     }
 
-    /// A capture directory as a kill (or a failed stop) leaves it.
+    /// A capture directory as a kill (or a failed stop) leaves it. `lowSaved` segments were saved under
+    /// the guard floor; `brokenAudio` names segment audio files left unreadable.
     private func captureDir(deviceOnly: Bool, notified: Bool = false, priorAttempts: Int = 0, transcriptJSON: Bool = false,
-                            saved: Set<Int> = [], corrupt: Set<Int> = [], readableRecording: Bool = true) throws -> (URL, CaptureManifest) {
+                            saved: Set<Int> = [], lowSaved: Set<Int> = [], corrupt: Set<Int> = [], brokenAudio: [String] = [],
+                            readableRecording: Bool = true, localFailed: Bool = false) throws -> (URL, CaptureManifest) {
         let dir = try DeviceFixtures.tempDir("device-recovery")
         dirs.append(dir)
         let template = try templateDir()
@@ -54,6 +58,10 @@ final class DeviceRecoveryTests: XCTestCase {
             try Data([0]).write(to: recording)
         }
         for seq in saved { try savedSegment(seq).write(to: dir.appendingPathComponent(LocalTranscriber.transcriptName(seq: seq))) }
+        for seq in lowSaved {
+            try savedSegment(seq, lowConfidence: true).write(to: dir.appendingPathComponent(LocalTranscriber.transcriptName(seq: seq)))
+        }
+        for name in brokenAudio { try Data([0]).write(to: dir.appendingPathComponent(name)) }
         for seq in corrupt { try Data("{\"seq\":".utf8).write(to: dir.appendingPathComponent(LocalTranscriber.transcriptName(seq: seq))) }
         if transcriptJSON {
             try Data(contentsOf: DeviceFixtures.fixtureURL).write(to: dir.appendingPathComponent(CaptureRecovery.transcriptName))
@@ -61,33 +69,47 @@ final class DeviceRecoveryTests: XCTestCase {
         let manifest = CaptureManifest(
             meetingId: DeviceFixtures.meetingId, seriesId: nil, instanceURL: URL(string: "https://minutia.example.com")!,
             userId: "u1", createdAt: Date(timeIntervalSince1970: 0), recoveryAttempts: priorAttempts, notified: notified,
-            transcriptionMode: .device, deviceOnly: deviceOnly, language: "en")
+            transcriptionMode: .device, deviceOnly: deviceOnly, language: "en", localFailed: localFailed)
         CaptureRecovery.saveManifest(manifest, to: dir)
         return (dir, manifest)
     }
 
-    /// The local model as recovery finds it at launch.
-    private enum Model { case none, ready, failsToLoad }
+    /// The local model as recovery finds it at launch. `none`: the manifest has no entry for the
+    /// language. `notReady`: there is an entry but the model is still downloading or warming.
+    private enum Model { case none, notReady, ready, failsToLoad }
 
-    /// A fresh engine, load gate and factory for one row. The factory hands out a new transcriber per call.
+    private final class Counter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _count = 0
+        var count: Int { lock.withLock { _count } }
+        func increment() { lock.withLock { _count += 1 } }
+    }
+
+    /// A fresh engine, load gate and factory for one row. The factory hands out a new transcriber per call
+    /// and counts the calls.
     private struct Local {
         let engine: ScriptedEngine
         let gate: LoadGate
-        let factory: @Sendable (CaptureManifest) async -> LocalTranscriber?
+        let built: Counter
+        let factory: @Sendable (CaptureManifest) async throws -> LocalTranscriber?
 
-        init(_ model: Model) {
-            let engine = DeviceFixtures.meetingEngine(DeviceRecoveryTests.segments)
+        init(_ model: Model, engine: ScriptedEngine = DeviceFixtures.meetingEngine(DeviceRecoveryTests.segments)) {
             let gate = LoadGate(open: true)
+            let built = Counter()
+            self.built = built
             self.engine = engine
             self.gate = gate
             switch model {
             case .none:
-                factory = { _ in nil }
+                factory = { _ in built.increment(); return nil }
+            case .notReady:
+                factory = { _ in built.increment(); throw CaptureRecovery.RecoveryError.deferred }
             case .ready, .failsToLoad:
                 let failure: Error? = model == .failsToLoad ? CocoaError(.fileReadCorruptFile) : nil
                 factory = { _ in
-                    LocalTranscriber(source: DeviceFixtures.source, language: "en", guardFloor: DeviceFixtures.ultra.guardFloor,
-                                     loadEngine: gate.loader(engine, failure: failure))
+                    built.increment()
+                    return LocalTranscriber(source: DeviceFixtures.source, language: "en", guardFloor: DeviceFixtures.ultra.guardFloor,
+                                            loadEngine: gate.loader(engine, failure: failure))
                 }
             }
         }
@@ -103,11 +125,13 @@ final class DeviceRecoveryTests: XCTestCase {
     }
 
     private func recover(_ dir: URL, _ manifest: CaptureManifest, transport: RecordingTransport, cloud: RecordingCloud,
-                         local: Local, flushNotes: @escaping @Sendable () async throws -> Void = {}) async -> Error? {
+                         local: Local, cloudTimeout: TimeInterval = CaptureSession.recoveryUploadTimeout,
+                         onStep: @escaping @Sendable (CaptureSession.FinishingStep) async -> Void = { _ in },
+                         flushNotes: @escaping @Sendable () async throws -> Void = {}) async -> Error? {
         do {
             try await CaptureRecovery.recoverDeviceMeeting(
                 directory: dir, manifest: manifest, transport: transport, cloud: cloud,
-                makeTranscriber: local.factory, flushNotes: flushNotes, sleep: { _ in })
+                makeTranscriber: local.factory, flushNotes: flushNotes, sleep: { _ in }, cloudTimeout: cloudTimeout, onStep: onStep)
             return nil
         } catch {
             return error
@@ -204,6 +228,7 @@ final class DeviceRecoveryTests: XCTestCase {
         var notified = false
         var transcriptJSON = false
         var saved: Set<Int> = []
+        var brokenAudio: [String] = []
         var readableRecording = true
         var model: Model = .ready
         var submit: [Int] = [200]
@@ -218,6 +243,7 @@ final class DeviceRecoveryTests: XCTestCase {
 
     private static let cloudFinalize = ["uploadRecording", "finalizeMeeting", "requestTranscription"]
     private static let all = Set(0..<segments)
+    private static let allSegmentAudio = (0..<segments).flatMap { ["seg-\($0)-me.m4a", "seg-\($0)-them.m4a"] }
 
     private var matrix: [Row] {
         let six = Array(repeating: "submit", count: CaptureSession.submitBackoff.count + 1)
@@ -228,7 +254,7 @@ final class DeviceRecoveryTests: XCTestCase {
             Row(label: "On this Mac only, finished transcript, 2xx", deviceOnly: true, transcriptJSON: true, saved: Self.all,
                 engine: [], device: ["submit"], cloud: [], deleted: true, attempts: .unchanged, report: .recovered),
             Row(label: "Automatic, finished transcript, 409 to the end", transcriptJSON: true, submit: [409],
-                engine: [], device: six, cloud: [], deleted: false, attempts: .unchanged, report: nil),
+                engine: [], device: six, cloud: [], deleted: false, attempts: .plusOne, report: nil),
             Row(label: "On this Mac only, finished transcript, 503", deviceOnly: true, transcriptJSON: true, submit: [503],
                 engine: [], device: ["submit"], cloud: [], deleted: false, attempts: .plusOne, report: nil),
             Row(label: "Automatic, finished transcript, rejected 422", transcriptJSON: true, submit: [422],
@@ -243,12 +269,12 @@ final class DeviceRecoveryTests: XCTestCase {
             Row(label: "Automatic, killed, nothing saved, 503", submit: [503],
                 engine: calls([0, 1, 2]), device: ["mark", "submit"], cloud: [], deleted: false, attempts: .plusOne, report: nil),
             Row(label: "On this Mac only, killed, nothing saved, 409 to the end", deviceOnly: true, submit: [409],
-                engine: calls([0, 1, 2]), device: ["mark"] + six, cloud: [], deleted: false, attempts: .unchanged, report: nil),
+                engine: calls([0, 1, 2]), device: ["mark"] + six, cloud: [], deleted: false, attempts: .plusOne, report: nil),
             // No usable model: Automatic finishes in the cloud, On this Mac only keeps everything.
             Row(label: "Automatic, killed, no model, cloud 2xx", model: .none,
                 engine: [], device: [], cloud: Self.cloudFinalize, deleted: true, attempts: .unchanged, report: .recovered),
             Row(label: "Automatic, killed, no model, cloud 409", model: .none, transcribe: 409,
-                engine: [], device: [], cloud: Self.cloudFinalize, deleted: false, attempts: .unchanged, report: nil),
+                engine: [], device: [], cloud: Self.cloudFinalize, deleted: false, attempts: .plusOne, report: nil),
             Row(label: "Automatic, killed, no model, cloud 503", model: .none, transcribe: 503,
                 engine: [], device: [], cloud: Self.cloudFinalize, deleted: false, attempts: .plusOne, report: nil),
             Row(label: "Automatic, killed, no model, cloud 500", model: .none, transcribe: 500,
@@ -258,6 +284,22 @@ final class DeviceRecoveryTests: XCTestCase {
             Row(label: "On this Mac only, killed, no model", deviceOnly: true, model: .none,
                 engine: [], device: [], cloud: [], deleted: false, attempts: .pinned, report: .keptOnThisMac),
             Row(label: "On this Mac only, killed, the model fails to load", deviceOnly: true, model: .failsToLoad,
+                engine: [], device: [], cloud: [], deleted: false, attempts: .pinned, report: .keptOnThisMac),
+            // The model is still downloading or warming: Automatic does not wait, On this Mac only waits for it.
+            Row(label: "Automatic, killed, the model is not ready yet, cloud 2xx", model: .notReady,
+                engine: [], device: [], cloud: Self.cloudFinalize, deleted: true, attempts: .unchanged, report: .recovered),
+            Row(label: "On this Mac only, killed, the model is not ready yet", deviceOnly: true, model: .notReady,
+                engine: [], device: [], cloud: [], deleted: false, attempts: .unchanged, report: nil),
+            // Segment audio that does not cover the recording: empty text must never replace real audio.
+            Row(label: "Automatic, killed, every segment unreadable but the recording readable", brokenAudio: Self.allSegmentAudio,
+                engine: [], device: [], cloud: Self.cloudFinalize, deleted: true, attempts: .unchanged, report: .recovered),
+            Row(label: "On this Mac only, killed, every segment unreadable but the recording readable", deviceOnly: true,
+                brokenAudio: Self.allSegmentAudio,
+                engine: [], device: [], cloud: [], deleted: false, attempts: .pinned, report: .keptOnThisMac),
+            Row(label: "Automatic, killed, two segments' system audio unreadable", brokenAudio: ["seg-1-them.m4a", "seg-2-them.m4a"],
+                engine: [], device: [], cloud: Self.cloudFinalize, deleted: true, attempts: .unchanged, report: .recovered),
+            Row(label: "On this Mac only, killed, two segments' system audio unreadable", deviceOnly: true,
+                brokenAudio: ["seg-1-them.m4a", "seg-2-them.m4a"],
                 engine: [], device: [], cloud: [], deleted: false, attempts: .pinned, report: .keptOnThisMac),
             Row(label: "On this Mac only, the stop already gave up and told the user", deviceOnly: true, notified: true,
                 engine: [], device: [], cloud: [], deleted: false, attempts: .pinned, report: nil),
@@ -275,7 +317,7 @@ final class DeviceRecoveryTests: XCTestCase {
         for row in matrix {
             let (dir, manifest) = try captureDir(deviceOnly: row.deviceOnly, notified: row.notified,
                                                  transcriptJSON: row.transcriptJSON, saved: row.saved,
-                                                 readableRecording: row.readableRecording)
+                                                 brokenAudio: row.brokenAudio, readableRecording: row.readableRecording)
             let transport = RecordingTransport(submitStatuses: row.submit)
             let cloud = RecordingCloud(transcribeStatus: row.transcribe)
             let local = Local(row.model)
@@ -304,7 +346,8 @@ final class DeviceRecoveryTests: XCTestCase {
         let rows: [(label: String, error: Error?, attempts: Attempts, report: AppController.SweepReport?)] = [
             ("2xx", nil, .unchanged, .recovered),
             ("503, assembled from the fast-lane segments", nil, .unchanged, .recovered),
-            ("409", MinutiaClientError.serverError(status: 409), .unchanged, nil),
+            ("409", MinutiaClientError.serverError(status: 409), .plusOne, nil),
+            ("cancelled by a starting recording", CancellationError(), .unchanged, nil),
             ("500", MinutiaClientError.serverError(status: 500), .plusOne, nil),
             ("unreachable", URLError(.cannotConnectToHost), .plusOne, nil),
             ("unreadable recording", CaptureRecovery.RecoveryError.unreadableRecording, .pinned, .exhausted),
@@ -318,15 +361,15 @@ final class DeviceRecoveryTests: XCTestCase {
 
     // MARK: Attempts
 
-    /// A 409 means another claim on the meeting is still running, not that this recording is broken:
-    /// it never counts toward the ceiling. Any other failure does, and the attempt that reaches the
-    /// ceiling posts the one-time notice, after which the sweep skips the directory.
-    func test_aBusyServer_neverCountsTowardTheAttemptCeiling_otherFailuresDoAndStopAtFive() async throws {
+    /// A server that keeps answering 409 counts toward the ceiling like any other retriable failure, so
+    /// a meeting stuck behind a claim that never clears stops at five with the one-time notice, after
+    /// which the sweep skips the directory.
+    func test_aBusyServer_countsTowardTheAttemptCeiling_likeOtherFailures_andStopsAtFive() async throws {
         let last = AppController.maxRecoveryAttempts - 1
         let rows: [(label: String, submit: [Int], transcribe: Int, json: Bool, model: Model, attempts: Int, report: AppController.SweepReport?)] = [
-            ("resend answered 409", [409], 200, true, .ready, last, nil),
+            ("resend answered 409", [409], 200, true, .ready, AppController.maxRecoveryAttempts, .exhausted),
             ("resend answered 503", [503], 200, true, .ready, AppController.maxRecoveryAttempts, .exhausted),
-            ("cloud finalize answered 409", [200], 409, false, .none, last, nil),
+            ("cloud finalize answered 409", [200], 409, false, .none, AppController.maxRecoveryAttempts, .exhausted),
             ("cloud finalize answered 500", [200], 500, false, .none, AppController.maxRecoveryAttempts, .exhausted),
         ]
         for row in rows {
@@ -356,6 +399,7 @@ final class DeviceRecoveryTests: XCTestCase {
             ("On this Mac only, a finished transcript is resent", true, true, [], .ready, false),
             ("a killed meeting transcribed on this Mac", false, false, [0], .ready, false),
             ("Automatic with no model, finished in the cloud", false, false, [], .none, false),
+            ("Automatic whose model fails to load, finished in the cloud", false, false, [], .failsToLoad, false),
             ("a resend whose notes flush fails", false, true, [], .ready, true),
         ]
         for row in rows {
@@ -412,5 +456,259 @@ final class DeviceRecoveryTests: XCTestCase {
             XCTAssertEqual(cloud.log, [], "retry \(retryStatus)")
             XCTAssertEqual(exists(dir), retryStatus != 200, "retry \(retryStatus)")
         }
+    }
+
+    // MARK: The quality guard judges the whole meeting
+
+    /// The guard tolerates one failed window in a meeting that otherwise passes. Recovery must judge the
+    /// saved segments too, or a lone failing missing segment looks like a meeting that failed throughout.
+    func test_recovery_aFailingMissingSegmentAmongSavedPasses_isJudgedWithTheSavedOnes_andSubmitted() async throws {
+        for deviceOnly in [false, true] {
+            let label = deviceOnly ? "On this Mac only" : "Automatic"
+            let (dir, manifest) = try captureDir(deviceOnly: deviceOnly, saved: [0, 1])
+            let transport = RecordingTransport()
+            let cloud = RecordingCloud()
+            let local = Local(.ready, engine: DeviceFixtures.meetingEngine(Self.segments, lowConfidence: [2]))
+            let error = await recover(dir, manifest, transport: transport, cloud: cloud, local: local)
+
+            XCTAssertNil(error, "\(label): pass, pass, fail passes the guard; got \(String(describing: error))")
+            XCTAssertEqual(local.engine.calls, calls([2]), label)
+            XCTAssertEqual(transport.log.filter { $0 == "mark" || $0 == "submit" }, ["mark", "submit"], label)
+            XCTAssertEqual(try texts(transport.bodies.first), ["Item 0.", "Item 1."], "\(label): the failed segment's text is dropped")
+            XCTAssertEqual(cloud.log, [], "\(label): recovered on this Mac, not refused into the cloud")
+            XCTAssertFalse(exists(dir), label)
+        }
+    }
+
+    /// A saved segment that fails the floor counts too: saved fail, missing fail, missing pass is two
+    /// failed windows in a row, so the meeting is refused locally.
+    func test_recovery_savedFailuresPlusMissingFailures_stillTripTheGuard() async throws {
+        for deviceOnly in [false, true] {
+            let label = deviceOnly ? "On this Mac only" : "Automatic"
+            let (dir, manifest) = try captureDir(deviceOnly: deviceOnly, lowSaved: [0])
+            let transport = RecordingTransport()
+            let cloud = RecordingCloud()
+            let local = Local(.ready, engine: DeviceFixtures.meetingEngine(Self.segments, lowConfidence: [1]))
+            let error = await recover(dir, manifest, transport: transport, cloud: cloud, local: local)
+            let decision = sweep(manifest, error)
+
+            XCTAssertEqual(transport.submits, 0, "\(label): no transcript is sent")
+            if deviceOnly {
+                XCTAssertEqual(error as? CaptureRecovery.RecoveryError, .audioStaysOnThisMac, "got \(String(describing: error))")
+                XCTAssertEqual(cloud.log, [], "no audio egress under On this Mac only")
+                XCTAssertTrue(exists(dir))
+                XCTAssertEqual(decision.attempts, .pinned)
+                XCTAssertEqual(decision.report, .keptOnThisMac)
+            } else {
+                XCTAssertNil(error, "got \(String(describing: error))")
+                XCTAssertEqual(cloud.log, Self.cloudFinalize, "Automatic falls back to the cloud")
+                XCTAssertFalse(exists(dir))
+            }
+        }
+    }
+
+    // MARK: Recovery yields to a recording
+
+    /// A recording starting cancels recovery. Mid-transcription that cancels the transcriber, keeps every
+    /// file and throws the cancellation, which the sweep neither counts nor reports.
+    func test_recovery_cancelledMidTranscription_cancelsTheTranscriber_deletesNothing_andThrowsCancellation() async throws {
+        let (dir, manifest) = try captureDir(deviceOnly: true, saved: [0])
+        let transport = RecordingTransport()
+        let cloud = RecordingCloud()
+        let local = Local(.ready, engine: ScriptedEngine(hanging: ["seg-1-me.m4a"]))
+        let finish = Finish()
+        let task = Task { finish.record(await self.recover(dir, manifest, transport: transport, cloud: cloud, local: local)) }
+        defer { task.cancel() }
+        let transcribing = await eventually(timeout: 10) { local.engine.calls.contains("seg-1-me.m4a") }
+        XCTAssertTrue(transcribing, "precondition: segment 1 is being transcribed")
+
+        task.cancel()
+        let finished = await eventually(timeout: 5) { finish.done }
+
+        XCTAssertTrue(finished, "a cancelled recovery returns promptly instead of waiting out the transcription")
+        XCTAssertTrue(finish.error is CancellationError, "got \(String(describing: finish.error))")
+        let cancelled = await eventually { local.engine.cancelled == ["seg-1-me.m4a"] }
+        XCTAssertTrue(cancelled, "the transcriber is cancelled; got \(local.engine.cancelled)")
+        XCTAssertTrue(exists(dir.appendingPathComponent(CaptureRecovery.recordingName)))
+        XCTAssertTrue(exists(dir.appendingPathComponent(LocalTranscriber.transcriptName(seq: 0))))
+        XCTAssertTrue(exists(dir.appendingPathComponent(CaptureRecovery.manifestName)))
+        XCTAssertEqual(transport.submits, 0)
+        XCTAssertEqual(cloud.log, [])
+        let decision = sweep(manifest, finish.error)
+        XCTAssertEqual(decision.attempts, .unchanged)
+        XCTAssertNil(decision.report)
+    }
+
+    private enum Hook { case mark, submit, flush, cloudTranscribe }
+
+    /// A recording that starts at the last moment cancels recovery. The cancellation is checked right
+    /// before each submit and each directory removal, so nothing is sent after it and the directory a
+    /// starting recording may reuse is never deleted under it.
+    func test_recovery_cancelledJustBeforeTheServerAccepts_keepsTheDirectory_sendsNothingMore_andThrowsCancellation() async throws {
+        let rows: [(label: String, json: Bool, saved: Set<Int>, model: Model, hook: Hook, submits: Int)] = [
+            ("a fresh transcript, cancelled as it marks the meeting", false, Self.all, .ready, .mark, 0),
+            ("a fresh transcript, cancelled while the server accepts it", false, Self.all, .ready, .submit, 1),
+            ("a finished transcript, cancelled as the notes flush", true, [], .ready, .flush, 0),
+            ("a finished transcript, cancelled while the server accepts it", true, [], .ready, .submit, 1),
+            ("no model, cancelled while the cloud accepts it", false, [], .none, .cloudTranscribe, 0),
+            ("the model fails to load, cancelled while the cloud accepts it", false, [], .failsToLoad, .cloudTranscribe, 0),
+        ]
+        for row in rows {
+            let (dir, manifest) = try captureDir(deviceOnly: false, transcriptJSON: row.json, saved: row.saved)
+            let canceller = Canceller()
+            let transport = RecordingTransport(
+                onMark: { if row.hook == .mark { canceller.cancel() } },
+                onSubmit: { if row.hook == .submit { canceller.cancel() } })
+            let cloud = RecordingCloud(onTranscribe: { if row.hook == .cloudTranscribe { canceller.cancel() } })
+            let local = Local(row.model)
+            let finish = Finish()
+            let task = Task {
+                finish.record(await self.recover(dir, manifest, transport: transport, cloud: cloud, local: local) {
+                    if row.hook == .flush { canceller.cancel() }
+                })
+            }
+            canceller.hold(task)
+            await task.value
+
+            XCTAssertTrue(finish.error is CancellationError, "\(row.label): got \(String(describing: finish.error))")
+            XCTAssertTrue(exists(dir), "\(row.label): the directory is kept")
+            XCTAssertTrue(exists(dir.appendingPathComponent(CaptureRecovery.recordingName)), row.label)
+            XCTAssertEqual(transport.submits, row.submits, row.label)
+            XCTAssertEqual(AppController.recoveryOutcome(for: finish.error), .deferred, row.label)
+        }
+    }
+
+    // MARK: Outcomes that never count an attempt
+
+    func test_recoveryOutcome_cancellationAndANotReadyModel_areDeferred_andSaveAndReportNothing() {
+        let manifest = CaptureManifest(
+            meetingId: DeviceFixtures.meetingId, seriesId: nil, instanceURL: URL(string: "https://minutia.example.com")!,
+            userId: "u1", createdAt: Date(timeIntervalSince1970: 0), recoveryAttempts: 2, transcriptionMode: .device,
+            deviceOnly: true, language: "en")
+        for error in [CancellationError() as Error, CaptureRecovery.RecoveryError.deferred] {
+            XCTAssertEqual(AppController.recoveryOutcome(for: error), .deferred, "\(error)")
+        }
+        let step = AppController.sweepStep(
+            manifest: manifest, outcome: .deferred, sweep: AppController.recoverySweep(priorAttempts: manifest.recoveryAttempts))
+        XCTAssertNil(step.save, "a deferred recovery persists nothing")
+        XCTAssertNil(step.report, "and tells the user nothing")
+    }
+
+    func test_recoveryOutcome_a409_isRetriedLater_likeAnyRetriableFailure() {
+        XCTAssertEqual(AppController.recoveryOutcome(for: MinutiaClientError.serverError(status: 409)), .retryLater)
+        XCTAssertEqual(AppController.recoveryOutcome(for: CaptureSession.submitFailure(MinutiaClientError.serverError(status: 409))), .retryLater)
+    }
+
+    func test_submitFailure_rethrowsCancellation_insteadOfReportingAnUnsentTranscript() {
+        let mapped: Error = CaptureSession.submitFailure(CancellationError())
+        XCTAssertTrue(mapped is CancellationError, "got \(mapped)")
+    }
+
+    // MARK: A local failure in Automatic goes straight to the cloud next time
+
+    func test_manifest_localFailed_decodesFalseFromALegacyManifest_andRoundTrips() throws {
+        let legacy = Data("""
+        {"meetingId":"\(DeviceFixtures.meetingId)","instanceURL":"https://minutia.example.com","createdAt":0,
+         "transcriptionMode":"device","deviceOnly":false,"language":"en"}
+        """.utf8)
+        XCTAssertFalse(try JSONDecoder().decode(CaptureManifest.self, from: legacy).localFailed)
+
+        let failed = CaptureManifest(
+            meetingId: DeviceFixtures.meetingId, seriesId: nil, instanceURL: URL(string: "https://minutia.example.com")!,
+            userId: "u1", createdAt: Date(timeIntervalSince1970: 0), transcriptionMode: .device, language: "en", localFailed: true)
+        let decoded = try JSONDecoder().decode(CaptureManifest.self, from: try JSONEncoder().encode(failed))
+        XCTAssertTrue(decoded.localFailed)
+        XCTAssertEqual(decoded, failed)
+    }
+
+    /// A stop whose local transcription fails in Automatic records that on the manifest before trying
+    /// the cloud, so a crash or a failed upload never makes recovery run the local model again.
+    func test_anAutomaticStopsLocalFailure_persistsLocalFailed_beforeTheCloudFallback() async throws {
+        let rows: [(label: String, engine: ScriptedEngine, loadFailure: Error?, timeout: TimeInterval?)] = [
+            ("the model fails to load", DeviceFixtures.meetingEngine(1), CocoaError(.fileReadCorruptFile), nil),
+            ("local transcription times out", ScriptedEngine(hanging: ["seg-0-me.m4a"]), nil, 0.5),
+        ]
+        for row in rows {
+            let (dir, _) = try captureDir(deviceOnly: false)
+            let local = LocalTranscriber(source: DeviceFixtures.source, language: "en", guardFloor: DeviceFixtures.ultra.guardFloor,
+                                         loadEngine: LoadGate(open: true).loader(row.engine, failure: row.loadFailure))
+            do {
+                _ = try await CaptureSession.finishOnDevice(
+                    meetingId: DeviceFixtures.meetingId, directory: dir, tail: [DeviceFixtures.segment(0, in: dir)],
+                    durationSeconds: 600, transcriber: local, transport: RecordingTransport(), recapOpened: true,
+                    deviceOnly: false, cloud: RecordingCloud(failure: URLError(.notConnectedToInternet)),
+                    transcribeTimeout: row.timeout, sleep: { _ in })
+                XCTFail("\(row.label): precondition: the cloud fallback fails")
+            } catch {}
+
+            XCTAssertTrue(exists(dir), row.label)
+            XCTAssertEqual(CaptureRecovery.loadManifest(from: dir)?.localFailed, true, row.label)
+        }
+    }
+
+    /// After a local failure, Automatic recovery never builds a transcriber and finishes in the cloud. On
+    /// this Mac only ignores the flag: it has nowhere else to go.
+    func test_recovery_ofALocalFailedMeeting_inAutomatic_goesStraightToTheCloud_onThisMacOnlyStillTranscribesLocally() async throws {
+        for deviceOnly in [false, true] {
+            let label = deviceOnly ? "On this Mac only" : "Automatic"
+            let (dir, manifest) = try captureDir(deviceOnly: deviceOnly, saved: [0], localFailed: true)
+            let transport = RecordingTransport()
+            let cloud = RecordingCloud()
+            let local = Local(.ready)
+            let error = await recover(dir, manifest, transport: transport, cloud: cloud, local: local)
+
+            XCTAssertNil(error, "\(label): got \(String(describing: error))")
+            XCTAssertFalse(exists(dir), label)
+            if deviceOnly {
+                XCTAssertEqual(local.built.count, 1)
+                XCTAssertEqual(local.engine.calls, calls([1, 2]))
+                XCTAssertEqual(cloud.log, [])
+            } else {
+                XCTAssertEqual(local.built.count, 0, "no transcriber is built")
+                XCTAssertEqual(local.engine.calls, [])
+                XCTAssertEqual(transport.log.filter { $0 == "mark" || $0 == "submit" }, [])
+                XCTAssertEqual(cloud.log, Self.cloudFinalize)
+            }
+        }
+    }
+
+    // MARK: Timeouts and progress
+
+    /// Both recovery cloud paths are bounded by the timeout recovery passes (900 s by default, not the
+    /// live stop's 60 s); a stalled upload ends as a retriable failure with the directory kept.
+    func test_recoveryCloudPaths_areBoundedByTheRecoveryUploadTimeout() async throws {
+        XCTAssertEqual(CaptureSession.recoveryUploadTimeout, 900)
+        XCTAssertEqual(CaptureSession.finalizeTimeout, 60, "the live stop keeps its own ceiling")
+        let rows: [(label: String, model: Model)] = [("no model", .none), ("the model fails to load", .failsToLoad)]
+        for row in rows {
+            let (dir, manifest) = try captureDir(deviceOnly: false)
+            let cloud = RecordingCloud(uploadHangs: true)
+            let local = Local(row.model)
+            let finish = Finish()
+            let task = Task {
+                finish.record(await self.recover(dir, manifest, transport: RecordingTransport(), cloud: cloud, local: local, cloudTimeout: 0.3))
+            }
+            let finished = await eventually(timeout: 5) { finish.done }
+            task.cancel()
+
+            XCTAssertTrue(finished, "\(row.label): the upload is cut off at the timeout recovery passed")
+            XCTAssertEqual(cloud.log, ["uploadRecording"], row.label)
+            XCTAssertNotNil(finish.error, row.label)
+            XCTAssertFalse(finish.error is CancellationError, "\(row.label): a timeout is a failure, not a cancellation")
+            XCTAssertEqual(AppController.recoveryOutcome(for: finish.error), .retryLater, row.label)
+            XCTAssertTrue(exists(dir), row.label)
+        }
+    }
+
+    /// Retry shows the same progress as a stop: recovery reports its finishing steps.
+    func test_recovery_reportsItsFinishingSteps() async throws {
+        let (dir, manifest) = try captureDir(deviceOnly: false, saved: [0])
+        let steps = StepLog()
+        let error = await recover(dir, manifest, transport: RecordingTransport(), cloud: RecordingCloud(), local: Local(.ready),
+                                  onStep: { steps.record($0) })
+
+        XCTAssertNil(error, "got \(String(describing: error))")
+        XCTAssertTrue(steps.steps.contains { if case .transcribing = $0 { return true }; return false }, "got \(steps.steps)")
+        XCTAssertEqual(steps.steps.last, .submitting)
     }
 }

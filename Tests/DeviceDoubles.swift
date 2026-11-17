@@ -82,7 +82,7 @@ final class LoadGate: @unchecked Sendable {
 
 /// Records every device-transport call in order. `submitStatuses` is consumed one per submit; when
 /// it runs out the last status repeats. `failure` makes every call throw it instead. `onMark` runs
-/// the moment the mark is called, before `markDelay`.
+/// the moment the mark is called, before `markDelay`; `onSubmit` runs before a submit answers.
 final class RecordingTransport: DeviceTranscriptTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var _log: [String] = []
@@ -91,15 +91,17 @@ final class RecordingTransport: DeviceTranscriptTransport, @unchecked Sendable {
     private let failure: Error?
     private let markDelay: TimeInterval
     private let onMark: @Sendable () -> Void
+    private let onSubmit: @Sendable () -> Void
     let warmed = XCTestExpectation(description: "summary warmed")
     let ended = XCTestExpectation(description: "meeting ended")
 
     init(submitStatuses: [Int] = [200], failure: Error? = nil, markDelay: TimeInterval = 0,
-         onMark: @escaping @Sendable () -> Void = {}) {
+         onMark: @escaping @Sendable () -> Void = {}, onSubmit: @escaping @Sendable () -> Void = {}) {
         statuses = submitStatuses
         self.failure = failure
         self.markDelay = markDelay
         self.onMark = onMark
+        self.onSubmit = onSubmit
     }
 
     var log: [String] { lock.withLock { _log } }
@@ -118,6 +120,7 @@ final class RecordingTransport: DeviceTranscriptTransport, @unchecked Sendable {
     func submitDeviceTranscript(meetingId: String, body: Data) async throws -> Int {
         record("submit")
         lock.withLock { _bodies.append(body) }
+        onSubmit()
         if let failure { throw failure }
         return lock.withLock { statuses.count > 1 ? statuses.removeFirst() : statuses[0] }
     }
@@ -137,7 +140,8 @@ final class RecordingTransport: DeviceTranscriptTransport, @unchecked Sendable {
 /// Records every cloud-finalize call. A device meeting that stays on this Mac must leave `log` empty.
 /// `failure` makes the recording upload throw it. `transcribeStatus` is the transcribe route's answer,
 /// mapped the way `MinutiaClient.requestTranscription` maps it: 2xx returns, a 503 returns unless
-/// `strict`, anything else throws.
+/// `strict`, anything else throws. `uploadHangs` makes the upload wait until cancelled, like a stalled
+/// network; `onTranscribe` runs before the transcribe request answers.
 final class RecordingCloud: CloudFinalizeTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var _log: [String] = []
@@ -146,10 +150,15 @@ final class RecordingCloud: CloudFinalizeTransport, @unchecked Sendable {
     private var _strict: [Bool] = []
     private let failure: Error?
     private let transcribeStatus: Int
+    private let uploadHangs: Bool
+    private let onTranscribe: @Sendable () -> Void
 
-    init(failure: Error? = nil, transcribeStatus: Int = 200) {
+    init(failure: Error? = nil, transcribeStatus: Int = 200, uploadHangs: Bool = false,
+         onTranscribe: @escaping @Sendable () -> Void = {}) {
         self.failure = failure
         self.transcribeStatus = transcribeStatus
+        self.uploadHangs = uploadHangs
+        self.onTranscribe = onTranscribe
     }
 
     var log: [String] { lock.withLock { _log } }
@@ -159,6 +168,7 @@ final class RecordingCloud: CloudFinalizeTransport, @unchecked Sendable {
 
     func uploadRecording(meetingId: String, fileURL: URL) async throws -> String {
         lock.withLock { _log.append("uploadRecording"); _uploaded.append(fileURL) }
+        if uploadHangs { try await Task.sleep(nanoseconds: 3_600_000_000_000) }
         if let failure { throw failure }
         return "\(meetingId)/recording.m4a"
     }
@@ -169,6 +179,7 @@ final class RecordingCloud: CloudFinalizeTransport, @unchecked Sendable {
 
     func requestTranscription(meetingId: String, expectedSegments: Int?, deferExtraction: Bool, strict: Bool) async throws {
         lock.withLock { _log.append("requestTranscription"); _expectedSegments.append(expectedSegments); _strict.append(strict) }
+        onTranscribe()
         if (200...299).contains(transcribeStatus) || (transcribeStatus == 503 && !strict) { return }
         throw MinutiaClientError.serverError(status: transcribeStatus)
     }
@@ -262,6 +273,33 @@ enum DeviceFixtures {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
+}
+
+/// Cancels the task it holds from inside a fake's hook, even when the hook fires before `hold`.
+final class Canceller: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Void, Never>?
+    private var requested = false
+
+    func hold(_ task: Task<Void, Never>) {
+        let cancelNow: Bool = lock.withLock { self.task = task; return requested }
+        if cancelNow { task.cancel() }
+    }
+
+    func cancel() {
+        let held: Task<Void, Never>? = lock.withLock { requested = true; return task }
+        held?.cancel()
+    }
+}
+
+/// The error a recovery task finished with, and whether it finished at all.
+final class Finish: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _done = false
+    private var _error: Error?
+    var done: Bool { lock.withLock { _done } }
+    var error: Error? { lock.withLock { _error } }
+    func record(_ error: Error?) { lock.withLock { _done = true; _error = error } }
 }
 
 /// Polls `condition` until it holds or `timeout` passes.

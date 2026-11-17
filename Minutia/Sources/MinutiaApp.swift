@@ -1652,6 +1652,7 @@ final class AppController: NSObject, ObservableObject {
         case retryLater
         case keptOnThisMac
         case busy
+        case deferred
     }
 
     nonisolated static func recoveryOutcome(for error: Error?) -> RecoveryOutcome {
@@ -1699,7 +1700,7 @@ final class AppController: NSObject, ObservableObject {
         case .unreadable:
             updated.recoveryAttempts = maxRecoveryAttempts
             return SweepStep(save: updated, report: .exhausted)
-        case .busy:
+        case .busy, .deferred:
             return SweepStep(save: nil, report: nil)
         case .retryLater:
             updated.recoveryAttempts = sweep.nextAttempts
@@ -1738,7 +1739,7 @@ final class AppController: NSObject, ObservableObject {
     /// static so it stays testable and off the main actor.
     nonisolated static func recoverAll(
         client: MinutiaClient, instance: URL, connectedUserId: String?, excluding activeMeetingId: String?,
-        makeTranscriber: @escaping @Sendable (CaptureManifest) async -> LocalTranscriber? = { _ in nil },
+        makeTranscriber: @escaping @Sendable (CaptureManifest) async throws -> LocalTranscriber? = { _ in nil },
         flushNotes: @escaping @Sendable (String) async throws -> Void = { _ in }
     ) async -> (recovered: [CaptureManifest], transcriptionUnavailable: [CaptureManifest], keptOnThisMac: [CaptureManifest], exhausted: [CaptureManifest]) {
         var recovered: [CaptureManifest] = []
@@ -1783,7 +1784,7 @@ final class AppController: NSObject, ObservableObject {
                 logger.error("Recovery: unreadable recording for meeting \(manifest.meetingId, privacy: .public)")
             case .retryLater:
                 logger.error("Recovery deferred for meeting \(manifest.meetingId, privacy: .public) attempt \(sweep.nextAttempts, privacy: .public): \(String(describing: caught), privacy: .public)")
-            case .keptOnThisMac, .busy:
+            case .keptOnThisMac, .busy, .deferred:
                 break
             }
             switch step.report {

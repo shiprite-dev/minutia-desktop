@@ -200,6 +200,37 @@ final class DeviceTranscriptTests: XCTestCase {
                        "no text is lost or reordered")
     }
 
+    /// Only the 2 MB body is over, by about a thousand merges' worth, with about two thousand units of
+    /// text to spare. Each merge adds a joining space, so merging far more than needed pushes the text
+    /// past 600,000 and refuses the meeting; the merge count must stay at the minimum.
+    func test_fitted_overTheBodyLimitNearTheTextLimit_mergesNoMoreThanTheBytesRequire() throws {
+        let segments = (0..<19_980).map { i in
+            DeviceTranscript.Segment(speaker: "them", start: 10_000 + Double(i) + 0.25, end: 10_000 + Double(i) + 0.75,
+                                     text: String(repeating: "x", count: i < 18_480 ? 30 : 29), confidence: 0.91)
+        }
+        let make = { (segments: [DeviceTranscript.Segment]) in
+            DeviceTranscript(source: DeviceFixtures.source, language: "en", durationSeconds: 21_600, outcome: "speech", segments: segments)
+        }
+        let transcript = make(segments)
+        let text = transcript.segments.reduce(0) { $0 + $1.text.utf16.count }
+        let over = try transcript.encoded().count - DeviceTranscript.maxBodyBytes
+        let pair = DeviceTranscript.Segment(speaker: "them", start: segments[0].start, end: segments[1].end,
+                                            text: segments[0].text + " " + segments[1].text, confidence: 0.91)
+        let perMerge = try transcript.encoded().count - make([pair] + segments.dropFirst(2)).encoded().count
+        let minimum = (over + perMerge - 1) / perMerge
+        XCTAssertLessThanOrEqual(segments.count, DeviceTranscript.maxSegments, "precondition: the count fits")
+        XCTAssertGreaterThan(over, 0, "precondition: the body is over")
+        XCTAssertGreaterThan(DeviceTranscript.maxTotalText - text, minimum, "precondition: the minimum merges fit the text limit")
+        XCTAssertLessThan(DeviceTranscript.maxTotalText - text, 3 * minimum, "precondition: three times the merges would not")
+
+        let fitted = try XCTUnwrap(transcript.fitted(), "the minimum merges fit every limit, so the transcript is never refused")
+        let merges = segments.count - fitted.segments.count
+        XCTAssertGreaterThanOrEqual(merges, minimum)
+        XCTAssertLessThanOrEqual(merges, minimum + 2, "merges only what the bytes require")
+        XCTAssertLessThanOrEqual(try fitted.encoded().count, DeviceTranscript.maxBodyBytes)
+        XCTAssertEqual(fitted.segments.map(\.text).joined(separator: " "), segments.map(\.text).joined(separator: " "))
+    }
+
     // MARK: The server counts UTF-16 code units (Zod .max, String.length)
 
     func test_build_splitsEmojiTextByUTF16Units_keepingEveryWord() {

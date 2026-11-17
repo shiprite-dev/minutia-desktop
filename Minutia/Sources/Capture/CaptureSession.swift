@@ -47,6 +47,7 @@ final class CaptureSession: ObservableObject {
 
     /// Ceiling for the stop-time network finalize (drain + upload + finalize + transcribe request).
     static let finalizeTimeout: TimeInterval = 60
+    static let recoveryUploadTimeout: TimeInterval = 900
 
     /// If no audio frames drain for this long while recording, the tap and mic have both stalled and
     /// the recording is silently frozen; the session flips to a fatal error rather than pinning a
