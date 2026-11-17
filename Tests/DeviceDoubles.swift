@@ -121,6 +121,7 @@ final class RecordingTransport: DeviceTranscriptTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var _log: [String] = []
     private var _bodies: [Data] = []
+    private var _marks: [Double] = []
     private var statuses: [Int]
     private let failure: Error?
     private let markDelay: TimeInterval
@@ -140,11 +141,14 @@ final class RecordingTransport: DeviceTranscriptTransport, @unchecked Sendable {
 
     var log: [String] { lock.withLock { _log } }
     var bodies: [Data] { lock.withLock { _bodies } }
+    /// The `durationSeconds` of every mark, in order.
+    var marks: [Double] { lock.withLock { _marks } }
     var submits: Int { log.filter { $0 == "submit" }.count }
 
     private func record(_ entry: String) { lock.withLock { _log.append(entry) } }
 
     func markAwaitingDeviceTranscript(meetingId: String, durationSeconds: Double) async throws {
+        lock.withLock { _marks.append(durationSeconds) }
         onMark()
         if markDelay > 0 { try? await Task.sleep(nanoseconds: UInt64(markDelay * 1_000_000_000)) }
         record("mark")

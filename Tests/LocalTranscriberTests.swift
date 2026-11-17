@@ -352,4 +352,25 @@ final class LocalTranscriberTests: XCTestCase {
         XCTAssertTrue(released, "and nothing else holds it")
         XCTAssertEqual(gate.loads, 1, "cancel never starts another load")
     }
+
+    /// A job cancelled while it waits on a slow model load must not run once the load lands: a recording
+    /// that cancelled recovery would otherwise share the Neural Engine with a transcription of the mic.
+    func test_aJobCancelledWhileWaitingOnTheLoad_neverTranscribes_whenTheLoadFinishesAfterCancel() async throws {
+        let gate = LoadGate()
+        let engine = ScriptedEngine()
+        let local = LocalTranscriber(source: DeviceFixtures.source, language: "en", loadEngine: gate.loader(engine))
+        await local.startLoading()
+        local.enqueue(DeviceFixtures.segment(0, in: dir))
+        let loading = await eventually { gate.loads == 1 }
+        XCTAssertTrue(loading, "precondition: the model is loading")
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        let cancelling = Task { await local.cancel() }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        gate.open()
+        await cancelling.value
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertEqual(engine.calls, [], "the cancelled job makes no engine call")
+    }
 }

@@ -668,6 +668,19 @@ final class ModelStoreTests: XCTestCase {
         XCTAssertEqual(store.status, .ready(revision: manifest.entry(forLanguage: "ja")!.revision))
     }
 
+    /// Recovery prepares the model a rescued meeting needs without taking over the user's language: the
+    /// language prepared again after a recording is still the one the user asked for.
+    func test_aPrepareThatDoesNotRemember_preparesItsLanguage_butNeverReplacesTheUsersLanguage() async {
+        let store = await readyEnglishStore()
+
+        await store.prepare(language: "ja", remember: false)
+        XCTAssertEqual(store.routableEntry(forLanguage: "ja")?.id, "fake-ja", "the rescued meeting's language is prepared")
+
+        store.recordingDidStart()
+        await store.recordingDidStop()
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"), "the user's language is the one resumed after a recording")
+    }
+
     func test_recordingStartMidDownload_cancelsTheTransfer_andResumesFromDiskWhenItStops() async {
         let manifest = Fixture.manifest()
         let weight = url("Encoder.mlmodelc/weights/weight.bin", in: en(manifest))

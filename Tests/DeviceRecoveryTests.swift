@@ -126,12 +126,14 @@ final class DeviceRecoveryTests: XCTestCase {
 
     private func recover(_ dir: URL, _ manifest: CaptureManifest, transport: RecordingTransport, cloud: RecordingCloud,
                          local: Local, cloudTimeout: TimeInterval = CaptureSession.recoveryUploadTimeout,
+                         segmentSeconds: Double = SegmentWriter.segmentSeconds,
                          onStep: @escaping @Sendable (CaptureSession.FinishingStep) async -> Void = { _ in },
                          flushNotes: @escaping @Sendable () async throws -> Void = {}) async -> Error? {
         do {
             try await CaptureRecovery.recoverDeviceMeeting(
                 directory: dir, manifest: manifest, transport: transport, cloud: cloud,
-                makeTranscriber: local.factory, flushNotes: flushNotes, sleep: { _ in }, cloudTimeout: cloudTimeout, onStep: onStep)
+                makeTranscriber: local.factory, flushNotes: flushNotes, sleep: { _ in }, cloudTimeout: cloudTimeout,
+                segmentSeconds: segmentSeconds, onStep: onStep)
             return nil
         } catch {
             return error
@@ -741,16 +743,23 @@ final class DeviceRecoveryTests: XCTestCase {
 
     // MARK: A kill during the stop's local transcription keeps the tail pieces
 
+    /// The segment length the tail fixtures run at: 2 s for each minute of meeting, so a full segment is
+    /// 10 s of audio and the pieces of the last partial segment stay shorter than one.
+    private static let scaledSegment = SegmentWriter.segmentSeconds / 30
+
     /// What the stop leaves on disk once `SegmentWriter.finish()` kept the tail pieces: full segments
-    /// `seg-0` to `seg-(N-1)`, no `seg-N` files (finish deleted them), and the last partial segment as
-    /// `tail-N`, `tail-(N+1)`, ... pieces, each mic and system file `pieceSeconds[i]` long.
-    private func postFinishDir(deviceOnly: Bool, fullSegments: Int, fullSeconds: Int, pieceSeconds: [Int],
-                               recordingSeconds: Int, savedPieces: Set<Int> = [], keepPartialSegment: Bool = false) throws -> (URL, CaptureManifest) {
+    /// `seg-0` to `seg-(N-1)`, each `scaledSegment` long, no `seg-N` files (finish deleted them), and the
+    /// last partial segment as `tail-N`, `tail-(N+1)`, ... pieces, each mic and system file
+    /// `pieceSeconds[i]` long. `unreadablePieces` are piece indexes whose mic file is left unreadable.
+    private func postFinishDir(deviceOnly: Bool, fullSegments: Int, pieceSeconds: [Int], recordingSeconds: Int,
+                               savedPieces: Set<Int> = [], unreadablePieces: Set<Int> = [],
+                               keepPartialSegment: Bool = false) async throws -> (URL, CaptureManifest) {
         let dir = try DeviceFixtures.tempDir("device-recovery-tail")
         dirs.append(dir)
         for seq in 0..<fullSegments {
             for channel in ["me", "them"] {
-                try AudioFixtures.writeFragmentedM4A(to: dir.appendingPathComponent("seg-\(seq)-\(channel).m4a"), seconds: fullSeconds)
+                try AudioFixtures.writeFragmentedM4A(
+                    to: dir.appendingPathComponent("seg-\(seq)-\(channel).m4a"), seconds: Int(Self.scaledSegment))
             }
         }
         if keepPartialSegment {
@@ -766,19 +775,35 @@ final class DeviceRecoveryTests: XCTestCase {
             }
         }
         try AudioFixtures.writeFragmentedM4A(to: dir.appendingPathComponent(CaptureRecovery.recordingName), seconds: recordingSeconds)
+        let starts = try await pieceStarts(in: dir, fullSegments: fullSegments, count: pieceSeconds.count)
         for seq in savedPieces {
-            let start = Double(fullSegments) * SegmentWriter.segmentSeconds
-                + Double(pieceSeconds.prefix(seq - fullSegments).reduce(0, +)) + 0.5
+            let start = starts[seq - fullSegments] + 0.5
             try JSONEncoder().encode(LocalTranscriber.SegmentTranscript(
                 seq: seq, modelId: DeviceFixtures.ultra.id,
                 segments: [.init(speaker: "me", start: start, end: start + 0.4, text: "Tail \(seq).", confidence: 0.92)]))
                 .write(to: dir.appendingPathComponent(LocalTranscriber.transcriptName(seq: seq)))
+        }
+        for index in unreadablePieces {
+            try Data([0]).write(to: dir.appendingPathComponent("tail-\(fullSegments + index)-me.m4a"))
         }
         let manifest = CaptureManifest(
             meetingId: DeviceFixtures.meetingId, seriesId: nil, instanceURL: URL(string: "https://minutia.example.com")!,
             userId: "u1", createdAt: Date(timeIntervalSince1970: 0), transcriptionMode: .device, deviceOnly: deviceOnly, language: "en")
         CaptureRecovery.saveManifest(manifest, to: dir)
         return (dir, manifest)
+    }
+
+    /// Where each piece starts on the meeting clock, from the test-side duration oracle: the first where
+    /// the last full segment ended, each later one where the piece before it ended.
+    private func pieceStarts(in dir: URL, fullSegments: Int, count: Int) async throws -> [Double] {
+        var starts: [Double] = []
+        var start = Double(fullSegments) * Self.scaledSegment
+        for index in 0..<count {
+            starts.append(start)
+            let seconds = await AudioFixtures.assetDuration(dir.appendingPathComponent("tail-\(fullSegments + index)-me.m4a"))
+            start += try XCTUnwrap(seconds, "piece \(index) is readable")
+        }
+        return starts
     }
 
     /// "Item N." over five seconds for each full segment, "Tail N." from 0.5 s to 0.9 s into each piece.
@@ -794,68 +819,196 @@ final class DeviceRecoveryTests: XCTestCase {
     private func tailCalls(_ seqs: [Int]) -> [String] { seqs.flatMap { ["tail-\($0)-me.m4a", "tail-\($0)-them.m4a"] } }
 
     /// After finish() the last partial segment exists only as pieces; recovery reads them as the segments
-    /// that follow the full ones, on the meeting clock the stop gave them.
+    /// that follow the full ones, on the meeting clock the stop gave them. The pieces have unequal lengths,
+    /// so a start that assumed equal pieces would be off.
     func test_readableSegments_afterFinishKeptTheTailPieces_returnsThePiecesAfterTheFullSegments_onTheMeetingClock() async throws {
-        let (dir, _) = try postFinishDir(deviceOnly: false, fullSegments: 2, fullSeconds: 1, pieceSeconds: [1, 1], recordingSeconds: 4)
-        let segments = await CaptureRecovery.readableSegments(in: dir)
+        let (dir, _) = try await postFinishDir(deviceOnly: false, fullSegments: 2, pieceSeconds: [2, 1, 3], recordingSeconds: 26)
+        let segments = await CaptureRecovery.readableSegments(in: dir, segmentSeconds: Self.scaledSegment)
+        let starts = try await pieceStarts(in: dir, fullSegments: 2, count: 3)
 
-        XCTAssertEqual(segments.map(\.seq), [0, 1, 2, 3])
-        XCTAssertEqual(segments.map(\.micURL.lastPathComponent), ["seg-0-me.m4a", "seg-1-me.m4a", "tail-2-me.m4a", "tail-3-me.m4a"])
-        XCTAssertEqual(segments.map(\.sysURL.lastPathComponent), ["seg-0-them.m4a", "seg-1-them.m4a", "tail-2-them.m4a", "tail-3-them.m4a"])
-        guard segments.count == 4 else { return }
+        XCTAssertEqual(segments.map(\.seq), [0, 1, 2, 3, 4])
+        XCTAssertEqual(segments.map(\.micURL.lastPathComponent),
+                       ["seg-0-me.m4a", "seg-1-me.m4a", "tail-2-me.m4a", "tail-3-me.m4a", "tail-4-me.m4a"])
+        XCTAssertEqual(segments.map(\.sysURL.lastPathComponent),
+                       ["seg-0-them.m4a", "seg-1-them.m4a", "tail-2-them.m4a", "tail-3-them.m4a", "tail-4-them.m4a"])
+        XCTAssertEqual(starts[0], 20, accuracy: 0.001, "fixture: the first piece starts where the second full segment ends")
+        XCTAssertEqual(starts[1] - starts[0], 2, accuracy: 0.1, "fixture: the first piece is about 2 s")
+        XCTAssertEqual(starts[2] - starts[1], 1, accuracy: 0.1, "fixture: the second piece is about 1 s")
+        guard segments.count == 5 else { return }
         XCTAssertEqual(segments[0].offsetSeconds, 0)
-        XCTAssertEqual(segments[1].offsetSeconds, 300)
-        XCTAssertEqual(segments[2].offsetSeconds, 600, accuracy: 0.01, "the first piece starts where the last full segment ended")
-        XCTAssertEqual(segments[3].offsetSeconds, 601, accuracy: 0.1, "each piece starts after the pieces before it")
+        XCTAssertEqual(segments[1].offsetSeconds, Self.scaledSegment, "a full segment starts at seq times the segment length")
+        for (index, start) in starts.enumerated() {
+            XCTAssertEqual(segments[2 + index].offsetSeconds, start, accuracy: 0.000_001,
+                           "piece \(index) starts exactly where the pieces before it end")
+        }
+    }
+
+    /// A piece in the middle that cannot be read has an unknown length, so every piece after it has an
+    /// unknown start. Only the leading run of readable pieces is kept, on the exact clock.
+    func test_readableSegments_anUnreadableMiddlePiece_keepsOnlyTheLeadingPieces_neverShiftsTheLaterOnes() async throws {
+        let (dir, _) = try await postFinishDir(deviceOnly: false, fullSegments: 0, pieceSeconds: [2, 1, 3], recordingSeconds: 6,
+                                               unreadablePieces: [1])
+        let segments = await CaptureRecovery.readableSegments(in: dir, segmentSeconds: Self.scaledSegment)
+
+        XCTAssertEqual(segments.map(\.micURL.lastPathComponent), ["tail-0-me.m4a"],
+                       "the piece after the unreadable one is dropped, not moved up into its place")
+        XCTAssertEqual(segments.first?.offsetSeconds, 0)
+        let first = await AudioFixtures.assetDuration(dir.appendingPathComponent("tail-0-me.m4a"))
+        XCTAssertEqual(segments.first?.frames, Int64(try XCTUnwrap(first) * MixPlan.sampleRate))
     }
 
     /// A kill mid-recording leaves the partial segment's own files beside the live pieces; the segment
     /// file covers the same audio, so the pieces are ignored.
     func test_readableSegments_midRecording_prefersThePartialSegment_overTheLivePieces() async throws {
-        let (dir, _) = try postFinishDir(deviceOnly: false, fullSegments: 2, fullSeconds: 1, pieceSeconds: [1, 1], recordingSeconds: 4,
-                                         keepPartialSegment: true)
-        let segments = await CaptureRecovery.readableSegments(in: dir)
+        let (dir, _) = try await postFinishDir(deviceOnly: false, fullSegments: 2, pieceSeconds: [2, 1, 3], recordingSeconds: 26,
+                                               keepPartialSegment: true)
+        let segments = await CaptureRecovery.readableSegments(in: dir, segmentSeconds: Self.scaledSegment)
         XCTAssertEqual(segments.map(\.micURL.lastPathComponent), ["seg-0-me.m4a", "seg-1-me.m4a", "seg-2-me.m4a"])
+        XCTAssertEqual(segments.map(\.offsetSeconds), [0, Self.scaledSegment, 2 * Self.scaledSegment])
     }
 
     /// A kill while the stop transcribed on this Mac: the tail pieces count toward coverage, the missing
     /// ones are transcribed and the saved ones reused, so the submitted transcript reaches the end of the
-    /// meeting. In On this Mac only a 13-minute meeting whose last 3 minutes are pieces (scaled to 1 s a
-    /// minute) is recovered, not kept forever.
+    /// meeting. The meeting is marked and sent with the recording's own duration. In On this Mac only a
+    /// 13-minute meeting whose last 3 minutes are pieces is recovered, not kept forever.
     func test_recovery_afterAKillDuringTheStopsTranscription_includesTheTailPieces_andSubmitsTheWholeMeeting() async throws {
-        let rows: [(label: String, deviceOnly: Bool, full: Int, fullSeconds: Int, pieces: [Int], recording: Int, saved: Set<Int>,
-                    engine: [String], texts: [String])] = [
-            ("Automatic, no piece saved", false, 2, 1, [1, 1], 4, [],
-             calls([0, 1]) + tailCalls([2, 3]), ["Item 0.", "Item 1.", "Tail 2.", "Tail 3."]),
-            ("Automatic, the first piece saved", false, 2, 1, [1, 1], 4, [2],
-             calls([0, 1]) + tailCalls([3]), ["Item 0.", "Item 1.", "Tail 2.", "Tail 3."]),
-            ("On this Mac only, 13 minutes with a 3-minute tail", true, 2, 5, [1, 1, 1], 13, [],
-             calls([0, 1]) + tailCalls([2, 3, 4]), ["Item 0.", "Item 1.", "Tail 2.", "Tail 3.", "Tail 4."]),
+        let rows: [(label: String, deviceOnly: Bool, saved: Set<Int>, engine: [String])] = [
+            ("Automatic, no piece saved", false, [], calls([0, 1]) + tailCalls([2, 3, 4])),
+            ("Automatic, the first piece saved", false, [2], calls([0, 1]) + tailCalls([3, 4])),
+            ("On this Mac only, 13 minutes with a 3-minute tail", true, [], calls([0, 1]) + tailCalls([2, 3, 4])),
         ]
         for row in rows {
-            let (dir, manifest) = try postFinishDir(deviceOnly: row.deviceOnly, fullSegments: row.full, fullSeconds: row.fullSeconds,
-                                                    pieceSeconds: row.pieces, recordingSeconds: row.recording, savedPieces: row.saved)
+            let (dir, manifest) = try await postFinishDir(deviceOnly: row.deviceOnly, fullSegments: 2, pieceSeconds: [2, 1, 3],
+                                                          recordingSeconds: 26, savedPieces: row.saved)
+            let recordingDuration = await AudioFixtures.assetDuration(dir.appendingPathComponent(CaptureRecovery.recordingName))
+            let recording = try XCTUnwrap(recordingDuration)
+            let starts = try await pieceStarts(in: dir, fullSegments: 2, count: 3)
             let transport = RecordingTransport()
             let cloud = RecordingCloud()
-            let local = Local(.ready, engine: tailEngine(fullSegments: row.full, pieces: row.pieces.count))
-            let error = await recover(dir, manifest, transport: transport, cloud: cloud, local: local)
+            let local = Local(.ready, engine: tailEngine(fullSegments: 2, pieces: 3))
+            let error = await recover(dir, manifest, transport: transport, cloud: cloud, local: local, segmentSeconds: Self.scaledSegment)
             let decision = sweep(manifest, error)
 
             XCTAssertNil(error, "\(row.label): got \(String(describing: error))")
             XCTAssertEqual(local.engine.calls, row.engine, "\(row.label): engine calls")
             XCTAssertEqual(transport.log.filter { $0 == "mark" || $0 == "submit" }, ["mark", "submit"], row.label)
-            XCTAssertEqual(try texts(transport.bodies.first), row.texts, "\(row.label): the transcript reaches the end of the meeting")
+            XCTAssertEqual(transport.marks.count, 1, row.label)
+            for mark in transport.marks {
+                XCTAssertEqual(mark, recording, accuracy: 0.000_001, "\(row.label): the meeting is marked with the recording's duration")
+            }
+            XCTAssertEqual(try texts(transport.bodies.first), ["Item 0.", "Item 1.", "Tail 2.", "Tail 3.", "Tail 4."],
+                           "\(row.label): the transcript reaches the end of the meeting")
             if let body = transport.bodies.first {
-                let starts = try JSONDecoder().decode(DeviceTranscript.self, from: body).segments
-                    .filter { $0.text.hasPrefix("Tail") }.map(\.start)
-                let expected = row.pieces.indices.map { Double(row.full) * 300 + Double(row.pieces.prefix($0).reduce(0, +)) + 0.5 }
-                XCTAssertEqual(starts.count, expected.count, row.label)
-                for (got, want) in zip(starts, expected) { XCTAssertEqual(got, want, accuracy: 0.1, "\(row.label): piece on the meeting clock") }
+                let sent = try JSONDecoder().decode(DeviceTranscript.self, from: body)
+                XCTAssertEqual(sent.durationSeconds, recording, accuracy: 0.01, "\(row.label): the transcript carries the recording's duration")
+                let tails = sent.segments.filter { $0.text.hasPrefix("Tail") }.map(\.start)
+                XCTAssertEqual(tails.count, starts.count, row.label)
+                for (got, start) in zip(tails, starts) {
+                    XCTAssertEqual(got, start + 0.5, accuracy: 0.006, "\(row.label): piece exactly on the meeting clock")
+                }
             }
             XCTAssertEqual(cloud.log, [], "\(row.label): no audio leaves the Mac")
             XCTAssertFalse(exists(dir), "\(row.label): the server 2xx deletes the directory")
             XCTAssertEqual(decision.report, .recovered, row.label)
         }
+    }
+
+    /// With the middle piece unreadable only the first piece counts, so the segment audio no longer covers
+    /// the recording: Automatic finishes in the cloud from the recording, On this Mac only keeps the audio.
+    /// Neither sends a transcript with the last piece moved into the gap.
+    func test_recovery_anUnreadableMiddlePiece_letsTheCoverageCheckDecide_neverSubmitsShiftedText() async throws {
+        for deviceOnly in [false, true] {
+            let label = deviceOnly ? "On this Mac only" : "Automatic"
+            let (dir, manifest) = try await postFinishDir(deviceOnly: deviceOnly, fullSegments: 2, pieceSeconds: [2, 1, 3],
+                                                          recordingSeconds: 26, unreadablePieces: [1])
+            let transport = RecordingTransport()
+            let cloud = RecordingCloud()
+            let local = Local(.ready, engine: tailEngine(fullSegments: 2, pieces: 3))
+            let error = await recover(dir, manifest, transport: transport, cloud: cloud, local: local, segmentSeconds: Self.scaledSegment)
+            let decision = sweep(manifest, error)
+
+            XCTAssertEqual(transport.submits, 0, "\(label): no transcript is sent; got \(String(describing: error))")
+            XCTAssertEqual(local.engine.calls, [], "\(label): nothing is transcribed for a meeting the segments do not cover")
+            if deviceOnly {
+                XCTAssertEqual(error as? CaptureRecovery.RecoveryError, .audioStaysOnThisMac, "got \(String(describing: error))")
+                XCTAssertEqual(cloud.log, [], "no audio egress under On this Mac only")
+                XCTAssertTrue(exists(dir))
+                XCTAssertEqual(decision.report, .keptOnThisMac)
+            } else {
+                XCTAssertNil(error, "got \(String(describing: error))")
+                XCTAssertEqual(cloud.log, Self.cloudFinalize)
+                XCTAssertFalse(exists(dir))
+                XCTAssertEqual(decision.report, .recovered)
+            }
+        }
+    }
+
+    // MARK: A stuck engine never holds recovery
+
+    func test_engineStopTimeout_isTenSeconds() {
+        XCTAssertEqual(CaptureSession.engineStopTimeout, 10)
+    }
+
+    /// Runs a device stop of one segment on `engine` in a task, waits until the engine is transcribing,
+    /// cancels the task and returns what it finished with, the seconds from cancel to return and the
+    /// engine calls still running at the return. nil when it did not return within `wait`.
+    private func cancelMidTranscription(engine: StubbornEngine, engineStopTimeout: TimeInterval,
+                                        wait: TimeInterval) async throws -> (error: Error?, seconds: TimeInterval, inFlight: Int)? {
+        let dir = try DeviceFixtures.tempDir("device-recovery-stuck")
+        dirs.append(dir)
+        let local = LocalTranscriber(source: DeviceFixtures.source, language: "en", loadEngine: LoadGate(open: true).loader(engine))
+        await local.startLoading()
+        let finish = Finish()
+        let inFlightAtReturn = InFlightBox()
+        let task = Task {
+            do {
+                _ = try await CaptureSession.finishOnDevice(
+                    meetingId: DeviceFixtures.meetingId, directory: dir, tail: [DeviceFixtures.segment(0, in: dir)],
+                    durationSeconds: 600, transcriber: local, transport: RecordingTransport(), recapOpened: true,
+                    engineStopTimeout: engineStopTimeout, sleep: { _ in })
+                inFlightAtReturn.set(engine.inFlight)
+                finish.record(nil)
+            } catch {
+                inFlightAtReturn.set(engine.inFlight)
+                finish.record(error)
+            }
+        }
+        let running = await eventually(timeout: 5) { engine.inFlight == 1 }
+        XCTAssertTrue(running, "precondition: the engine is transcribing")
+        let cancelledAt = Date()
+        task.cancel()
+        let finished = await eventually(timeout: wait) { finish.done }
+        guard finished else { return nil }
+        return (finish.error, Date().timeIntervalSince(cancelledAt), inFlightAtReturn.value)
+    }
+
+    private final class InFlightBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _value = -1
+        var value: Int { lock.withLock { _value } }
+        func set(_ value: Int) { lock.withLock { _value = value } }
+    }
+
+    /// A Core ML call that never returns must not hold recovery (and with it Retry and the next recording)
+    /// for the rest of the session: past the bound the cancelled stop stops waiting for the engine and
+    /// still throws the cancellation, which is never counted.
+    func test_aCancelledStop_whoseEngineNeverReturns_rethrowsCancellationWithinTheBound() async throws {
+        let result = try await cancelMidTranscription(engine: StubbornEngine(milliseconds: 3_600_000), engineStopTimeout: 0.3, wait: 3)
+
+        let returned = try XCTUnwrap(result, "a cancelled stop returns within the bound instead of waiting on the engine forever")
+        XCTAssertTrue(returned.error is CancellationError, "got \(String(describing: returned.error))")
+        XCTAssertLessThan(returned.seconds, 2, "it gives up at the 0.3 s bound")
+        XCTAssertEqual(AppController.recoveryOutcome(for: returned.error), .deferred)
+    }
+
+    /// Within the bound the cancelled stop still waits for the engine to return, so a recording that starts
+    /// next never shares the Neural Engine with it.
+    func test_aCancelledStop_whoseEngineReturnsWithinTheBound_waitsForIt() async throws {
+        let result = try await cancelMidTranscription(engine: StubbornEngine(milliseconds: 500), engineStopTimeout: 5, wait: 5)
+
+        let returned = try XCTUnwrap(result, "a cancelled stop returns once the engine has")
+        XCTAssertTrue(returned.error is CancellationError, "got \(String(describing: returned.error))")
+        XCTAssertEqual(returned.inFlight, 0, "it returns only after the engine call has returned")
     }
 
     // MARK: Segments are judged in meeting order
@@ -923,7 +1076,7 @@ final class DeviceRecoveryTests: XCTestCase {
             ("an Intel Mac, even with a healthy entry", .blocked(.intelMac), true, true, .unusable),
             ("an unsupported macOS", .blocked(.unsupportedOS), true, false, .unusable),
             ("an unsupported macOS, even with a healthy entry", .blocked(.unsupportedOS), true, true, .unusable),
-            ("no entry for the language, per the store", .blocked(.noEntryForLanguage), true, false, .unusable),
+            ("no entry for the language per the store, while the manifest has one", .blocked(.noEntryForLanguage), true, false, .deferred),
             ("no manifest entry, while ready", .ready(revision: "r1"), false, false, .unusable),
             ("no manifest entry, while downloading", .downloading(received: 1, total: 2), false, false, .unusable),
             ("no manifest entry, while idle", .idle, false, false, .unusable),

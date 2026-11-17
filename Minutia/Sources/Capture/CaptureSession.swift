@@ -362,7 +362,8 @@ final class CaptureSession: ObservableObject {
         meetingId: String, directory: URL, tail: [SegmentWriter.ClosedSegment], durationSeconds: Double,
         transcriber: LocalTranscriber, transport: any DeviceTranscriptTransport, recapOpened: Bool,
         deviceOnly: Bool = true, cloud: (any CloudFinalizeTransport)? = nil,
-        transcribeTimeout: TimeInterval? = nil, cloudTimeout: TimeInterval = finalizeTimeout,
+        transcribeTimeout: TimeInterval? = nil, engineStopTimeout: TimeInterval = CaptureSession.engineStopTimeout,
+        cloudTimeout: TimeInterval = finalizeTimeout,
         sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
         flushNotes: @escaping @Sendable () async throws -> Void = {},
         saved: [DeviceTranscript.Segment] = [],
@@ -496,6 +497,9 @@ final class CaptureSession: ObservableObject {
                                          finalizeTimeout: TimeInterval = CaptureSession.finalizeTimeout) -> TimeInterval {
         (audioMayLeaveMac ? 0 : localTranscriptionTimeout(durationSeconds: elapsedSeconds)) + finalizeTimeout + 5
     }
+
+    /// How long a cancelled stop waits for the engine to stand down before giving up on it.
+    nonisolated static let engineStopTimeout: TimeInterval = 10
 
     /// Ceiling on local transcription at stop; past it the stop fails with a retryable error.
     nonisolated static func localTranscriptionTimeout(durationSeconds: Double) -> TimeInterval {

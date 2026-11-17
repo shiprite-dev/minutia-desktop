@@ -108,7 +108,7 @@ final class ModelStore: ObservableObject {
     /// Makes the entry for `language` healthy and warm: gates, downloads missing files, verifies,
     /// warms up, records health, then prunes superseded revisions. Safe to call on every launch,
     /// after sign-in and whenever the meeting language changes.
-    func prepare(language: String) async {
+    func prepare(language: String, remember: Bool = true) async {
         lastLanguage = language
         if let current = running {
             await current.task.value

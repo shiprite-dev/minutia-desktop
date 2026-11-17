@@ -139,6 +139,7 @@ enum CaptureRecovery {
         flushNotes: @escaping @Sendable () async throws -> Void = {},
         sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
         cloudTimeout: TimeInterval = CaptureSession.recoveryUploadTimeout,
+        segmentSeconds: Double = SegmentWriter.segmentSeconds,
         onStep: @escaping @Sendable (CaptureSession.FinishingStep) async -> Void = { _ in }
     ) async throws {
         let finished = try? Data(contentsOf: directory.appendingPathComponent(transcriptName))
@@ -230,7 +231,7 @@ enum CaptureRecovery {
     }
 
     /// Segment pairs whose mic AND system files are both readable, sorted by seq ascending.
-    static func readableSegments(in directory: URL) async -> [SegmentWriter.ClosedSegment] {
+    static func readableSegments(in directory: URL, segmentSeconds: Double = SegmentWriter.segmentSeconds) async -> [SegmentWriter.ClosedSegment] {
         let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
         var segments: [SegmentWriter.ClosedSegment] = []
         for segment in names.compactMap({ recoveredSegment(in: directory, name: $0) }).sorted(by: { $0.seq < $1.seq }) {

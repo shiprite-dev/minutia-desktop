@@ -1705,6 +1705,11 @@ final class AppController: NSObject, ObservableObject {
         case deferred
     }
 
+    nonisolated static func shouldRunRecovery(on status: ModelStatus) -> Bool {
+        if case .ready = status { return true }
+        return false
+    }
+
     nonisolated static func recoveryOutcome(for error: Error?) -> RecoveryOutcome {
         guard let error else { return .recovered }
         if case MinutiaClientError.featureUnavailable = error { return .transcriptionUnavailable }
