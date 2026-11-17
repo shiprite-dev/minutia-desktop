@@ -40,4 +40,21 @@ enum QualityGuard {
         let consecutive = zip(fails, fails.dropFirst()).contains { $0 && $1 }
         return !consecutive && Double(fails.filter { $0 }.count) / Double(fails.count) < maxFailingShare
     }
+
+    /// The stop-time judgment of a device meeting: one judged window per segment transcription.
+    enum Verdict: Equatable, Sendable { case pass, fail, unjudged }
+
+    /// When the first this-many judged windows all fail, the rest of the meeting is not transcribed locally.
+    static let earlyAbortWindows = 4
+
+    /// A segment's verdict from both channels' speech, or nil when the engine threw on it. A throw fails;
+    /// at least `minSpeechSeconds` of speech whose duration-weighted mean confidence is under `floor`
+    /// fails; less speech than that (silence included) is unjudged.
+    static func verdict(_ speech: [SpeechSegment]?, floor: Double) -> Verdict { .pass }
+
+    /// The same share and consecutive rules as `passes(_:floor:)`, over judged segment verdicts.
+    static func passes(_ verdicts: [Verdict]) -> Bool { true }
+
+    /// True once the first `earlyAbortWindows` judged verdicts are all failures.
+    static func abortsEarly(_ verdicts: [Verdict]) -> Bool { false }
 }

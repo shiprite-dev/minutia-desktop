@@ -129,6 +129,44 @@ final class RecordingTransport: DeviceTranscriptTransport, @unchecked Sendable {
     }
 }
 
+/// Records every cloud-finalize call. A device meeting that stays on this Mac must leave `log` empty.
+/// `failure` makes the recording upload throw it.
+final class RecordingCloud: CloudFinalizeTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _log: [String] = []
+    private var _uploaded: [URL] = []
+    private var _expectedSegments: [Int?] = []
+    private let failure: Error?
+
+    init(failure: Error? = nil) { self.failure = failure }
+
+    var log: [String] { lock.withLock { _log } }
+    var uploaded: [URL] { lock.withLock { _uploaded } }
+    var expectedSegments: [Int?] { lock.withLock { _expectedSegments } }
+
+    func uploadRecording(meetingId: String, fileURL: URL) async throws -> String {
+        lock.withLock { _log.append("uploadRecording"); _uploaded.append(fileURL) }
+        if let failure { throw failure }
+        return "\(meetingId)/recording.m4a"
+    }
+
+    func finalizeMeeting(meetingId: String, audioPath: String, duration: Double, sizeBytes: Int64) async throws {
+        lock.withLock { _log.append("finalizeMeeting") }
+    }
+
+    func requestTranscription(meetingId: String, expectedSegments: Int?, deferExtraction: Bool) async throws {
+        lock.withLock { _log.append("requestTranscription"); _expectedSegments.append(expectedSegments) }
+    }
+}
+
+/// Collects the local-failure notifications a device stop posts.
+final class FailureLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _failures: [LocalTranscriber.Failure] = []
+    var failures: [LocalTranscriber.Failure] { lock.withLock { _failures } }
+    func record(_ failure: LocalTranscriber.Failure) { lock.withLock { _failures.append(failure) } }
+}
+
 /// Collects `FinishingStep`s reported from any task.
 final class StepLog: @unchecked Sendable {
     private let lock = NSLock()
@@ -169,6 +207,21 @@ enum DeviceFixtures {
         "seg-1-me.m4a": [speech(5, 6.5, "Yes, I will follow up.", 0.95)],
     ]
     static let fixtureDuration = 312.75
+
+    /// A meeting of `count` five-minute segments where segment N says "Item N." for five seconds on the
+    /// mic channel. `failing` segments make the engine throw; `lowConfidence` ones decode under the
+    /// parakeet-ultra guard floor.
+    static func meetingEngine(_ count: Int, failing: Set<Int> = [], lowConfidence: Set<Int> = []) -> ScriptedEngine {
+        ScriptedEngine(
+            Dictionary(uniqueKeysWithValues: (0..<count).map { n in
+                ("seg-\(n)-me.m4a", [speech(0, 5, "Item \(n).", lowConfidence.contains(n) ? 0.5 : 0.92)])
+            }),
+            failing: Set(failing.map { "seg-\($0)-me.m4a" }))
+    }
+
+    static func items(_ count: Int, except dropped: Set<Int> = []) -> [String] {
+        (0..<count).filter { !dropped.contains($0) }.map { "Item \($0)." }
+    }
 
     /// Bundled as a test resource: the test host must not read the source tree, which can live on
     /// an external volume it cannot open.

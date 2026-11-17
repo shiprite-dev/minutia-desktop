@@ -938,6 +938,77 @@ final class ModelStoreTests: XCTestCase {
         XCTAssertNotEqual(store.status, .ready(revision: "en-rev-1"))
         XCTAssertNil(store.routableEntry(forLanguage: "en"))
     }
+
+    // MARK: Local transcription failures
+
+    func test_twoLocalFailuresInARow_reverifyTheModelOnce_redownloadingACorruptFile() async throws {
+        XCTAssertEqual(ModelStore.failuresBeforeReverify, 2)
+        let manifest = Fixture.manifest()
+        let transfer = FakeTransfer(manifest: manifest)
+        let warmer = FakeWarmer()
+        let store = makeStore(manifest: manifest, transfer: transfer, warmer: warmer)
+        await store.prepare(language: "en")
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"), "precondition: English entry ready")
+        let installRequests = transfer.requests.count
+        try Data(repeating: 0xAB, count: 64).write(
+            to: store.directory(for: en(manifest)).appendingPathComponent("Encoder.mlmodelc/weights/weight.bin"))
+
+        await store.recordLocalTranscription(succeeded: false, language: "en")
+        XCTAssertEqual(transfer.requests.count, installRequests, "one failure does not re-verify")
+        XCTAssertEqual(warmer.calls, ["fake-en"])
+        XCTAssertTrue(store.healthyRevisions.contains("en-rev-1"), "one failure keeps the model routable")
+
+        await store.recordLocalTranscription(succeeded: false, language: "en")
+        XCTAssertEqual(transfer.requests.dropFirst(installRequests).map(\.url), [url("Encoder.mlmodelc/weights/weight.bin", in: en(manifest))],
+                       "the second failure in a row re-verifies every file and re-downloads the corrupt one")
+        XCTAssertEqual(warmer.calls, ["fake-en", "fake-en"], "the re-verified model is warmed again")
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"))
+
+        await store.recordLocalTranscription(succeeded: false, language: "en")
+        XCTAssertEqual(warmer.calls.count, 2, "the re-verify resets the count, so the next failure alone does not repeat it")
+    }
+
+    func test_twoLocalFailuresInARow_markTheModelUnhealthy_whenItCannotBeRevived() async {
+        _ = await readyEnglishStore()
+        let broken = makeStore(warmer: FakeWarmer(fails: true))
+        XCTAssertNotNil(broken.routableEntry(forLanguage: "en"), "precondition: healthy across relaunch")
+
+        await broken.recordLocalTranscription(succeeded: false, language: "en")
+        await broken.recordLocalTranscription(succeeded: false, language: "en")
+
+        XCTAssertFalse(broken.healthyRevisions.contains("en-rev-1"))
+        XCTAssertNil(broken.routableEntry(forLanguage: "en"), "the next meeting is not routed to a model that keeps failing")
+        XCTAssertNil(makeStore().routableEntry(forLanguage: "en"), "unhealthy survives relaunch")
+    }
+
+    func test_aLocalSuccessBetweenFailures_resetsTheCount() async {
+        let manifest = Fixture.manifest()
+        let transfer = FakeTransfer(manifest: manifest)
+        let warmer = FakeWarmer()
+        let store = makeStore(manifest: manifest, transfer: transfer, warmer: warmer)
+        await store.prepare(language: "en")
+        let installRequests = transfer.requests.count
+
+        await store.recordLocalTranscription(succeeded: false, language: "en")
+        await store.recordLocalTranscription(succeeded: true, language: "en")
+        await store.recordLocalTranscription(succeeded: false, language: "en")
+
+        XCTAssertEqual(transfer.requests.count, installRequests)
+        XCTAssertEqual(warmer.calls, ["fake-en"], "no re-verify")
+        XCTAssertTrue(store.healthyRevisions.contains("en-rev-1"))
+    }
+
+    func test_localFailuresInARow_countAcrossMeetingsAndRelaunches() async {
+        let first = await readyEnglishStore()
+        await first.recordLocalTranscription(succeeded: false, language: "en")
+
+        let warmer = FakeWarmer()
+        let relaunched = makeStore(warmer: warmer)
+        await relaunched.recordLocalTranscription(succeeded: false, language: "en")
+
+        XCTAssertEqual(warmer.calls, ["fake-en"], "the failure before the relaunch counts toward the re-verify")
+        XCTAssertEqual(relaunched.status, .ready(revision: "en-rev-1"))
+    }
 }
 
 private final class LockedFlags: @unchecked Sendable {

@@ -38,6 +38,8 @@ final class CaptureSession: ObservableObject {
     struct StopResult {
         let expectedSegments: Int?
         let transcriptRequested: Bool
+        /// Set when a device meeting's local transcription failed and the stop finished in the cloud instead.
+        var localFailure: LocalTranscriber.Failure? = nil
     }
 
     enum CaptureError: Error { case notRunning, stalled, recordingUnfinished, alreadyRunning, invalidMeetingId, transcriptionBlocked(TranscriptionReason),
@@ -347,10 +349,12 @@ final class CaptureSession: ObservableObject {
     nonisolated static func finishOnDevice(
         meetingId: String, directory: URL, tail: [SegmentWriter.ClosedSegment], durationSeconds: Double,
         transcriber: LocalTranscriber, transport: any DeviceTranscriptTransport, recapOpened: Bool,
+        deviceOnly: Bool = true, cloud: (any CloudFinalizeTransport)? = nil,
         transcribeTimeout: TimeInterval? = nil,
         sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
         flushNotes: @escaping @Sendable () async throws -> Void = {},
-        onStep: @escaping @Sendable (FinishingStep) async -> Void = { _ in }
+        onStep: @escaping @Sendable (FinishingStep) async -> Void = { _ in },
+        notifyLocalFailure: @escaping @Sendable (LocalTranscriber.Failure) async -> Void = { _ in }
     ) async throws -> StopResult {
         guard durationSeconds > 0 else { throw CaptureError.nothingRecorded }
         async let notesFlushed: Void = { try? await flushNotes() }()
@@ -524,6 +528,15 @@ final class CaptureSession: ObservableObject {
         return "Recording stopped: \(error.localizedDescription)"
     }
 }
+
+/// The Automatic-mode fallback's network surface: the cloud finalize over the full recording on disk.
+protocol CloudFinalizeTransport {
+    func uploadRecording(meetingId: String, fileURL: URL) async throws -> String
+    func finalizeMeeting(meetingId: String, audioPath: String, duration: Double, sizeBytes: Int64) async throws
+    func requestTranscription(meetingId: String, expectedSegments: Int?, deferExtraction: Bool) async throws
+}
+
+extension MinutiaClient: CloudFinalizeTransport {}
 
 /// Owns the audio hot path off the main actor: ring buffers, the tap and mic, the segment writer,
 /// and the 250ms mix/write tick. Reports the tick's peak level and any freshly closed segments

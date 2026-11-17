@@ -216,4 +216,89 @@ final class LocalTranscriberTests: XCTestCase {
             XCTFail("a load failure must surface")
         } catch {}
     }
+
+    // MARK: Segment failures, the stop guard, and the load bound
+
+    private func guarded(_ engine: ScriptedEngine, gate: LoadGate = LoadGate(open: true), loadFailure: Error? = nil,
+                         loadTimeout: TimeInterval = LocalTranscriber.loadTimeoutSeconds) -> LocalTranscriber {
+        LocalTranscriber(source: DeviceFixtures.source, language: "en", guardFloor: DeviceFixtures.ultra.guardFloor,
+                         loadTimeout: loadTimeout, loadEngine: gate.loader(engine, failure: loadFailure))
+    }
+
+    /// Enqueues segments 0 to count-2 as if recorded, and finishes with the last as the tail.
+    private func finishMeeting(_ local: LocalTranscriber, segments count: Int) async throws -> DeviceTranscript {
+        await local.startLoading()
+        for seq in 0..<(count - 1) { local.enqueue(DeviceFixtures.segment(seq, in: dir)) }
+        return try await local.finish(tail: [DeviceFixtures.segment(count - 1, in: dir)], durationSeconds: Double(count) * 300)
+    }
+
+    private func failure(of work: @escaping @Sendable () async throws -> DeviceTranscript,
+                         within seconds: TimeInterval = 5) async -> Error? {
+        let outcome = OutcomeBox()
+        Task {
+            do { _ = try await work(); outcome.set(nil) } catch { outcome.set(error) }
+        }
+        let settled = await eventually(timeout: seconds) { outcome.settled }
+        XCTAssertTrue(settled, "finish must settle within \(seconds)s")
+        return outcome.error
+    }
+
+    func test_oneFailedSegment_isDroppedFromTheTranscript_andTheRestStillTranscribe() async throws {
+        let local = guarded(DeviceFixtures.meetingEngine(8, failing: [3]))
+        let transcript = try await finishMeeting(local, segments: 8)
+        XCTAssertEqual(transcript.segments.map(\.text), DeviceFixtures.items(8, except: [3]))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("seg-3.transcript.json").path),
+                       "a failed segment leaves no partial transcript beside its audio")
+    }
+
+    func test_aMeetingThatTripsTheStopGuard_failsFinishAsQualityGuard() async {
+        let rows: [(String, ScriptedEngine, Int)] = [
+            ("two failed segments in a row", DeviceFixtures.meetingEngine(10, failing: [4, 5]), 10),
+            ("a quarter of the segments under the floor", DeviceFixtures.meetingEngine(4, lowConfidence: [2]), 4),
+        ]
+        for (label, engine, count) in rows {
+            let local = guarded(engine)
+            let error = await failure { try await self.finishMeeting(local, segments: count) }
+            XCTAssertEqual(error as? LocalTranscriber.Failure, .qualityGuard, "\(label): got \(String(describing: error))")
+        }
+    }
+
+    func test_theFirstFourSegmentsAllFailing_skipsLocalTranscriptionOfTheRest() async {
+        let engine = DeviceFixtures.meetingEngine(7, failing: [0, 1, 2, 3, 4, 5, 6])
+        let local = guarded(engine)
+        let error = await failure { try await self.finishMeeting(local, segments: 7) }
+        XCTAssertEqual(error as? LocalTranscriber.Failure, .qualityGuard, "got \(String(describing: error))")
+        XCTAssertEqual(engine.calls.filter { ["seg-4", "seg-5", "seg-6"].contains(String($0.prefix(5))) }, [],
+                       "segments after the early abort never reach the engine; got \(engine.calls)")
+    }
+
+    func test_aModelLoadError_failsFinishAsModelLoad_withoutRetryingTheLoadPerSegment() async {
+        let gate = LoadGate(open: true)
+        let local = guarded(DeviceFixtures.meetingEngine(3), gate: gate, loadFailure: CocoaError(.fileReadCorruptFile))
+        let error = await failure { try await self.finishMeeting(local, segments: 3) }
+        XCTAssertEqual(error as? LocalTranscriber.Failure, .modelLoad, "got \(String(describing: error))")
+        XCTAssertEqual(gate.loads, 1)
+    }
+
+    func test_theModelLoadTimeout_isTwoMinutes() {
+        XCTAssertEqual(LocalTranscriber.loadTimeoutSeconds, 120)
+    }
+
+    func test_aModelLoadPastItsTimeout_failsFinishAsTimedOut_withoutWaitingForTheLoad() async {
+        let gate = LoadGate()
+        let local = guarded(DeviceFixtures.meetingEngine(2), gate: gate, loadTimeout: 0.3)
+        let error = await failure { try await self.finishMeeting(local, segments: 2) }
+        gate.open()
+        XCTAssertEqual(error as? LocalTranscriber.Failure, .modelLoadTimedOut, "got \(String(describing: error))")
+    }
+
+    func test_aSlowModelLoadUnderItsTimeout_isNotAFailure() async throws {
+        let gate = LoadGate()
+        let local = guarded(DeviceFixtures.meetingEngine(2), gate: gate, loadTimeout: 5)
+        let finishing = Task { try await self.finishMeeting(local, segments: 2) }
+        try await Task.sleep(nanoseconds: 500_000_000)
+        gate.open()
+        let transcript = try await finishing.value
+        XCTAssertEqual(transcript.segments.map(\.text), DeviceFixtures.items(2))
+    }
 }

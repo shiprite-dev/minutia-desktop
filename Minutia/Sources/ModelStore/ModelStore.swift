@@ -132,6 +132,14 @@ final class ModelStore: ObservableObject {
 
     var healthyRevisions: Set<String> { Set(manifest.entries.filter(isHealthy).map(\.revision)) }
 
+    /// Consecutive failed local transcriptions, across meetings and relaunches, that mark the model unhealthy.
+    static let failuresBeforeReverify = 2
+
+    /// Records how a meeting's local transcription ended for `language`'s entry. The
+    /// `failuresBeforeReverify`th failure in a row clears its health and warm markers and re-runs
+    /// `prepare` (sha256 re-verify, re-download of bad files, warm-up) once; a success resets the count.
+    func recordLocalTranscription(succeeded: Bool, language: String) async {}
+
     func recordingDidStart() {
         recording = true
         running?.task.cancel()

@@ -8,6 +8,15 @@ actor LocalTranscriber {
     static let idleUnloadSeconds: TimeInterval = 60
     /// FluidAudio's `ASRConstants.minimumAudioDurationSeconds`: shorter audio throws `invalidAudioData`.
     static let minimumSegmentSeconds: Double = 0.3
+    /// A model load running longer than this fails the meeting's local transcription.
+    static let loadTimeoutSeconds: TimeInterval = 120
+
+    /// Why a meeting's local transcription failed as a whole.
+    enum Failure: Error, Equatable {
+        case modelLoad
+        case modelLoadTimedOut
+        case qualityGuard
+    }
 
     /// Contents of `seg-N.transcript.json`: both channels, labeled and on the meeting clock.
     struct SegmentTranscript: Codable, Equatable {
@@ -22,13 +31,18 @@ actor LocalTranscriber {
     private let language: String
     private let unloadAfter: TimeInterval
     private let loadEngine: @Sendable () async throws -> any SpeechEngine
+    private let guardFloor: Double
+    private let loadTimeout: TimeInterval
 
     init(source: DeviceTranscript.Source, language: String,
          idleUnloadSeconds: TimeInterval = LocalTranscriber.idleUnloadSeconds,
+         guardFloor: Double = 0, loadTimeout: TimeInterval = LocalTranscriber.loadTimeoutSeconds,
          loadEngine: @escaping @Sendable () async throws -> any SpeechEngine) {
         self.source = source
         self.language = language
         unloadAfter = idleUnloadSeconds
+        self.guardFloor = guardFloor
+        self.loadTimeout = loadTimeout
         self.loadEngine = loadEngine
     }
 
