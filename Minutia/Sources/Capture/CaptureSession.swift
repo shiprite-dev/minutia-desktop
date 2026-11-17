@@ -307,14 +307,37 @@ final class CaptureSession: ObservableObject {
         case preparingModel
         case transcribing(completed: Int, total: Int)
         case submitting
+        case startingOnDevice
+        case uploadingRecording
 
         var label: String {
             switch self {
             case .preparingModel: "Preparing the speech model"
             case .transcribing(let completed, let total): "Transcribing on this Mac, \(completed) of \(total)"
             case .submitting: "Sending the transcript"
+            case .startingOnDevice, .uploadingRecording: ""
             }
         }
+    }
+
+    nonisolated static func finishingLabel(step: FinishingStep?, audioMayLeaveMac: Bool) -> String {
+        step?.label ?? "Uploading and requesting transcript"
+    }
+
+    func beginFinishing(audioMayLeaveMac: Bool) {}
+
+    nonisolated static let notesFlushTimeout: TimeInterval = 10
+
+    nonisolated static func finishFastLane(
+        audioMayLeaveMac: Bool, meetingId: String, recording: URL, durationSeconds: Double,
+        tail: [SegmentWriter.ClosedSegment], segmentsDropped: Bool,
+        enqueue: @escaping @Sendable (SegmentWriter.ClosedSegment) -> Void,
+        drain: @escaping @Sendable () async -> (uploaded: Int, registered: Int, failed: Int, enqueued: Int),
+        cloud: any CloudFinalizeTransport,
+        flushNotes: @escaping @Sendable () async throws -> Void = {},
+        timeout: TimeInterval = finalizeTimeout
+    ) async throws -> (counts: (uploaded: Int, registered: Int, failed: Int, enqueued: Int), expected: Int?) {
+        throw CaptureError.notRunning
     }
 
     /// Waits between transcript submits after a 409, a 401, a 5xx or a network error.
@@ -364,6 +387,7 @@ final class CaptureSession: ObservableObject {
         deviceOnly: Bool = true, cloud: (any CloudFinalizeTransport)? = nil,
         transcribeTimeout: TimeInterval? = nil, engineStopTimeout: TimeInterval = CaptureSession.engineStopTimeout,
         cloudTimeout: TimeInterval = finalizeTimeout,
+        notesFlushTimeout: TimeInterval = CaptureSession.notesFlushTimeout,
         sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
         flushNotes: @escaping @Sendable () async throws -> Void = {},
         saved: [DeviceTranscript.Segment] = [],

@@ -188,17 +188,43 @@ final class TranscriptionRouterTests: XCTestCase {
         XCTAssertEqual(TranscriptionSetting.allCases.map(\.title), ["Automatic", "On this Mac only", "Cloud"])
     }
 
-    func test_deviceRoutingGate_holdsCloudUntilFlipped_andAHiddenDefaultOverridesIt() throws {
+    func test_deviceRoutingGate_isOnByDefault_andAHiddenDefaultCanStillTurnItOff() throws {
         let suite = "TranscriptionRouterTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
 
-        XCTAssertFalse(TranscriptionRouter.deviceRoutingEnabledByDefault, "device routing ships turned off by default")
-        XCTAssertEqual(TranscriptionRouter.isDeviceRoutingEnabled(defaults), TranscriptionRouter.deviceRoutingEnabledByDefault)
-        defaults.set(true, forKey: TranscriptionRouter.deviceRoutingKey)
-        XCTAssertTrue(TranscriptionRouter.isDeviceRoutingEnabled(defaults))
+        XCTAssertTrue(TranscriptionRouter.deviceRoutingEnabledByDefault, "device routing ships turned on")
+        XCTAssertTrue(TranscriptionRouter.isDeviceRoutingEnabled(defaults), "a fresh install routes on device with no user action")
         defaults.set(false, forKey: TranscriptionRouter.deviceRoutingKey)
         XCTAssertFalse(TranscriptionRouter.isDeviceRoutingEnabled(defaults))
+        XCTAssertEqual(TranscriptionRouter.decide(input(gate: TranscriptionRouter.isDeviceRoutingEnabled(defaults))), .cloud(.deviceRoutingOff))
+        defaults.set(true, forKey: TranscriptionRouter.deviceRoutingKey)
+        XCTAssertTrue(TranscriptionRouter.isDeviceRoutingEnabled(defaults))
+    }
+
+    /// A fresh install with no stored setting and no hidden default, end to end through the real gate.
+    func test_freshInstall_withTheShippedGate_routesPerTheDecisionMatrix() throws {
+        let suite = "TranscriptionRouterTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let gate = TranscriptionRouter.isDeviceRoutingEnabled(defaults)
+        let automatic = TranscriptionSetting.load(from: defaults)
+        let pinned = ModelManifest.pinned
+        let healthy = Set(pinned.entries.map(\.revision))
+
+        let rows: [(String, TranscriptionRouter.Input, TranscriptionDecision)] = [
+            ("Automatic, healthy model", input(healthy: healthy, setting: automatic, gate: gate, manifest: pinned), .device),
+            ("Automatic, no healthy model", input(healthy: [], setting: automatic, gate: gate, manifest: pinned), .cloud(.modelNotReady)),
+            ("Automatic, Japanese", input(language: "ja", healthy: healthy, setting: automatic, gate: gate, manifest: pinned),
+             .cloud(.unsupportedLanguage)),
+            ("Automatic, Intel Mac", input(appleSilicon: false, healthy: healthy, setting: automatic, gate: gate, manifest: pinned),
+             .cloud(.intelMac)),
+            ("On this Mac only, no model", input(healthy: [], setting: .onDeviceOnly, gate: gate, manifest: pinned),
+             .blocked(.modelNotReady)),
+        ]
+        for (name, row, expected) in rows {
+            XCTAssertEqual(TranscriptionRouter.decide(row), expected, name)
+        }
     }
 
     // MARK: Settings copy

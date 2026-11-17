@@ -93,9 +93,11 @@ final class DeviceResubmitTests: XCTestCase {
         XCTAssertEqual(AppController.recoveryOutcome(for: CaptureSession.CaptureError.transcriptRejected), .unreadable)
     }
 
-    func test_recoveryNotification_forADeviceMeeting_saysItWasSent_neverUploading() {
+    /// A device meeting's recovery may finish on this Mac or, for Automatic, in the cloud; the manifest
+    /// cannot tell which, so the notice claims neither and never says uploading.
+    func test_recoveryNotification_forADeviceMeeting_neverMentionsUploading_orWhereItWasTranscribed() {
         let device = AppController.recoveryNotificationBody(transcriptionMode: .device)
-        XCTAssertEqual(device, "A meeting transcribed on this Mac has been sent.")
+        XCTAssertEqual(device, "A meeting that didn't finish has been recovered. The recap is being prepared.")
         XCTAssertFalse(device.lowercased().contains("upload"), device)
         XCTAssertEqual(AppController.recoveryNotificationBody(transcriptionMode: .cloud),
                        "A meeting that didn't finish uploading has been recovered. The recap is being prepared.")

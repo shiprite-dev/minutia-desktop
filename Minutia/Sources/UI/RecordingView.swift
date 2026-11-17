@@ -22,6 +22,10 @@ struct RecordingView: View {
         return min(total, max(1, Int((level * Float(total)).rounded(.up))))
     }
 
+    static func progressLine(uploaded: Int, total: Int, audioMayLeaveMac: Bool) -> String {
+        "\(uploaded) of \(total) segments uploaded"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {

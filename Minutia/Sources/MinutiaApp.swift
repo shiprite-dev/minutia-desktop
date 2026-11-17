@@ -438,7 +438,7 @@ final class AppController: NSObject, ObservableObject {
     /// outlives the timed-out network step.
     nonisolated private static let deviceTranscriptFailure = "This meeting could not be transcribed on this Mac. The recording is kept on this Mac."
 
-    nonisolated static func finalizeFailureMessage(for error: Error, host: String?) -> String {
+    nonisolated static func finalizeFailureMessage(for error: Error, host: String?, audioMayLeaveMac: Bool = true) -> String {
         if case MinutiaClientError.featureUnavailable = error {
             return "Transcription is not enabled for this account on \(host ?? "the server"). Your audio is saved. Ask your workspace admin to enable AI features."
         }
@@ -482,6 +482,12 @@ final class AppController: NSObject, ObservableObject {
     /// Quitting must prompt when there is unfinished durable work: a recording in flight (or
     /// finalizing its upload), or a startup recovery sweep still rescuing a prior recording. Leaving
     /// without finishing would defer the upload to the next-launch recovery at best.
+    nonisolated static func quitAlert(capturingAudioMayLeaveMac: Bool?) -> (title: String, message: String) {
+        ("Finishing upload", "Minutia is still finishing a recording upload. Finish and quit, or keep it running?")
+    }
+
+    nonisolated static let recoveryRowLabel = "Finishing a previous recording upload…"
+
     nonisolated static func shouldConfirmQuit(phase: AppPhase, recoveryActive: Bool) -> Bool {
         if recoveryActive { return true }
         switch phase {
@@ -1733,7 +1739,7 @@ final class AppController: NSObject, ObservableObject {
         case failed(String)
     }
 
-    nonisolated static func refinalizeOutcome(for error: Error?, host: String?) -> RefinalizeOutcome {
+    nonisolated static func refinalizeOutcome(for error: Error?, host: String?, audioMayLeaveMac: Bool = true) -> RefinalizeOutcome {
         guard let error else { return .finalized }
         if error is CancellationError { return .cancelled }
         return .failed(finalizeFailureMessage(for: error, host: host))
