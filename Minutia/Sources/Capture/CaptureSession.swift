@@ -325,7 +325,8 @@ final class CaptureSession: ObservableObject {
     /// waits, throws.
     nonisolated static func submitDeviceTranscript(
         meetingId: String, body: Data, transport: any DeviceTranscriptTransport,
-        sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }
+        sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
+        accepted: AcceptedBox? = nil
     ) async throws {
         var attempt = 0
         while true {
@@ -333,7 +334,7 @@ final class CaptureSession: ObservableObject {
             var status: Int?
             var failure: Error?
             do { status = try await transport.submitDeviceTranscript(meetingId: meetingId, body: body) } catch { failure = error }
-            if let status, (200...299).contains(status) { return }
+            if let status, (200...299).contains(status) { accepted?.set(); return }
             if let status, (400...499).contains(status), ![401, 403, 408, 409, 429].contains(status) { throw CaptureError.transcriptRejected }
             let retryable: Bool
             if let status {
@@ -378,7 +379,7 @@ final class CaptureSession: ObservableObject {
             }
             await onLocalOutcome(true)
         } catch CaptureError.localTranscriptionTimedOut {
-            await transcriber.cancel()
+            Task { await transcriber.cancel() }
             await onLocalOutcome(false)
             guard !deviceOnly, let cloud else {
                 if deviceOnly {
@@ -394,7 +395,7 @@ final class CaptureSession: ObservableObject {
                 meetingId: meetingId, directory: directory, durationSeconds: durationSeconds, failure: .transcriptionTimedOut,
                 transport: transport, cloud: cloud, recapOpened: recapOpened, timeout: cloudTimeout)
         } catch let failure as LocalTranscriber.Failure {
-            await transcriber.cancel()
+            Task { await transcriber.cancel() }
             await onLocalOutcome(false)
             guard !deviceOnly, let cloud else {
                 markNotified(directory)
@@ -424,16 +425,17 @@ final class CaptureSession: ObservableObject {
         try? await transport.markAwaitingDeviceTranscript(meetingId: meetingId, durationSeconds: fitted.durationSeconds)
         try Task.checkCancellation()
         await onStep(.submitting)
+        let accepted = AcceptedBox()
         do {
             try await withTimeout(seconds: finalizeTimeout) {
-                try await submitDeviceTranscript(meetingId: meetingId, body: body, transport: transport, sleep: sleep)
+                try await submitDeviceTranscript(meetingId: meetingId, body: body, transport: transport, sleep: sleep, accepted: accepted)
             }
+        } catch where accepted.value {
         } catch CaptureError.transcriptRejected {
             throw CaptureError.transcriptRejected
         } catch {
             throw submitFailure(error)
         }
-        try Task.checkCancellation()
         try? FileManager.default.removeItem(at: directory)
         if !recapOpened { Task { await transport.warmSummary(meetingId: meetingId) } }
         Task { await endMeetingIfAllowed { try await transport.endMeeting(meetingId: meetingId) } }
@@ -446,12 +448,14 @@ final class CaptureSession: ObservableObject {
         timeout: TimeInterval
     ) async throws -> StopResult {
         let recording = directory.appendingPathComponent(CaptureRecovery.recordingName)
-        try await withTimeout(seconds: timeout) {
-            try await finalizeRecordingInCloud(
-                meetingId: meetingId, recording: recording, duration: durationSeconds, cloud: cloud,
-                deferExtraction: true, flushNotes: {})
-        }
-        try Task.checkCancellation()
+        let accepted = AcceptedBox()
+        do {
+            try await withTimeout(seconds: timeout) {
+                try await finalizeRecordingInCloud(
+                    meetingId: meetingId, recording: recording, duration: durationSeconds, cloud: cloud,
+                    deferExtraction: true, flushNotes: {}, accepted: accepted)
+            }
+        } catch where accepted.value {}
         try? FileManager.default.removeItem(at: directory)
         if !recapOpened { Task { await transport.warmSummary(meetingId: meetingId) } }
         Task { await endMeetingIfAllowed { try await transport.endMeeting(meetingId: meetingId) } }
@@ -460,7 +464,7 @@ final class CaptureSession: ObservableObject {
 
     nonisolated static func finalizeRecordingInCloud(
         meetingId: String, recording: URL, duration: Double, cloud: any CloudFinalizeTransport,
-        deferExtraction: Bool, flushNotes: @escaping @Sendable () async throws -> Void
+        deferExtraction: Bool, flushNotes: @escaping @Sendable () async throws -> Void, accepted: AcceptedBox? = nil
     ) async throws {
         let path = try await cloud.uploadRecording(meetingId: meetingId, fileURL: recording)
         try Task.checkCancellation()
@@ -468,7 +472,11 @@ final class CaptureSession: ObservableObject {
         try await cloud.finalizeMeeting(meetingId: meetingId, audioPath: path, duration: duration, sizeBytes: size)
         _ = try await NotepadFinalize.flushThenTranscribe(
             flush: flushNotes,
-            requestTranscription: { try await cloud.requestTranscription(meetingId: meetingId, expectedSegments: nil, deferExtraction: deferExtraction, strict: true) })
+            requestTranscription: {
+                let result = try await cloud.requestTranscription(meetingId: meetingId, expectedSegments: nil, deferExtraction: deferExtraction, strict: true)
+                accepted?.set()
+                return result
+            })
     }
 
     private nonisolated static func markNotified(_ directory: URL) {

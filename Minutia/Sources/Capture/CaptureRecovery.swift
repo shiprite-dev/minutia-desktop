@@ -80,6 +80,13 @@ struct CaptureManifest: Codable, Equatable {
 /// A directory is recoverable once it holds both a manifest and the full `recording.m4a`; the
 /// sweep mirrors `CaptureSession.stop`'s finalize so a rescued meeting reaches the same server
 /// state as a cleanly stopped one.
+final class AcceptedBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var accepted = false
+    var value: Bool { lock.withLock { accepted } }
+    func set() { lock.withLock { accepted = true } }
+}
+
 enum CaptureRecovery {
     static let manifestName = "manifest.json"
     static let recordingName = "recording.m4a"
@@ -91,7 +98,13 @@ enum CaptureRecovery {
     enum ModelDecision: Equatable { case ready, deferred, unusable }
 
     static func modelDecision(status: ModelStatus, hasEntry: Bool, isRoutable: Bool) -> ModelDecision {
-        .ready
+        guard hasEntry else { return .unusable }
+        if case .blocked(let reason) = status, reason == .intelMac || reason == .unsupportedOS { return .unusable }
+        if isRoutable { return .ready }
+        switch status {
+        case .failed, .blocked(.noEntryForLanguage): return .unusable
+        default: return .deferred
+        }
     }
 
     /// Segment audio must cover this share of the recording before its transcript may stand for the meeting.
@@ -108,14 +121,15 @@ enum CaptureRecovery {
               (try? JSONDecoder().decode(DeviceTranscript.self, from: data)) != nil else {
             throw RecoveryError.transcriptNotFinished
         }
+        let accepted = AcceptedBox()
         do {
-            try await CaptureSession.submitDeviceTranscript(meetingId: meetingId, body: data, transport: transport, sleep: sleep)
+            try await CaptureSession.submitDeviceTranscript(meetingId: meetingId, body: data, transport: transport, sleep: sleep, accepted: accepted)
+        } catch where accepted.value {
         } catch CaptureSession.CaptureError.transcriptRejected {
             throw CaptureSession.CaptureError.transcriptRejected
         } catch {
             throw CaptureSession.submitFailure(error)
         }
-        try Task.checkCancellation()
         try? FileManager.default.removeItem(at: directory)
     }
 
@@ -139,8 +153,8 @@ enum CaptureRecovery {
             throw RecoveryError.audioStaysOnThisMac
         }
         var transcriber: LocalTranscriber?
-        if !(manifest.localFailed && !manifest.deviceOnly) {
-            do { transcriber = try await makeTranscriber(manifest) } catch RecoveryError.deferred where !manifest.deviceOnly {}
+        if manifest.deviceOnly || !manifest.localFailed {
+            transcriber = try await makeTranscriber(manifest)
         }
         if transcriber == nil && manifest.deviceOnly {
             endMeeting()
@@ -155,42 +169,46 @@ enum CaptureRecovery {
             var missing: [SegmentWriter.ClosedSegment] = []
             var saved: [LocalTranscriber.SegmentTranscript] = []
             var covered = 0.0
+            var clock = duration
             for segment in await readableSegments(in: directory) {
-                let seconds = await readableAudioDuration(of: segment.micURL) ?? 0
+                let seconds = segment.frames > 0
+                    ? Double(segment.frames) / MixPlan.sampleRate
+                    : await readableAudioDuration(of: segment.micURL) ?? 0
                 covered += seconds
+                if let start = segment.startSeconds { clock = max(clock, start + seconds) }
                 if let transcript = savedTranscript(in: directory, seq: segment.seq) {
                     saved.append(transcript)
                 } else {
                     missing.append(SegmentWriter.ClosedSegment(
-                        seq: segment.seq, micURL: segment.micURL, sysURL: segment.sysURL, frames: Int64(seconds * MixPlan.sampleRate)))
+                        seq: segment.seq, micURL: segment.micURL, sysURL: segment.sysURL, frames: Int64(seconds * MixPlan.sampleRate),
+                        startSeconds: segment.startSeconds))
                 }
             }
             if covered >= minimumCoverage * duration {
                 await transcriber.seed(saved)
                 do {
                     _ = try await CaptureSession.finishOnDevice(
-                        meetingId: manifest.meetingId, directory: directory, tail: missing, durationSeconds: duration,
+                        meetingId: manifest.meetingId, directory: directory, tail: missing, durationSeconds: clock,
                         transcriber: transcriber, transport: transport, recapOpened: true, deviceOnly: manifest.deviceOnly,
                         cloud: cloud, cloudTimeout: cloudTimeout, sleep: sleep, flushNotes: flushNotes,
                         saved: saved.flatMap(\.segments), onStep: onStep)
                     return
                 } catch is LocalTranscriber.Failure, CaptureSession.CaptureError.localTranscriptionTimedOut {
                     throw RecoveryError.audioStaysOnThisMac
-                } catch is CancellationError {
-                    await transcriber.cancel()
-                    throw CancellationError()
                 }
             } else if manifest.deviceOnly {
                 endMeeting()
                 throw RecoveryError.audioStaysOnThisMac
             }
         }
-        try await withTimeout(seconds: cloudTimeout) {
-            try await CaptureSession.finalizeRecordingInCloud(
-                meetingId: manifest.meetingId, recording: recordingURL, duration: duration, cloud: cloud,
-                deferExtraction: false, flushNotes: flushNotes)
-        }
-        try Task.checkCancellation()
+        let accepted = AcceptedBox()
+        do {
+            try await withTimeout(seconds: cloudTimeout) {
+                try await CaptureSession.finalizeRecordingInCloud(
+                    meetingId: manifest.meetingId, recording: recordingURL, duration: duration, cloud: cloud,
+                    deferExtraction: false, flushNotes: flushNotes, accepted: accepted)
+            }
+        } catch where accepted.value {}
         try? FileManager.default.removeItem(at: directory)
         endMeeting()
     }
@@ -219,6 +237,21 @@ enum CaptureRecovery {
             guard await readableAudioDuration(of: segment.micURL) != nil,
                   await readableAudioDuration(of: segment.sysURL) != nil else { continue }
             segments.append(segment)
+        }
+        let pieces = names.compactMap { name -> Int? in
+            guard name.hasPrefix("tail-"), name.hasSuffix("-me.m4a") else { return nil }
+            return Int(name.dropFirst(5).dropLast(7))
+        }.sorted()
+        guard let first = pieces.first,
+              !FileManager.default.fileExists(atPath: directory.appendingPathComponent("seg-\(first)-me.m4a").path) else { return segments }
+        var start = Double(first) * SegmentWriter.segmentSeconds
+        for seq in pieces {
+            let mic = directory.appendingPathComponent("tail-\(seq)-me.m4a")
+            let sys = directory.appendingPathComponent("tail-\(seq)-them.m4a")
+            guard let seconds = await readableAudioDuration(of: mic), await readableAudioDuration(of: sys) != nil else { continue }
+            segments.append(SegmentWriter.ClosedSegment(
+                seq: seq, micURL: mic, sysURL: sys, frames: Int64(seconds * MixPlan.sampleRate), startSeconds: start))
+            start += seconds
         }
         return segments
     }

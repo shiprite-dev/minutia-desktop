@@ -51,7 +51,7 @@ actor LocalTranscriber {
     private var loadTask: Task<any SpeechEngine, Error>?
     private var loadFailure: Failure?
     private var loadStartedAt = Date()
-    private var verdicts: [QualityGuard.Verdict] = []
+    private var verdicts: [Int: QualityGuard.Verdict] = [:]
     private var unloadTask: Task<Void, Never>?
 
     private let intakeLock = NSLock()
@@ -84,7 +84,7 @@ actor LocalTranscriber {
     }
 
     private func didLoad(_ loaded: any SpeechEngine) {
-        guard loadFailure == nil else { return }
+        guard loadFailure == nil, !intakeLock.withLock({ cancelled }) else { return }
         engine = loaded
         loadTask = nil
     }
@@ -153,39 +153,42 @@ actor LocalTranscriber {
 
     private func run(_ segment: SegmentWriter.ClosedSegment) async throws -> [DeviceTranscript.Segment] {
         guard Double(segment.frames) / MixPlan.sampleRate >= Self.minimumSegmentSeconds else { return [] }
-        guard !QualityGuard.abortsEarly(verdicts) else { return [] }
+        guard !QualityGuard.abortsEarly(orderedVerdicts) else { return [] }
         do {
             let engine = try await engineForJob()
             let mine = try await engine.transcribe(.file(segment.micURL))
+            try Task.checkCancellation()
             let theirs = try await engine.transcribe(.file(segment.sysURL))
             let verdict = QualityGuard.verdict(mine.segments + theirs.segments, floor: guardFloor)
-            guard verdict != .fail else { verdicts.append(.fail); return [] }
+            guard verdict != .fail else { verdicts[segment.seq] = .fail; return [] }
             let labeled = DeviceTranscript.labeled(mine, speaker: .me, offset: segment.offsetSeconds)
                 + DeviceTranscript.labeled(theirs, speaker: .them, offset: segment.offsetSeconds)
             let saved = SegmentTranscript(seq: segment.seq, modelId: engine.modelId, segments: labeled)
             try JSONEncoder().encode(saved).write(
                 to: segment.micURL.deletingLastPathComponent().appendingPathComponent(Self.transcriptName(seq: segment.seq)),
                 options: .atomic)
-            verdicts.append(verdict)
+            verdicts[segment.seq] = verdict
             return labeled
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            verdicts.append(.fail)
+            verdicts[segment.seq] = .fail
             return []
         }
     }
 
     /// Counts saved segment transcripts toward the meeting verdict, so recovery judges the whole meeting.
     func seed(_ saved: [SegmentTranscript]) {
-        verdicts = saved.map { transcript in
-            QualityGuard.verdict(
+        verdicts = Dictionary(saved.map { transcript in
+            (transcript.seq, QualityGuard.verdict(
                 transcript.segments.compactMap { segment in
                     segment.confidence.map { SpeechSegment(start: segment.start, end: segment.end, text: segment.text, confidence: $0) }
                 },
-                floor: guardFloor)
-        }
+                floor: guardFloor))
+        }, uniquingKeysWith: { _, new in new })
     }
+
+    private var orderedVerdicts: [QualityGuard.Verdict] { verdicts.sorted { $0.key < $1.key }.map(\.value) }
 
     private func jobFinished() {
         intakeLock.withLock { activeJobs -= 1 }
@@ -212,12 +215,17 @@ actor LocalTranscriber {
         })
     }
 
-    /// Cancels every pending job and the load, and drops the engine.
-    func cancel() {
+    /// Cancels every pending job and the load, waits for each to return (a Core ML call or model load
+    /// cannot be interrupted), then drops the engine.
+    func cancel() async {
         let pending = intakeLock.withLock { defer { jobs = []; cancelled = true }; return jobs }
-        pending.forEach { $0.cancel() }
-        loadTask?.cancel(); loadTask = nil
+        let load = loadTask
+        loadTask = nil
         unloadTask?.cancel(); unloadTask = nil
+        pending.forEach { $0.cancel() }
+        load?.cancel()
+        for job in pending { _ = await job.result }
+        _ = await load?.result
         engine = nil
     }
 
@@ -235,7 +243,7 @@ actor LocalTranscriber {
             await onStep(.transcribing(completed: index + 1, total: all.count))
         }
         if let loadFailure { throw loadFailure }
-        guard QualityGuard.passes(verdicts) else { throw Failure.qualityGuard }
+        guard QualityGuard.passes(orderedVerdicts) else { throw Failure.qualityGuard }
         scheduleUnload()
         return DeviceTranscript.build(source: source, language: language, durationSeconds: durationSeconds, segments: segments)
     }

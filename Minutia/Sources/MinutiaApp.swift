@@ -646,6 +646,8 @@ final class AppController: NSObject, ObservableObject {
     private var detectorBoundInstance: URL?
     /// Single-flight guard for the startup recovery sweep.
     private var recoveryTask: Task<Void, Never>?
+    private var rerunRecovery = false
+    private var startingCapture = false
     private let defaults = UserDefaults.standard
     private var screenLocked = false
     private var asleep = false
@@ -1191,6 +1193,8 @@ final class AppController: NSObject, ObservableObject {
     }
 
     private func launchCapture(meetingId: String, seriesId: UUID?, announce: Bool, client: MinutiaClient, routing: CaptureRouting) async throws {
+        startingCapture = true
+        defer { startingCapture = false }
         let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
         if let task = recoveryTask {
             task.cancel()
@@ -1224,11 +1228,21 @@ final class AppController: NSObject, ObservableObject {
     }
 
     private func recoveryTranscriber(_ manifest: CaptureManifest) throws -> LocalTranscriber? {
-        guard let language = manifest.language, modelStore.manifest.entry(forLanguage: language) != nil else { return nil }
-        guard case .ready = modelStore.status, let transcriber = deviceTranscriber(language: language) else {
+        guard let language = manifest.language else { return nil }
+        let routable = modelStore.routableEntry(forLanguage: language) != nil
+        switch CaptureRecovery.modelDecision(
+            status: modelStore.status, hasEntry: modelStore.manifest.entry(forLanguage: language) != nil, isRoutable: routable) {
+        case .unusable:
+            return nil
+        case .deferred:
+            switch modelStore.status {
+            case .idle, .ready: Task { await modelStore.prepare(language: language) }
+            default: break
+            }
             throw CaptureRecovery.RecoveryError.deferred
+        case .ready:
+            return deviceTranscriber(language: language)
         }
-        return transcriber
     }
 
     private func verifySoleRecorder(meetingId: String, token: Int, client: MinutiaClient) {
@@ -1625,7 +1639,8 @@ final class AppController: NSObject, ObservableObject {
     /// launch. The live recording's directory (if any) is never swept.
     private func runRecovery() {
         if case .recording = phase { return }
-        guard recoveryTask == nil, let client = authManager.client(), let instance = authManager.instance else { return }
+        guard !startingCapture, let client = authManager.client(), let instance = authManager.instance else { return }
+        guard recoveryTask == nil else { rerunRecovery = true; return }
         let activeId = recordingMeetingId?.uuidString
         recoveryActive = true
         let notepad = notepad
@@ -1671,7 +1686,10 @@ final class AppController: NSObject, ObservableObject {
         recoveryTask = task
         Task {
             await task.value
-            if recoveryTask == task { recoveryTask = nil }
+            if recoveryTask == task {
+                recoveryTask = nil
+                if rerunRecovery { rerunRecovery = false; runRecovery() }
+            }
         }
     }
 
@@ -1779,6 +1797,7 @@ final class AppController: NSObject, ObservableObject {
         var exhausted: [CaptureManifest] = []
         guard let root = try? CaptureStore.capturesRoot() else { return (recovered, transcriptionUnavailable, keptOnThisMac, exhausted) }
         for dir in CaptureRecovery.recoverableDirectories(in: root, excluding: activeMeetingId) {
+            guard !Task.isCancelled else { break }
             guard let manifest = CaptureRecovery.loadManifest(from: dir) else {
                 logger.error("Recovery: unreadable manifest at \(dir.lastPathComponent, privacy: .public)")
                 continue
