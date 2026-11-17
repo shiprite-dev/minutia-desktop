@@ -408,6 +408,8 @@ final class DeviceFallbackTests: XCTestCase {
         XCTAssertEqual(cloud.strict, [true], "a 503 must not count as accepted")
         XCTAssertFalse(transport.log.contains("mark") || transport.log.contains("submit"), "got \(transport.log)")
         XCTAssertFalse(dirExists, "the cloud 2xx deletes the capture directory")
+        let ended = await eventually { transport.log.contains("endMeeting") }
+        XCTAssertTrue(ended, "a meeting finished by recovery is ended on the server, like the stop path")
     }
 
     func test_recovery_whoseCloudFinalizeFails_keepsTheDirectory_forTheNextAttempt() async throws {
@@ -473,7 +475,7 @@ final class DeviceFallbackTests: XCTestCase {
         let first = AppController.recoverySweep(priorAttempts: 0)
 
         let crashed = AppController.sweepStep(manifest: fresh, outcome: .keptOnThisMac, sweep: first)
-        XCTAssertEqual(crashed.report, .exhausted, "a crash before the stop's notice gets exactly one from the sweep")
+        XCTAssertEqual(crashed.report, .keptOnThisMac, "a crash before the stop's notice gets exactly one, the not-transcribed notice")
         XCTAssertEqual(crashed.save?.recoveryAttempts, AppController.maxRecoveryAttempts)
         XCTAssertEqual(crashed.save?.notified, true, "the sweep's notice is persisted too")
 

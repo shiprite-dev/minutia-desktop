@@ -147,10 +147,10 @@ final class ModelStore: ObservableObject {
         defaults.removeObject(forKey: healthKey(entry))
         defaults.removeObject(forKey: warmKey(entry))
         if lastLanguage == nil { return }
-        if recording { lastLanguage = language } else { reverifyTask = Task { await self.prepare(language: language) } }
+        if recording { lastLanguage = language } else {
+            Task { guard self.lastLanguage != nil else { return }; await self.prepare(language: language) }
+        }
     }
-
-    private var reverifyTask: Task<Void, Never>?
 
     func recordingDidStart() {
         recording = true

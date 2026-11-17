@@ -125,6 +125,7 @@ enum CaptureRecovery {
             meetingId: manifest.meetingId, recording: recordingURL, duration: duration, cloud: cloud,
             deferExtraction: false, flushNotes: flushNotes)
         try? FileManager.default.removeItem(at: directory)
+        Task { await CaptureSession.endMeetingIfAllowed { try await transport.endMeeting(meetingId: manifest.meetingId) } }
     }
 
     /// nil when the file is missing, has no audio track, or has no positive finite duration.

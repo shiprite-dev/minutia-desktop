@@ -376,8 +376,8 @@ final class CaptureSession: ObservableObject {
             await onLocalOutcome(false)
             guard !deviceOnly, let cloud else {
                 if deviceOnly {
-                    await notifyLocalFailure(.transcriptionTimedOut)
                     markNotified(directory)
+                    await notifyLocalFailure(.transcriptionTimedOut)
                 }
                 Task { await endMeetingIfAllowed { try await transport.endMeeting(meetingId: meetingId) } }
                 throw CaptureError.localTranscriptionTimedOut
@@ -390,8 +390,8 @@ final class CaptureSession: ObservableObject {
             await transcriber.cancel()
             await onLocalOutcome(false)
             guard !deviceOnly, let cloud else {
-                await notifyLocalFailure(failure)
                 markNotified(directory)
+                await notifyLocalFailure(failure)
                 Task { await endMeetingIfAllowed { try await transport.endMeeting(meetingId: meetingId) } }
                 throw failure
             }

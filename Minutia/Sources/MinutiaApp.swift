@@ -1626,6 +1626,9 @@ final class AppController: NSObject, ObservableObject {
                     title: "Transcription unavailable",
                     body: "Transcription is not enabled for this account on \(instance.host ?? "the server"). The recording is saved.")
             }
+            if !result.keptOnThisMac.isEmpty {
+                Self.postNotification(title: "Meeting not transcribed", body: Self.deviceTranscriptFailure)
+            }
             // A recording that has failed to finalize past the attempt ceiling is treated as
             // deterministically dead: tell the user once, keep the audio, stop retrying it.
             if !result.exhausted.isEmpty {
@@ -1669,7 +1672,7 @@ final class AppController: NSObject, ObservableObject {
         return .failed(finalizeFailureMessage(for: error, host: host))
     }
 
-    enum SweepReport: Equatable { case recovered, transcriptionUnavailable, exhausted }
+    enum SweepReport: Equatable { case recovered, transcriptionUnavailable, keptOnThisMac, exhausted }
 
     struct SweepStep: Equatable {
         var save: CaptureManifest?
@@ -1688,7 +1691,7 @@ final class AppController: NSObject, ObservableObject {
         case .keptOnThisMac:
             updated.recoveryAttempts = maxRecoveryAttempts
             updated.notified = true
-            return SweepStep(save: updated, report: manifest.notified ? nil : .exhausted)
+            return SweepStep(save: updated, report: manifest.notified ? nil : .keptOnThisMac)
         case .unreadable:
             updated.recoveryAttempts = maxRecoveryAttempts
             return SweepStep(save: updated, report: .exhausted)
@@ -1730,11 +1733,12 @@ final class AppController: NSObject, ObservableObject {
     nonisolated static func recoverAll(
         client: MinutiaClient, instance: URL, connectedUserId: String?, excluding activeMeetingId: String?,
         flushNotes: @escaping @Sendable (String) async throws -> Void = { _ in }
-    ) async -> (recovered: [CaptureManifest], transcriptionUnavailable: [CaptureManifest], exhausted: [CaptureManifest]) {
+    ) async -> (recovered: [CaptureManifest], transcriptionUnavailable: [CaptureManifest], keptOnThisMac: [CaptureManifest], exhausted: [CaptureManifest]) {
         var recovered: [CaptureManifest] = []
         var transcriptionUnavailable: [CaptureManifest] = []
+        var keptOnThisMac: [CaptureManifest] = []
         var exhausted: [CaptureManifest] = []
-        guard let root = try? CaptureStore.capturesRoot() else { return (recovered, transcriptionUnavailable, exhausted) }
+        guard let root = try? CaptureStore.capturesRoot() else { return (recovered, transcriptionUnavailable, keptOnThisMac, exhausted) }
         for dir in CaptureRecovery.recoverableDirectories(in: root, excluding: activeMeetingId) {
             guard let manifest = CaptureRecovery.loadManifest(from: dir) else {
                 logger.error("Recovery: unreadable manifest at \(dir.lastPathComponent, privacy: .public)")
@@ -1778,11 +1782,12 @@ final class AppController: NSObject, ObservableObject {
             switch step.report {
             case .recovered?: recovered.append(manifest)
             case .transcriptionUnavailable?: transcriptionUnavailable.append(manifest)
+            case .keptOnThisMac?: keptOnThisMac.append(manifest)
             case .exhausted?: exhausted.append(manifest)
             case nil: break
             }
         }
-        return (recovered, transcriptionUnavailable, exhausted)
+        return (recovered, transcriptionUnavailable, keptOnThisMac, exhausted)
     }
 
     nonisolated static func recoveryNotificationBody(transcriptionMode: TranscriptionMode) -> String {
