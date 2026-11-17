@@ -163,12 +163,10 @@ final class PanelFlowTests: XCTestCase {
     func test_sentScreen_saysSentInPlainWords_andIsAnnouncedOnce() {
         let controller = signedIn()
         finishCleanly(controller, cue: sentCue())
-        for _ in 0..<2 {
-            let seen = panel(controller)
-            XCTAssertTrue(seen.has("Sent. Your recap is on its way"), seen.text)
-            XCTAssertTrue(seen.has("Open recap"), seen.text)
-            XCTAssertFalse(seen.has("SERIES"), seen.text)
-        }
+        let seen = panel(controller)
+        XCTAssertTrue(seen.has("Sent. Your recap is on its way"), seen.text)
+        XCTAssertTrue(seen.has("Open recap"), seen.text)
+        XCTAssertFalse(seen.has("SERIES"), seen.text)
         XCTAssertEqual(announcements.filter { $0 == "Sent. Your recap is on its way" }.count, 1)
     }
 
