@@ -1729,11 +1729,13 @@ final class AppController: NSObject, ObservableObject {
 
     enum RefinalizeOutcome: Equatable {
         case finalized
+        case cancelled
         case failed(String)
     }
 
     nonisolated static func refinalizeOutcome(for error: Error?, host: String?) -> RefinalizeOutcome {
         guard let error else { return .finalized }
+        if error is CancellationError { return .cancelled }
         return .failed(finalizeFailureMessage(for: error, host: host))
     }
 
@@ -1936,6 +1938,7 @@ final class AppController: NSObject, ObservableObject {
             } catch {
                 switch Self.refinalizeOutcome(for: error, host: authManager.instance?.host) {
                 case .finalized: apply(.finalized)
+                case .cancelled: break
                 case .failed(let message):
                     lastFailedStart = .finalize(meetingId: meetingId)
                     apply(.failed(message))

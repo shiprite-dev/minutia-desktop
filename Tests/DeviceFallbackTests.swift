@@ -465,6 +465,10 @@ final class DeviceFallbackTests: XCTestCase {
                        .failed("This meeting could not be transcribed on this Mac. The recording is kept on this Mac."))
     }
 
+    func test_retry_cancelledBySignOut_showsNoErrorAndArmsNoRetry() {
+        XCTAssertEqual(AppController.refinalizeOutcome(for: CancellationError(), host: "minutia.example.com"), .cancelled)
+    }
+
     /// One notice per failed On this Mac only meeting in total: the stop's notice, or for a meeting that
     /// crashed before its stop could post one, a single notice from the launch sweep. Either way the sweep
     /// pins the attempts so it never tries again.

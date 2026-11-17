@@ -238,7 +238,8 @@ enum CaptureRecovery {
         guard let first = pieces.first,
               !FileManager.default.fileExists(atPath: directory.appendingPathComponent("seg-\(first)-me.m4a").path) else { return segments }
         var start = Double(first) * segmentSeconds
-        for seq in pieces {
+        for (index, seq) in pieces.enumerated() {
+            guard seq == first + index else { break }
             let mic = directory.appendingPathComponent("tail-\(seq)-me.m4a")
             let sys = directory.appendingPathComponent("tail-\(seq)-them.m4a")
             guard let seconds = await readableAudioDuration(of: mic), await readableAudioDuration(of: sys) != nil else { break }
