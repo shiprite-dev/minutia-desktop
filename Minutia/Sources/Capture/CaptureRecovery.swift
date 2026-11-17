@@ -33,8 +33,7 @@ struct CaptureManifest: Codable, Equatable {
     /// the ceiling the directory is left alone so a deterministically-dead recording never retries on
     /// every launch forever. Older manifests have no field and decode as 0.
     var recoveryAttempts: Int
-    /// True once the terminal "transcription unavailable" notification has been posted for this
-    /// directory, so it is not re-posted on every later launch or auth transition. Decodes false.
+    /// True once a terminal notice was posted for this directory. Decodes false.
     var notified: Bool
     let transcriptionMode: TranscriptionMode
     let deviceOnly: Bool
@@ -116,15 +115,15 @@ enum CaptureRecovery {
         if let saved, (try? JSONDecoder().decode(DeviceTranscript.self, from: saved)) != nil {
             return try await resubmitDeviceTranscript(directory: directory, meetingId: manifest.meetingId, transport: transport, sleep: sleep)
         }
-        if manifest.deviceOnly { throw RecoveryError.audioStaysOnThisMac }
+        if manifest.deviceOnly {
+            Task { await CaptureSession.endMeetingIfAllowed { try await transport.endMeeting(meetingId: manifest.meetingId) } }
+            throw RecoveryError.audioStaysOnThisMac
+        }
         let recordingURL = directory.appendingPathComponent(recordingName)
         guard let duration = await readableAudioDuration(of: recordingURL) else { throw RecoveryError.unreadableRecording }
-        let path = try await cloud.uploadRecording(meetingId: manifest.meetingId, fileURL: recordingURL)
-        let size = ((try? FileManager.default.attributesOfItem(atPath: recordingURL.path)[.size]) as? NSNumber)?.int64Value ?? 0
-        try await cloud.finalizeMeeting(meetingId: manifest.meetingId, audioPath: path, duration: duration, sizeBytes: size)
-        _ = try await NotepadFinalize.flushThenTranscribe(
-            flush: flushNotes,
-            requestTranscription: { try await cloud.requestTranscription(meetingId: manifest.meetingId, expectedSegments: nil, deferExtraction: false, strict: true) })
+        try await CaptureSession.finalizeRecordingInCloud(
+            meetingId: manifest.meetingId, recording: recordingURL, duration: duration, cloud: cloud,
+            deferExtraction: false, flushNotes: flushNotes)
         try? FileManager.default.removeItem(at: directory)
     }
 

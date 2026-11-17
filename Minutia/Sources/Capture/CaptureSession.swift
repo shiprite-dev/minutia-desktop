@@ -375,7 +375,11 @@ final class CaptureSession: ObservableObject {
             await transcriber.cancel()
             await onLocalOutcome(false)
             guard !deviceOnly, let cloud else {
-                if deviceOnly { await notifyLocalFailure(.transcriptionTimedOut) }
+                if deviceOnly {
+                    await notifyLocalFailure(.transcriptionTimedOut)
+                    markNotified(directory)
+                }
+                Task { await endMeetingIfAllowed { try await transport.endMeeting(meetingId: meetingId) } }
                 throw CaptureError.localTranscriptionTimedOut
             }
             await notesFlushed
@@ -387,6 +391,8 @@ final class CaptureSession: ObservableObject {
             await onLocalOutcome(false)
             guard !deviceOnly, let cloud else {
                 await notifyLocalFailure(failure)
+                markNotified(directory)
+                Task { await endMeetingIfAllowed { try await transport.endMeeting(meetingId: meetingId) } }
                 throw failure
             }
             await notesFlushed
@@ -421,15 +427,32 @@ final class CaptureSession: ObservableObject {
     ) async throws -> StopResult {
         let recording = directory.appendingPathComponent(CaptureRecovery.recordingName)
         try await withTimeout(seconds: finalizeTimeout) {
-            let path = try await cloud.uploadRecording(meetingId: meetingId, fileURL: recording)
-            let size = ((try? FileManager.default.attributesOfItem(atPath: recording.path)[.size]) as? NSNumber)?.int64Value ?? 0
-            try await cloud.finalizeMeeting(meetingId: meetingId, audioPath: path, duration: durationSeconds, sizeBytes: size)
-            try await cloud.requestTranscription(meetingId: meetingId, expectedSegments: nil, deferExtraction: true, strict: true)
+            try await finalizeRecordingInCloud(
+                meetingId: meetingId, recording: recording, duration: durationSeconds, cloud: cloud,
+                deferExtraction: true, flushNotes: {})
         }
         try? FileManager.default.removeItem(at: directory)
         if !recapOpened { Task { await transport.warmSummary(meetingId: meetingId) } }
         Task { await endMeetingIfAllowed { try await transport.endMeeting(meetingId: meetingId) } }
         return StopResult(expectedSegments: nil, transcriptRequested: true, localFailure: failure)
+    }
+
+    nonisolated static func finalizeRecordingInCloud(
+        meetingId: String, recording: URL, duration: Double, cloud: any CloudFinalizeTransport,
+        deferExtraction: Bool, flushNotes: @escaping @Sendable () async throws -> Void
+    ) async throws {
+        let path = try await cloud.uploadRecording(meetingId: meetingId, fileURL: recording)
+        let size = ((try? FileManager.default.attributesOfItem(atPath: recording.path)[.size]) as? NSNumber)?.int64Value ?? 0
+        try await cloud.finalizeMeeting(meetingId: meetingId, audioPath: path, duration: duration, sizeBytes: size)
+        _ = try await NotepadFinalize.flushThenTranscribe(
+            flush: flushNotes,
+            requestTranscription: { try await cloud.requestTranscription(meetingId: meetingId, expectedSegments: nil, deferExtraction: deferExtraction, strict: true) })
+    }
+
+    private nonisolated static func markNotified(_ directory: URL) {
+        guard var manifest = CaptureRecovery.loadManifest(from: directory) else { return }
+        manifest.notified = true
+        CaptureRecovery.saveManifest(manifest, to: directory)
     }
 
     /// How long Quit waits for a stop already in flight.

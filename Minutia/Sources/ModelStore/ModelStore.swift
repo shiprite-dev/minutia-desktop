@@ -137,7 +137,7 @@ final class ModelStore: ObservableObject {
 
     /// Records how a meeting's local transcription ended for `language`'s entry. The
     /// `failuresBeforeReverify`th failure in a row clears its health and warm markers and re-runs
-    /// `prepare` (sha256 re-verify, re-download of bad files, warm-up) once; a success resets the count.
+    /// `prepare` (sha256 re-verify, re-download of bad files, warm-up) once, in the background; a success resets the count.
     func recordLocalTranscription(succeeded: Bool, language: String) async {
         guard let entry = manifest.entry(forLanguage: language) else { return }
         let key = "ModelStore.localFailures.\(entry.revision)"
@@ -146,8 +146,11 @@ final class ModelStore: ObservableObject {
         defaults.set(0, forKey: key)
         defaults.removeObject(forKey: healthKey(entry))
         defaults.removeObject(forKey: warmKey(entry))
-        if recording { lastLanguage = language } else { await prepare(language: language) }
+        if lastLanguage == nil { return }
+        if recording { lastLanguage = language } else { reverifyTask = Task { await self.prepare(language: language) } }
     }
+
+    private var reverifyTask: Task<Void, Never>?
 
     func recordingDidStart() {
         recording = true

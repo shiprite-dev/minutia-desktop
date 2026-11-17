@@ -448,7 +448,8 @@ final class AppController: NSObject, ObservableObject {
         case .nothingRecorded?: return "Nothing was recorded, so there is no transcript to send."
         default: break
         }
-        if case CaptureRecovery.RecoveryError.transcriptNotFinished = error {
+        if let recovery = error as? CaptureRecovery.RecoveryError,
+           recovery == .transcriptNotFinished || recovery == .audioStaysOnThisMac {
             return deviceTranscriptFailure
         }
         if error is LocalTranscriber.Failure { return deviceTranscriptFailure }
@@ -1665,7 +1666,6 @@ final class AppController: NSObject, ObservableObject {
 
     nonisolated static func refinalizeOutcome(for error: Error?, host: String?) -> RefinalizeOutcome {
         guard let error else { return .finalized }
-        if error as? CaptureRecovery.RecoveryError == .audioStaysOnThisMac { return .finalized }
         return .failed(finalizeFailureMessage(for: error, host: host))
     }
 
@@ -1687,7 +1687,8 @@ final class AppController: NSObject, ObservableObject {
             return SweepStep(save: updated, report: .transcriptionUnavailable)
         case .keptOnThisMac:
             updated.recoveryAttempts = maxRecoveryAttempts
-            return SweepStep(save: updated, report: nil)
+            updated.notified = true
+            return SweepStep(save: updated, report: manifest.notified ? nil : .exhausted)
         case .unreadable:
             updated.recoveryAttempts = maxRecoveryAttempts
             return SweepStep(save: updated, report: .exhausted)
@@ -1756,43 +1757,29 @@ final class AppController: NSObject, ObservableObject {
             } catch {
                 caught = error
             }
-            switch recoveryOutcome(for: caught) {
+            let outcome = recoveryOutcome(for: caught)
+            let step = sweepStep(manifest: manifest, outcome: outcome, sweep: sweep)
+            if let save = step.save { CaptureRecovery.saveManifest(save, to: dir) }
+            switch outcome {
             case .recovered:
                 try? FileManager.default.removeItem(at: dir)
                 if let notesRoot = try? NotepadStore.notesRoot() {
                     NotepadStore.removeIfSynced(meetingId: manifest.meetingId, in: notesRoot)
                 }
-                recovered.append(manifest)
             case .transcriptionUnavailable:
-                // Keep the directory: the audio is safe (uploaded + finalized) and the entitlement may
-                // be granted later. Never delete on featureUnavailable. Logged every sweep, but the
-                // user-facing notification fires once per directory (persisted `notified` flag).
                 logger.error("Recovery: transcription not enabled for meeting \(manifest.meetingId, privacy: .public)")
-                if !manifest.notified {
-                    var updated = manifest
-                    updated.notified = true
-                    CaptureRecovery.saveManifest(updated, to: dir)
-                    transcriptionUnavailable.append(manifest)
-                }
-            case .keptOnThisMac:
-                var updated = manifest
-                updated.recoveryAttempts = maxRecoveryAttempts
-                CaptureRecovery.saveManifest(updated, to: dir)
             case .unreadable:
-                // An unreadable recording never becomes readable: stop retrying at once and keep the audio.
-                var updated = manifest
-                updated.recoveryAttempts = maxRecoveryAttempts
-                CaptureRecovery.saveManifest(updated, to: dir)
                 logger.error("Recovery: unreadable recording for meeting \(manifest.meetingId, privacy: .public)")
-                exhausted.append(manifest)
             case .retryLater:
-                // Persist the incremented attempt count so the bound survives relaunches. Keep the
-                // audio; when the count reaches the ceiling, notify the user exactly once.
-                var updated = manifest
-                updated.recoveryAttempts = sweep.nextAttempts
-                CaptureRecovery.saveManifest(updated, to: dir)
                 logger.error("Recovery deferred for meeting \(manifest.meetingId, privacy: .public) attempt \(sweep.nextAttempts, privacy: .public): \(String(describing: caught), privacy: .public)")
-                if sweep.notifyOnExhaustion { exhausted.append(manifest) }
+            case .keptOnThisMac:
+                break
+            }
+            switch step.report {
+            case .recovered?: recovered.append(manifest)
+            case .transcriptionUnavailable?: transcriptionUnavailable.append(manifest)
+            case .exhausted?: exhausted.append(manifest)
+            case nil: break
             }
         }
         return (recovered, transcriptionUnavailable, exhausted)
@@ -1867,13 +1854,13 @@ final class AppController: NSObject, ObservableObject {
                         seriesId: manifest.seriesId.flatMap { UUID(uuidString: $0) },
                         instance: manifest.instanceURL)
                 }
-            } catch CaptureRecovery.RecoveryError.audioStaysOnThisMac {
-                apply(.finalized)
             } catch {
-                // Re-arm the finalize target: apply(.refinalizeStarted) moved through .finalizing,
-                // which retires lastFailedStart, so set it again before parking back in .error.
-                lastFailedStart = .finalize(meetingId: meetingId)
-                apply(.failed(Self.finalizeFailureMessage(for: error, host: authManager.instance?.host)))
+                switch Self.refinalizeOutcome(for: error, host: authManager.instance?.host) {
+                case .finalized: apply(.finalized)
+                case .failed(let message):
+                    lastFailedStart = .finalize(meetingId: meetingId)
+                    apply(.failed(message))
+                }
             }
         }
     }
