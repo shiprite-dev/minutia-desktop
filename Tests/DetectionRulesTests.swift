@@ -199,7 +199,7 @@ final class DetectionRulesTests: XCTestCase {
         XCTAssertNil(DetectionRules.liveAgendaItem([item], now: now))
     }
 
-    func test_liveAgendaItem_twoInWindow_earliestWins() {
+    func test_liveAgendaItem_twoInWindow_theMostRecentlyStartedWins() {
         let now = Date()
         let later = agendaItem(
             title: "Later", startAt: now.addingTimeInterval(-30), endAt: now.addingTimeInterval(1800),
@@ -207,7 +207,7 @@ final class DetectionRulesTests: XCTestCase {
         let earlier = agendaItem(
             title: "Earlier", startAt: now.addingTimeInterval(-90), endAt: now.addingTimeInterval(1800),
             meetingUrl: "https://zoom.us/j/5")
-        XCTAssertEqual(DetectionRules.liveAgendaItem([later, earlier], now: now)?.title, "Earlier")
+        XCTAssertEqual(DetectionRules.liveAgendaItem([later, earlier], now: now)?.title, "Later")
     }
 
     private func agendaItem(title: String, startAt: Date, endAt: Date, meetingUrl: String?) -> AgendaItem {
