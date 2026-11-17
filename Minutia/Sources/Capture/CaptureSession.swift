@@ -358,7 +358,8 @@ final class CaptureSession: ObservableObject {
         sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
         flushNotes: @escaping @Sendable () async throws -> Void = {},
         onStep: @escaping @Sendable (FinishingStep) async -> Void = { _ in },
-        notifyLocalFailure: @escaping @Sendable (LocalTranscriber.Failure) async -> Void = { _ in }
+        notifyLocalFailure: @escaping @Sendable (LocalTranscriber.Failure) async -> Void = { _ in },
+        onLocalOutcome: @escaping @Sendable (Bool) async -> Void = { _ in }
     ) async throws -> StopResult {
         guard durationSeconds > 0 else { throw CaptureError.nothingRecorded }
         async let notesFlushed: Void = { try? await flushNotes() }()
@@ -382,7 +383,7 @@ final class CaptureSession: ObservableObject {
                 let path = try await cloud.uploadRecording(meetingId: meetingId, fileURL: recording)
                 let size = ((try? FileManager.default.attributesOfItem(atPath: recording.path)[.size]) as? NSNumber)?.int64Value ?? 0
                 try await cloud.finalizeMeeting(meetingId: meetingId, audioPath: path, duration: durationSeconds, sizeBytes: size)
-                try await cloud.requestTranscription(meetingId: meetingId, expectedSegments: nil, deferExtraction: true)
+                try await cloud.requestTranscription(meetingId: meetingId, expectedSegments: nil, deferExtraction: true, strict: false)
             }
             try? FileManager.default.removeItem(at: directory)
             if !recapOpened { Task { await transport.warmSummary(meetingId: meetingId) } }
@@ -555,7 +556,7 @@ final class CaptureSession: ObservableObject {
 protocol CloudFinalizeTransport {
     func uploadRecording(meetingId: String, fileURL: URL) async throws -> String
     func finalizeMeeting(meetingId: String, audioPath: String, duration: Double, sizeBytes: Int64) async throws
-    func requestTranscription(meetingId: String, expectedSegments: Int?, deferExtraction: Bool) async throws
+    func requestTranscription(meetingId: String, expectedSegments: Int?, deferExtraction: Bool, strict: Bool) async throws
 }
 
 extension MinutiaClient: CloudFinalizeTransport {}

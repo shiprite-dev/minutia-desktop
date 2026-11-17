@@ -107,6 +107,14 @@ enum CaptureRecovery {
         try? FileManager.default.removeItem(at: directory)
     }
 
+    static func recoverDeviceMeeting(
+        directory: URL, manifest: CaptureManifest, transport: any DeviceTranscriptTransport, cloud: any CloudFinalizeTransport,
+        flushNotes: @escaping @Sendable () async throws -> Void = {},
+        sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }
+    ) async throws {
+        try await resubmitDeviceTranscript(directory: directory, meetingId: manifest.meetingId, transport: transport, sleep: sleep)
+    }
+
     /// nil when the file is missing, has no audio track, or has no positive finite duration.
     static func readableAudioDuration(of url: URL) async -> Double? {
         let asset = AVURLAsset(url: url)
@@ -191,7 +199,7 @@ enum CaptureRecovery {
         flushNotes: @escaping @Sendable () async throws -> Void = {}
     ) async throws {
         if manifest.transcriptionMode == .device {
-            try await resubmitDeviceTranscript(directory: directory, meetingId: manifest.meetingId, transport: client)
+            try await recoverDeviceMeeting(directory: directory, manifest: manifest, transport: client, cloud: client, flushNotes: flushNotes)
             return
         }
         guard manifest.audioMayLeaveMac else { throw RecoveryError.audioStaysOnThisMac }

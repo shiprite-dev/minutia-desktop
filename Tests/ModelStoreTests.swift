@@ -968,6 +968,32 @@ final class ModelStoreTests: XCTestCase {
         XCTAssertEqual(warmer.calls.count, 2, "the re-verify resets the count, so the next failure alone does not repeat it")
     }
 
+    /// The stop reports its local outcome while the store still treats the meeting as recording, so the
+    /// re-verify waits for `recordingDidStop` instead of being dropped.
+    func test_twoLocalFailuresReportedWhileRecording_reverifyOnceRecordingStops_redownloadingACorruptFile() async throws {
+        let manifest = Fixture.manifest()
+        let transfer = FakeTransfer(manifest: manifest)
+        let warmer = FakeWarmer()
+        let store = makeStore(manifest: manifest, transfer: transfer, warmer: warmer)
+        await store.prepare(language: "en")
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"), "precondition: English entry ready")
+        let installRequests = transfer.requests.count
+        try Data(repeating: 0xAB, count: 64).write(
+            to: store.directory(for: en(manifest)).appendingPathComponent("Encoder.mlmodelc/weights/weight.bin"))
+
+        store.recordingDidStart()
+        await store.recordLocalTranscription(succeeded: false, language: "en")
+        await store.recordLocalTranscription(succeeded: false, language: "en")
+        XCTAssertEqual(transfer.requests.count, installRequests, "nothing is fetched while a meeting is still finishing")
+        XCTAssertEqual(warmer.calls, ["fake-en"])
+
+        await store.recordingDidStop()
+        XCTAssertEqual(transfer.requests.dropFirst(installRequests).map(\.url), [url("Encoder.mlmodelc/weights/weight.bin", in: en(manifest))],
+                       "once recording stops every file is re-hashed and the corrupt one re-downloaded")
+        XCTAssertEqual(warmer.calls, ["fake-en", "fake-en"], "the re-verified model is warmed again")
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"))
+    }
+
     func test_twoLocalFailuresInARow_markTheModelUnhealthy_whenItCannotBeRevived() async {
         _ = await readyEnglishStore()
         let broken = makeStore(warmer: FakeWarmer(fails: true))

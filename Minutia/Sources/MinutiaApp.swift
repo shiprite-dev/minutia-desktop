@@ -1636,6 +1636,7 @@ final class AppController: NSObject, ObservableObject {
         case transcriptionUnavailable
         case unreadable
         case retryLater
+        case keptOnThisMac
     }
 
     nonisolated static func recoveryOutcome(for error: Error?) -> RecoveryOutcome {
@@ -1724,7 +1725,7 @@ final class AppController: NSObject, ObservableObject {
                     CaptureRecovery.saveManifest(updated, to: dir)
                     transcriptionUnavailable.append(manifest)
                 }
-            case .unreadable:
+            case .unreadable, .keptOnThisMac:
                 // An unreadable recording never becomes readable: stop retrying at once and keep the audio.
                 var updated = manifest
                 updated.recoveryAttempts = maxRecoveryAttempts
