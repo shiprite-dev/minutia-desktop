@@ -36,6 +36,9 @@ enum MinutiaClientError: Error, Equatable {
     case featureUnavailable
     /// A zero-row notes update: the meeting is gone or the user cannot write it. Terminal.
     case meetingNotWritable
+    /// The transcribe route answered 503: the server has no working transcription provider, so
+    /// nothing was transcribed and the local recording must be kept for a later retry.
+    case transcriptionNotConfigured
 }
 
 struct CheckinClaim: Equatable {
@@ -317,12 +320,12 @@ struct MinutiaClient {
 
     // MARK: - Async ops
 
-    func ownedSeries() async throws -> [Series] {
-        let uid = try await supabase.auth.session.user.id
+    /// Every series the signed-in user can record in. meeting_series RLS returns a row exactly when
+    /// start_or_join_meeting accepts it (owner, facilitator or participant), so no owner filter.
+    func recordableSeries() async throws -> [Series] {
         let response: PostgrestResponse<[Series]> = try await supabase
             .from("meeting_series")
             .select("id,name")
-            .eq("owner_id", value: uid.uuidString)
             .order("name")
             .execute()
         return response.value
@@ -409,7 +412,7 @@ struct MinutiaClient {
         if response.value.isEmpty { throw MinutiaClientError.meetingNotWritable }
     }
 
-    func requestTranscription(meetingId: String, expectedSegments: Int?, deferExtraction: Bool = false, strict: Bool = false) async throws {
+    func requestTranscription(meetingId: String, expectedSegments: Int?, deferExtraction: Bool = false) async throws {
         let token = try await tokenProvider()
         let request = Self.finalTranscribeRequest(instance: instance, meetingId: meetingId, expectedSegments: expectedSegments, deferExtraction: deferExtraction, token: token)
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -426,11 +429,9 @@ struct MinutiaClient {
         case .authExpired, .transientRetryable:
             throw MinutiaClientError.serverError(status: status)
         case .terminalOther:
-            // 503 is the legacy "transcription not configured" signal: the transcript can still be
-            // assembled from the fast-lane segments, so it alone is not a hard failure. Every other
-            // terminal 4xx must throw so the caller never treats the request as accepted and deletes
-            // the local audio with no server transcript (data loss).
-            if status == 503 && !strict { return }
+            // Never accepted: the caller keeps the local audio instead of deleting it with no
+            // server transcript (data loss).
+            if status == 503 { throw MinutiaClientError.transcriptionNotConfigured }
             throw MinutiaClientError.serverError(status: status)
         }
     }

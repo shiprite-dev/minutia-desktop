@@ -3,6 +3,7 @@ import AVFoundation
 import Combine
 import FluidAudio
 import OSLog
+import ServiceManagement
 import Sparkle
 import SwiftUI
 import UserNotifications
@@ -124,6 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // AuthManager.ensureConnected is single-flight and idempotent, so this racing MenuContent's
         // own restoreSession() is safe.
         guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
+        if FirstRun.isFirstLaunch(.standard) { AppController.shared.welcomeFirstLaunch() }
         Task { @MainActor in await AppController.shared.restoreSession() }
     }
 
@@ -281,6 +283,7 @@ final class AppController: NSObject, ObservableObject {
     /// Transient in-menu feedback (e.g. a rejected web-record) so the message exists even when
     /// notifications are off. Cleared on the next phase change.
     @Published private(set) var recordFeedback: String?
+    @Published private(set) var showsMenuBarHint = false
     /// True while the startup recovery sweep is finalizing a prior recording's orphaned upload.
     /// Drives a quiet in-menu row and folds recovery into the quit guard.
     @Published private(set) var recoveryActive: Bool = false
@@ -445,6 +448,9 @@ final class AppController: NSObject, ObservableObject {
     nonisolated static func finalizeFailureMessage(for error: Error, host: String?, audioMayLeaveMac: Bool = true) -> String {
         if case MinutiaClientError.featureUnavailable = error {
             return "Transcription is not enabled for this account on \(host ?? "the server"). Your audio is saved. Ask your workspace admin to enable AI features."
+        }
+        if case MinutiaClientError.transcriptionNotConfigured = error {
+            return "Transcription isn't set up on this server yet. Your recording is saved on this Mac."
         }
         switch error as? CaptureSession.CaptureError {
         case .transcriptNotSent?: return "Could not send the transcript. Retry to send it again."
@@ -875,10 +881,20 @@ final class AppController: NSObject, ObservableObject {
         }
     }
 
+    /// The first launch of a fresh install: point at the menu bar, since nothing else appears.
+    func welcomeFirstLaunch() {
+        showsMenuBarHint = true
+        Task {
+            let granted = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+            if granted == true { Self.postNotification(title: "Minutia", body: FirstRun.menuBarHint) }
+        }
+    }
+
     private func handleAuthChange(signedIn: Bool) {
         if signedIn {
             signingOut = false
             apply(.signedIn)
+            FirstRun.defaultLaunchAtLogin(defaults, status: SMAppService.mainApp.status) { try SMAppService.mainApp.register() }
             // apply() no-ops when an instance switch under the same email keeps the phase at .idle,
             // so rebind the detector explicitly: syncDetector re-points its agenda provider at the
             // new instance's client. loadSeries and runRecovery likewise re-run for the new instance.
@@ -1101,17 +1117,17 @@ final class AppController: NSObject, ObservableObject {
 
     private func loadSeries() async {
         guard let client = authManager.client() else { return }
-        guard let owned = try? await client.ownedSeries() else { return }
-        series = owned
+        guard let fetched = try? await client.recordableSeries() else { return }
+        series = fetched
         let last = UserDefaults.standard.string(forKey: Self.lastSeriesKey).flatMap(UUID.init(uuidString:))
-        if let last, owned.contains(where: { $0.id == last }) {
+        if let last, fetched.contains(where: { $0.id == last }) {
             selectedSeriesId = last
-        } else if selectedSeriesId == nil || !owned.contains(where: { $0.id == selectedSeriesId }) {
-            selectedSeriesId = owned.first?.id
+        } else if selectedSeriesId == nil || !fetched.contains(where: { $0.id == selectedSeriesId }) {
+            selectedSeriesId = fetched.first?.id
         }
     }
 
-    /// Re-fetch the owned series so a series created on the web while the app was already open is
+    /// Re-fetch the recordable series so a series created on the web while the app was already open is
     /// picked up. Called when the idle menu appears, the cheapest correct refresh point.
     func reloadSeries() {
         Task { await loadSeries() }

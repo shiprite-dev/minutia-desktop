@@ -35,7 +35,7 @@ struct MenuContent: View {
             Group {
                 switch controller.phase {
                 case .signedOut:
-                    SignInView(authManager: controller.authManager)
+                    SignInView(authManager: controller.authManager, showsMenuBarHint: controller.showsMenuBarHint)
                 case .idle:
                     IdleView(controller: controller, detectedVia: nil)
                 case .detected(let app):
