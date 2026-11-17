@@ -55,9 +55,10 @@ struct DeviceTranscript: Codable, Equatable, Sendable {
     /// when it cannot fit.
     func fitted() -> DeviceTranscript? {
         var current = self
-        while !current.fits {
-            guard current.segments.reduce(0, { $0 + $1.text.utf16.count }) <= Self.maxTotalText else { return nil }
+        while true {
             let bytes = (try? current.encoded().count) ?? .max
+            if current.fits(bytes: bytes) { break }
+            guard current.segments.reduce(0, { $0 + $1.text.utf16.count }) <= Self.maxTotalText else { return nil }
             let wanted = max(1, current.segments.count - Self.maxSegments, (bytes - Self.maxBodyBytes) / 200)
             let merged = current.mergedPairs(limit: wanted)
             guard merged.count < current.segments.count else { return nil }
@@ -67,10 +68,10 @@ struct DeviceTranscript: Codable, Equatable, Sendable {
         return current
     }
 
-    private var fits: Bool {
+    private func fits(bytes: Int) -> Bool {
         segments.count <= Self.maxSegments
             && segments.reduce(0) { $0 + $1.text.utf16.count } <= Self.maxTotalText
-            && ((try? encoded().count) ?? .max) <= Self.maxBodyBytes
+            && bytes <= Self.maxBodyBytes
     }
 
     private func mergedPairs(limit: Int) -> [Segment] {

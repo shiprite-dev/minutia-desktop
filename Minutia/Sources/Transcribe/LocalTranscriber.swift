@@ -176,6 +176,17 @@ actor LocalTranscriber {
         }
     }
 
+    /// Counts saved segment transcripts toward the meeting verdict, so recovery judges the whole meeting.
+    func seed(_ saved: [SegmentTranscript]) {
+        verdicts = saved.map { transcript in
+            QualityGuard.verdict(
+                transcript.segments.compactMap { segment in
+                    segment.confidence.map { SpeechSegment(start: segment.start, end: segment.end, text: segment.text, confidence: $0) }
+                },
+                floor: guardFloor)
+        }
+    }
+
     private func jobFinished() {
         intakeLock.withLock { activeJobs -= 1 }
     }

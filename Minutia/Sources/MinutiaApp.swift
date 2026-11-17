@@ -443,7 +443,7 @@ final class AppController: NSObject, ObservableObject {
             return "Transcription is not enabled for this account on \(host ?? "the server"). Your audio is saved. Ask your workspace admin to enable AI features."
         }
         switch error as? CaptureSession.CaptureError {
-        case .transcriptNotSent?, .transcriptBusy?: return "Could not send the transcript. Retry to send it again."
+        case .transcriptNotSent?: return "Could not send the transcript. Retry to send it again."
         case .localTranscriptionTimedOut?, .transcriptTooLarge?, .transcriptRejected?: return Self.deviceTranscriptFailure
         case .nothingRecorded?: return "Nothing was recorded, so there is no transcript to send."
         default: break
@@ -704,6 +704,7 @@ final class AppController: NSObject, ObservableObject {
 
     private override init() {
         super.init()
+        ModelHub.offlineMode = true
         Self.registerNotificationCategories()
         UNUserNotificationCenter.current().delegate = self
         observeCheckinTriggers()
@@ -737,6 +738,11 @@ final class AppController: NSObject, ObservableObject {
         authManager.$sessionIdentity
             .removeDuplicates()
             .sink { [weak self] identity in self?.handleAuthChange(signedIn: identity.email != nil) }
+            .store(in: &cancellables)
+
+        modelStore.$status
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] status in if case .ready = status { self?.runRecovery() } }
             .store(in: &cancellables)
 
         detector.$confidence
@@ -1186,6 +1192,10 @@ final class AppController: NSObject, ObservableObject {
 
     private func launchCapture(meetingId: String, seriesId: UUID?, announce: Bool, client: MinutiaClient, routing: CaptureRouting) async throws {
         let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
+        if let task = recoveryTask {
+            task.cancel()
+            try? await withTimeout(seconds: 3) { await task.value }
+        }
         try captureSession.start(
             meetingId: meetingId, seriesId: seriesId, userId: userId, client: client,
             decision: routing.decision, deviceOnly: routing.deviceOnly, language: routing.language,
@@ -1209,9 +1219,16 @@ final class AppController: NSObject, ObservableObject {
         let directory = modelStore.directory(for: entry)
         let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
         return LocalTranscriber(source: .onDevice(entry, appVersion: appVersion), language: language, guardFloor: model.guardFloor) {
-            ModelHub.offlineMode = true
-            return try await ParakeetEngine.load(model, from: directory)
+            try await ParakeetEngine.load(model, from: directory)
         }
+    }
+
+    private func recoveryTranscriber(_ manifest: CaptureManifest) throws -> LocalTranscriber? {
+        guard let language = manifest.language, modelStore.manifest.entry(forLanguage: language) != nil else { return nil }
+        guard case .ready = modelStore.status, let transcriber = deviceTranscriber(language: language) else {
+            throw CaptureRecovery.RecoveryError.deferred
+        }
+        return transcriber
     }
 
     private func verifySoleRecorder(meetingId: String, token: Int, client: MinutiaClient) {
@@ -1525,6 +1542,7 @@ final class AppController: NSObject, ObservableObject {
                 recordingSeriesId = nil
                 recordingInstance = nil
                 apply(.finalized)
+                runRecovery()
                 if !early, result.transcriptRequested, let meetingId, let instance, Self.opensRecap(for: reason) {
                     await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance)
                 }
@@ -1585,9 +1603,11 @@ final class AppController: NSObject, ObservableObject {
         case .none:
             break
         }
-        // Drain an in-flight startup recovery sweep too, so Finish & Quit does not abandon a prior
-        // recording's rescue. No-op when nothing is recovering (the task is already nil).
-        await recoveryTask?.value
+        // An in-flight recovery sweep is cancelled and given a moment to stand down; its directories stay for the next launch.
+        if let task = recoveryTask {
+            task.cancel()
+            try? await withTimeout(seconds: 5) { await task.value }
+        }
     }
 
     private func waitWhileFinalizing() async {
@@ -1604,15 +1624,16 @@ final class AppController: NSObject, ObservableObject {
     /// finalize each. Single-flight and best-effort: a failure leaves the directory for a later
     /// launch. The live recording's directory (if any) is never swept.
     private func runRecovery() {
+        if case .recording = phase { return }
         guard recoveryTask == nil, let client = authManager.client(), let instance = authManager.instance else { return }
         let activeId = recordingMeetingId?.uuidString
         recoveryActive = true
         let notepad = notepad
-        recoveryTask = Task { [weak self] in
+        occupyRecoverySlot { [weak self] in
             let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
             let result = await Self.recoverAll(
                 client: client, instance: instance, connectedUserId: userId, excluding: activeId,
-                makeTranscriber: { manifest in await self?.deviceTranscriber(language: manifest.language) },
+                makeTranscriber: { manifest in try await self?.recoveryTranscriber(manifest) },
                 flushNotes: { id in try await notepad.flush(meetingId: id, client: client) })
             await notepad.replayPending(client: client)
             // Recovery is otherwise silent; tell the user each rescued meeting is being finished, and
@@ -1638,7 +1659,19 @@ final class AppController: NSObject, ObservableObject {
                     body: "A saved recording could not be finished after several attempts. The audio is kept in Application Support.")
             }
             self?.recoveryActive = false
-            self?.recoveryTask = nil
+        }
+    }
+
+    private func occupyRecoverySlot(_ work: @escaping @MainActor () async -> Void) {
+        let previous = recoveryTask
+        let task = Task {
+            await withTaskCancellationHandler { await previous?.value } onCancel: { previous?.cancel() }
+            await work()
+        }
+        recoveryTask = task
+        Task {
+            await task.value
+            if recoveryTask == task { recoveryTask = nil }
         }
     }
 
@@ -1651,15 +1684,13 @@ final class AppController: NSObject, ObservableObject {
         case unreadable
         case retryLater
         case keptOnThisMac
-        case busy
         case deferred
     }
 
     nonisolated static func recoveryOutcome(for error: Error?) -> RecoveryOutcome {
         guard let error else { return .recovered }
         if case MinutiaClientError.featureUnavailable = error { return .transcriptionUnavailable }
-        if case MinutiaClientError.serverError(status: 409) = error { return .busy }
-        if case CaptureSession.CaptureError.transcriptBusy? = error as? CaptureSession.CaptureError { return .busy }
+        if error is CancellationError || error as? CaptureRecovery.RecoveryError == .deferred { return .deferred }
         if let recoveryError = error as? CaptureRecovery.RecoveryError,
            recoveryError == .unreadableRecording { return .unreadable }
         if error as? CaptureRecovery.RecoveryError == .audioStaysOnThisMac { return .keptOnThisMac }
@@ -1700,7 +1731,7 @@ final class AppController: NSObject, ObservableObject {
         case .unreadable:
             updated.recoveryAttempts = maxRecoveryAttempts
             return SweepStep(save: updated, report: .exhausted)
-        case .busy, .deferred:
+        case .deferred:
             return SweepStep(save: nil, report: nil)
         case .retryLater:
             updated.recoveryAttempts = sweep.nextAttempts
@@ -1769,6 +1800,7 @@ final class AppController: NSObject, ObservableObject {
             } catch {
                 caught = error
             }
+            if Task.isCancelled, caught != nil { break }
             let outcome = recoveryOutcome(for: caught)
             let step = sweepStep(manifest: manifest, outcome: outcome, sweep: sweep)
             if let save = step.save { CaptureRecovery.saveManifest(save, to: dir) }
@@ -1784,7 +1816,7 @@ final class AppController: NSObject, ObservableObject {
                 logger.error("Recovery: unreadable recording for meeting \(manifest.meetingId, privacy: .public)")
             case .retryLater:
                 logger.error("Recovery deferred for meeting \(manifest.meetingId, privacy: .public) attempt \(sweep.nextAttempts, privacy: .public): \(String(describing: caught), privacy: .public)")
-            case .keptOnThisMac, .busy, .deferred:
+            case .keptOnThisMac, .deferred:
                 break
             }
             switch step.report {
@@ -1844,7 +1876,8 @@ final class AppController: NSObject, ObservableObject {
     private func refinalize(meetingId: String) {
         guard case .error = phase, let client = authManager.client() else { return }
         apply(.refinalizeStarted)
-        Task {
+        occupyRecoverySlot { [self] in
+            defer { captureSession.endFinishing() }
             do {
                 let dir = try CaptureStore.capturesRoot()
                     .appendingPathComponent(meetingId.lowercased(), isDirectory: true)
@@ -1853,8 +1886,9 @@ final class AppController: NSObject, ObservableObject {
                 }
                 try await CaptureRecovery.recover(
                     directory: dir, manifest: manifest, client: client,
-                    makeTranscriber: { [weak self] in await self?.deviceTranscriber(language: $0.language) },
-                    flushNotes: { [notepad] in try await notepad.flush(meetingId: meetingId, client: client) })
+                    makeTranscriber: { [weak self] in try await self?.recoveryTranscriber($0) },
+                    flushNotes: { [notepad] in try await notepad.flush(meetingId: meetingId, client: client) },
+                    onStep: captureSession.finishingStepReporter())
                 try? FileManager.default.removeItem(at: dir)
                 if let notesRoot = try? NotepadStore.notesRoot() {
                     NotepadStore.removeIfSynced(meetingId: meetingId, in: notesRoot)
