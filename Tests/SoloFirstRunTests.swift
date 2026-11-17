@@ -120,6 +120,21 @@ final class SoloFirstRunTests: XCTestCase {
         XCTAssertEqual(controller.selectedSeriesId, standup.id)
     }
 
+    func test_afterTheStandupEnds_theNextUnscheduledCallRecordsIntoTheLastUsedSeries() {
+        defaults.set(weekly.id.uuidString, forKey: AppController.lastSeriesKey)
+        let controller = signedInController(series: [weekly, standup])
+        controller.detector.liveAgendaItem = happeningNow("Daily standup", standup)
+        controller.handleDetection(.high(.zoom))
+        XCTAssertEqual(controller.selectedSeriesId, standup.id)
+
+        controller.handleDetection(.none)
+        controller.detector.liveAgendaItem = nil
+        controller.handleDetection(.high(.zoom))
+
+        XCTAssertEqual(controller.meetingPromptPanel.content?.title, "Looks like you're in a Zoom meeting")
+        XCTAssertEqual(controller.selectedSeriesId, weekly.id)
+    }
+
     func test_theCalendarCatchingUp_doesNotOverrideAManualPick() {
         let controller = signedInController(series: [weekly, standup])
         controller.handleDetection(.high(.zoom))

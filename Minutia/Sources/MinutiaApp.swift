@@ -969,6 +969,10 @@ final class AppController: NSObject, ObservableObject {
             // prompt session so the next meeting can prompt again.
             if case .detected = phase { apply(.dismissedDetection) }
             resetMeetingPromptSession()
+            if !seriesPickedThisMeeting, MeetingPrompt.canPrompt(phase: phase) {
+                let ids = series.map(\.id)
+                selectedSeriesId = lastUsedSeriesId.flatMap { ids.contains($0) ? $0 : nil } ?? ids.first
+            }
             seriesPickedThisMeeting = false
         case .soft:
             // Quiet by design: no phase change, no prompt, just the menu bar hint.
@@ -992,6 +996,10 @@ final class AppController: NSObject, ObservableObject {
         selectLiveMeetingSeries()
         guard meetingPromptPanel.content != nil, let item else { return }
         presentMeetingPrompt(MeetingPrompt.content(for: app, meeting: item.title))
+    }
+
+    private var lastUsedSeriesId: UUID? {
+        defaults.string(forKey: Self.lastSeriesKey).flatMap(UUID.init(uuidString:))
     }
 
     /// The Series picker: the user's own choice, remembered as last-used.
@@ -1180,8 +1188,7 @@ final class AppController: NSObject, ObservableObject {
     func seriesLoaded(_ fetched: [Series]) {
         series = fetched
         let ids = fetched.map(\.id)
-        let last = defaults.string(forKey: Self.lastSeriesKey).flatMap(UUID.init(uuidString:))
-        selectedSeriesId = [selectedSeriesId, last].compactMap { $0 }.first(where: ids.contains) ?? ids.first
+        selectedSeriesId = [selectedSeriesId, lastUsedSeriesId].compactMap { $0 }.first(where: ids.contains) ?? ids.first
         if case .high = lastConfidence, MeetingPrompt.canPrompt(phase: phase) { selectLiveMeetingSeries() }
     }
 
