@@ -62,3 +62,26 @@ final class PanelRig {
         controller.presentRecapCue(cue)
     }
 }
+
+actor ManualClock {
+    private var now: TimeInterval = 0
+    private var sleepers: [(due: TimeInterval, resume: CheckedContinuation<Void, Never>)] = []
+
+    var sleeping: Int { sleepers.count }
+
+    func sleep(_ seconds: TimeInterval) async {
+        let due = now + seconds
+        await withCheckedContinuation { sleepers.append((due, $0)) }
+    }
+
+    func advance(_ seconds: TimeInterval) {
+        now += seconds
+        let due = sleepers.filter { $0.due <= now }
+        sleepers.removeAll { $0.due <= now }
+        due.forEach { $0.resume.resume() }
+    }
+
+    func waitForSleepers(_ count: Int) async {
+        for _ in 0..<200 where sleepers.count < count { try? await Task.sleep(nanoseconds: 10_000_000) }
+    }
+}

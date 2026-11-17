@@ -301,6 +301,7 @@ final class AppController: NSObject, ObservableObject {
     func panelClosed() { panelOpen = false }
     var announce: (String) -> Void = { AccessibilityNotification.Announcement($0).post() }
     var recapHold: () -> TimeInterval = { Celebration.hold(reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion) }
+    var sleep: (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }
     private var recapExpiry: Task<Void, Never>?
     @Published private(set) var selectedSeriesId: UUID?
     /// The user chose a series during the current detected meeting; detection then leaves it alone.
@@ -1671,7 +1672,7 @@ final class AppController: NSObject, ObservableObject {
         announce("Sent. Your recap is on its way")
         let hold = recapHold()
         recapExpiry = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(hold * 1_000_000_000))
+            await self?.sleep(hold)
             if !Task.isCancelled { self?.clearRecapCue() }
         }
     }

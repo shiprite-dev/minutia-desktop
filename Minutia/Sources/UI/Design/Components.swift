@@ -75,11 +75,7 @@ struct Eyebrow: View {
             if live {
                 let dot = Circle().fill(Brand.vermilion).frame(width: 6, height: 6)
                 if Loops.isRunning(visible: visible, reduceMotion: reduceMotion) {
-                    dot.phaseAnimator([1.0, 0.45]) { view, opacity in
-                        view.opacity(opacity)
-                    } animation: { _ in
-                        .easeInOut(duration: 1)
-                    }
+                    Pulse(period: 2) { dot.opacity(1 - 0.55 * $0) }
                 } else {
                     dot
                 }

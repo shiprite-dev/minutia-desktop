@@ -8,6 +8,7 @@ import os
 /// inside `CapturePipeline`.
 @MainActor
 final class CaptureSession: ObservableObject {
+    nonisolated static let ringHeadroomSeconds = 5
     @Published private(set) var elapsed: TimeInterval = 0
     @Published private(set) var level: Float = 0
     @Published private(set) var segmentsUploaded = 0
@@ -712,7 +713,7 @@ private final class CapturePipeline {
     private static let logger = Logger(subsystem: "app.minutia.desktop", category: "CapturePipeline")
 
     init(directory: URL) throws {
-        let capacity = Int(MixPlan.sampleRate) * 5   // 5s of headroom per source
+        let capacity = Int(MixPlan.sampleRate) * CaptureSession.ringHeadroomSeconds
         micBuffer = RingBuffer(capacityFrames: capacity)
         sysBuffer = RingBuffer(capacityFrames: capacity)
         writer = try SegmentWriter(directory: directory)

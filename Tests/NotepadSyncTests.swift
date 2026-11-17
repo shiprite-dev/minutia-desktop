@@ -45,6 +45,12 @@ final class NotepadSyncTests: XCTestCase {
             now: now))
     }
 
+    func test_notesTypedWithoutAPause_stillReachTheServerWithinFifteenSeconds() {
+        let now = Date()
+        XCTAssertTrue(NotepadSyncPolicy.shouldSync(
+            needsSync: true, inFlight: false, lastEditAt: now, firstUnsyncedEditAt: now.addingTimeInterval(-15), now: now))
+    }
+
     // MARK: - Retry backoff
 
     func test_retryDelay_doublesAndCaps() {

@@ -64,6 +64,12 @@ final class DesignTokensTests: XCTestCase {
         }
     }
 
+    func test_loopsGate_runsOnlyWhileTheMenuIsOpenAndMotionIsAllowed() {
+        XCTAssertTrue(Loops.isRunning(visible: true, reduceMotion: false))
+        XCTAssertFalse(Loops.isRunning(visible: false, reduceMotion: false))
+        XCTAssertFalse(Loops.isRunning(visible: true, reduceMotion: true))
+    }
+
     func test_fraunces_isBundledAndResolves() {
         XCTAssertTrue(Typo.frauncesAvailable)
     }

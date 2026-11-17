@@ -96,6 +96,18 @@ final class SeenMatcherTests: XCTestCase {
         XCTAssertFalse(seen("Downloading model 4%").has("Downloading model 42%"))
     }
 
+    func test_rejectsANegatedOrExtendedVersionOfTheSentence() {
+        XCTAssertFalse(seen("Not sent. Your recap is on its way").has("Sent. Your recap is on its way"))
+        XCTAssertFalse(seen("Unsent. Your recap is on its way").has("Sent. Your recap is on its way"))
+        XCTAssertFalse(seen("Couldn't send. Never sent. Your recap is on its way").has("Sent. Your recap is on its way"))
+        XCTAssertFalse(seen("Downloading model 42%").has("Downloading model 4"))
+        XCTAssertFalse(seen("Transcribing on this Mac, 3 of 120").has("Transcribing on this Mac, 3 of 12"))
+        XCTAssertFalse(seen("Recording").has("Record"))
+        XCTAssertFalse(seen("Retrying").has("Retry"))
+        XCTAssertTrue(seen("Sent. Your recap is on its way").has("Sent. Your recap is on its way"))
+        XCTAssertTrue(seen("Retry Dismiss").has("Retry"))
+    }
+
     func test_rejectsAConfusionThatIsNotADocumentedGlyphPair() {
         XCTAssertFalse(seen("Recora a meeting").has("Record a meeting"))
         XCTAssertFalse(seen("Sign in with browser").has("Sign in with brower"))

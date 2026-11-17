@@ -188,59 +188,73 @@ struct Seen {
         "\u{043C}": "m", "\u{0442}": "t", "\u{043D}": "h", "\u{043A}": "k", "\u{0432}": "b",
     ]
 
-    private static func normalize(_ value: String) -> String {
+    private static let negations: Set<String> = ["not", "no", "never", "cannot", "without", "t"]
+
+    private static func tokens(_ value: String) -> [String] {
         let folded = String(value.lowercased().map { homoglyphs[$0] ?? $0 }.map { $0 == "|" || $0 == "i" ? "l" : $0 })
-        return folded.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }.joined(separator: " ")
-            .replacingOccurrences(of: "rn", with: "m")
+        return folded.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
+            .map { $0.replacingOccurrences(of: "rn", with: "m") }
     }
 
-    func has(_ expected: String) -> Bool {
-        let needle = Self.normalize(expected)
-        return !needle.isEmpty && Self.normalize(text).contains(needle)
+    private static func contains(_ haystack: [String], _ needle: [String]) -> Bool {
+        guard !needle.isEmpty, haystack.count >= needle.count else { return false }
+        return (0...(haystack.count - needle.count)).contains { start in
+            haystack[start..<start + needle.count].elementsEqual(needle) && !(start > 0 && negations.contains(haystack[start - 1]))
+        }
     }
+
+    func has(_ expected: String) -> Bool { Self.contains(Self.tokens(text), Self.tokens(expected)) }
 
     func frame(of expected: String) -> CGRect? { frames(of: expected).first }
 
     func frames(of expected: String) -> [CGRect] {
-        frames.filter { Self.normalize($0.0).contains(Self.normalize(expected)) }.map(\.1)
+        let needle = Self.tokens(expected)
+        return frames.filter { Self.contains(Self.tokens($0.0), needle) }.map(\.1)
     }
+}
+
+final class LoopClockBox: ObservableObject {
+    @Published var date: Date?
+}
+
+private struct Dated: View {
+    @ObservedObject var box: LoopClockBox
+    let content: AnyView
+
+    var body: some View { content.environment(\.loopDate, box.date) }
 }
 
 @MainActor
 final class LivePanel {
+    private let box = LoopClockBox()
     private let hosting: NSHostingView<AnyView>
     private let window: NSWindow
 
     init<V: View>(_ root: V) {
-        hosting = NSHostingView(rootView: AnyView(root.background(Host.backdrop(dark: false)).environment(\.colorScheme, .light)))
+        let content = AnyView(root.background(Host.backdrop(dark: false)).environment(\.colorScheme, .light))
+        hosting = NSHostingView(rootView: AnyView(Dated(box: box, content: content)))
         hosting.appearance = NSAppearance(named: .aqua)
         hosting.frame = NSRect(origin: .zero, size: hosting.fittingSize)
         window = NSWindow(contentRect: hosting.frame, styleMask: [.borderless], backing: .buffered, defer: false)
         window.appearance = hosting.appearance
         window.contentView = hosting
-        window.orderFront(nil)
         spin(0.5)
     }
 
-    deinit { MainActor.assumeIsolated { window.orderOut(nil) } }
-
     func spin(_ seconds: TimeInterval) { RunLoop.current.run(until: Date().addingTimeInterval(seconds)) }
-
-    func changedBytesBetweenFrames(count: Int = 5, interval: TimeInterval = 0.2) -> [Int] {
-        hosting.layoutSubtreeIfNeeded()
-        var previous = Host.capture(hosting, scale: 1)
-        var changes: [Int] = []
-        for _ in 0..<count {
-            spin(interval)
-            hosting.layoutSubtreeIfNeeded()
-            let next = Host.capture(hosting, scale: 1)
-            if let previous, let next { changes.append(Host.differingBytes(previous, next)) }
-            previous = next
-        }
-        return changes
-    }
 
     func detach() { window.contentView = NSView() }
 
     func attach() { window.contentView = hosting }
+
+    func image(atLoopTime seconds: TimeInterval) -> CGImage {
+        box.date = Date(timeIntervalSinceReferenceDate: seconds)
+        spin(0.3)
+        hosting.layoutSubtreeIfNeeded()
+        return Host.capture(hosting)!
+    }
+
+    func animates() -> Bool {
+        Host.differingBytes(image(atLoopTime: 0), image(atLoopTime: 0.45)) > 0
+    }
 }

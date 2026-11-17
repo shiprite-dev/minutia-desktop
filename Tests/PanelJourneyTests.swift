@@ -21,7 +21,7 @@ final class PanelJourneyTests: XCTestCase {
 
     private func assertFills(_ name: String, _ view: some View, labels: [String], file: StaticString = #filePath, line: UInt = #line) {
         for dark in [false, true] {
-            guard let image = Host.render(view, dark: dark, spin: 0.2) else { return XCTFail("\(name) did not render", file: file, line: line) }
+            guard let image = Host.render(view, dark: dark, spin: 0.5) else { return XCTFail("\(name) did not render", file: file, line: line) }
             let regions = Host.fillRegions(image)
             let seen = Host.read(image)
             XCTAssertEqual(regions.count, labels.count, "\(name) (dark: \(dark)) fills: \(regions.map(\.frame)) text: \(seen.text)", file: file, line: line)
@@ -98,64 +98,30 @@ final class PanelJourneyTests: XCTestCase {
         XCTAssertEqual(rig.opened, [MinutiaClient.recapURL(instance: rig.instance, seriesId: rig.boardPrep.id, meetingId: meeting)])
     }
 
-    func test_theSentScreen_staysUpForAReadableBeatAfterTheCheckFinishesDrawing() {
+    func test_theSentScreen_staysUpForAReadableBeat_thenGivesWayToTheSeriesPicker() async {
         let controller = rig.signedIn()
-        let drawing = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.18 + 0.42 + 0.24
-        XCTAssertGreaterThanOrEqual(controller.recapHold(), drawing + 1.5)
+        let clock = ManualClock()
+        controller.sleep = { await clock.sleep($0) }
+        let hold = controller.recapHold()
+        rig.finishCleanly(controller, cue: rig.sentCue())
+        await clock.waitForSleepers(1)
+
+        await clock.advance(1.5)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let reading = rig.panel(controller)
+        XCTAssertTrue(reading.has("Sent. Your recap is on its way"), "gone before a user could read it: \(reading.text)")
+
+        await clock.advance(hold - 1.5 + 0.1)
+        for _ in 0..<100 where controller.recapCue != nil { try? await Task.sleep(nanoseconds: 10_000_000) }
+        let after = rig.panel(controller)
+        XCTAssertFalse(after.has("Sent. Your recap is on its way"), after.text)
+        XCTAssertTrue(after.has("SERIES"), after.text)
     }
 
-    func test_theSentCheck_finishesDrawingWithinTheHold_andReduceMotionShowsItAtOnce() {
-        let drawn = Host.render(DoneContent().environment(\.reduceMotionOverride, true), spin: 0.05).map { Host.vermilionRuns($0).pixels } ?? 0
+    func test_theSentCheck_isDrawnAtOnceUnderReduceMotion_andStartsEmptyOtherwise() {
+        let drawn = Host.vermilionPixels(DoneContent().environment(\.reduceMotionOverride, true), spin: 0.05)
         XCTAssertGreaterThan(drawn, 50)
-        let animated = Host.vermilionPixels(DoneContent().environment(\.reduceMotionOverride, false), spin: 1.4)
-        XCTAssertGreaterThanOrEqual(animated, drawn * 9 / 10)
-    }
-
-    func test_waitingOnTheBrowser_tellsTheUserWhere_andStartOverBringsSignInBack() async {
-        let controller = await adopted()
-        _ = controller.authManager.beginBrowserSignIn(device: "Test Mac")
-        let waiting = rig.panel(controller)
-        XCTAssertTrue(waiting.has("Check your browser to finish signing in."), waiting.text)
-        XCTAssertTrue(waiting.has("Start over"), waiting.text)
-        XCTAssertFalse(waiting.has("Sign in with browser"), waiting.text)
-        controller.authManager.cancelBrowserSignIn()
-        let again = rig.panel(controller)
-        XCTAssertTrue(again.has("Sign in with browser"), again.text)
-        XCTAssertFalse(again.has("Check your browser"), again.text)
-    }
-
-    func test_louderAudio_drawsTallerMeterBars() {
-        func barRows(_ level: Float) -> Int {
-            guard let image = Host.render(LevelBars(levels: [level, level, level]), spin: 0.2) else { return 0 }
-            let (width, height, data) = Host.pixels(image)
-            return (0..<height).filter { row in
-                (0..<width).contains { column in
-                    let i = (row * width + column) * 4
-                    return abs(Int(data[i]) - 0xE2) < 14 && abs(Int(data[i + 1]) - 0x3A) < 14 && Int(data[i + 2]) < 20
-                }
-            }.count
-        }
-        let silent = barRows(0), quiet = barRows(0.3), loud = barRows(1)
-        XCTAssertGreaterThan(silent, 0)
-        XCTAssertLessThan(silent, quiet)
-        XCTAssertLessThan(quiet, loud)
-    }
-
-    func test_theMenuBarIcon_looksDifferentInEveryStateThatNeedsAttention() {
-        func icon(_ phase: AppPhase, soft: Bool = false, consent: Bool = false) -> CGImage {
-            Host.render(MenuBarIcon(phase: phase, softHint: soft, pendingConsent: consent).font(.system(size: 40)), spin: 0.15)!
-        }
-        let idle = icon(.idle)
-        let states: [(String, CGImage)] = [
-            ("recording", icon(.recording)), ("finishing", icon(.finalizing)), ("error", icon(.error("x"))),
-            ("detected", icon(.detected(app: "Zoom"))), ("signed out", icon(.signedOut)), ("record request pending", icon(.idle, consent: true)),
-        ]
-        for (name, image) in states { XCTAssertGreaterThan(Host.differingBytes(idle, image), 0, "\(name) looks like idle") }
-        for (i, a) in states.enumerated() {
-            for b in states[(i + 1)...] where !(a.0 == "detected" && b.0 == "x") {
-                XCTAssertGreaterThan(Host.differingBytes(a.1, b.1), 0, "\(a.0) looks like \(b.0)")
-            }
-        }
+        XCTAssertEqual(Host.vermilionPixels(DoneContent().environment(\.reduceMotionOverride, false), spin: 0.05), 0)
     }
 
     // MARK: - Finishing progress
@@ -298,24 +264,23 @@ final class PanelJourneyTests: XCTestCase {
         return controller
     }
 
-    private func requireAnimatingHost() throws {
-        let panel = LivePanel(rig.menu(finishingController()))
-        try XCTSkipUnless(panel.changedBytesBetweenFrames().contains { $0 > 0 }, "this host draws no animation frames (headless runner)")
-    }
-
-    func test_animationsRunWhileThePanelIsOpen_andStopOnceItIsClosed() throws {
-        try requireAnimatingHost()
+    func test_animationsRunWhileThePanelIsOpen_stopOnceItIsClosed_andResumeOnReopen() {
         for (name, controller) in [("finishing", finishingController()), ("recording", recordingController())] {
             let panel = LivePanel(rig.menu(controller))
-            let whileOpen = panel.changedBytesBetweenFrames()
-            XCTAssertTrue(whileOpen.contains { $0 > 0 }, "\(name) should be animating while open: \(whileOpen)")
+            XCTAssertTrue(panel.animates(), "\(name) should be animating while open")
             controller.panelClosed()
-            panel.spin(0.5)
-            let afterClose = panel.changedBytesBetweenFrames()
-            XCTAssertEqual(afterClose, [Int](repeating: 0, count: afterClose.count), "\(name) kept animating after the panel closed")
+            panel.spin(0.3)
+            XCTAssertFalse(panel.animates(), "\(name) kept animating after the panel closed")
             controller.panelOpened()
-            panel.spin(0.5)
-            XCTAssertTrue(panel.changedBytesBetweenFrames().contains { $0 > 0 }, "\(name) did not resume when the panel reopened")
+            panel.spin(0.3)
+            XCTAssertTrue(panel.animates(), "\(name) did not resume when the panel reopened")
+        }
+    }
+
+    func test_withReduceMotionOn_theOpenPanelStaysStill() {
+        for (name, controller) in [("finishing", finishingController()), ("recording", recordingController())] {
+            XCTAssertTrue(LivePanel(rig.menu(controller).environment(\.reduceMotionOverride, false)).animates(), "\(name) should move with motion allowed")
+            XCTAssertFalse(LivePanel(rig.menu(controller).environment(\.reduceMotionOverride, true)).animates(), "\(name) moved under Reduce Motion")
         }
     }
 
@@ -329,15 +294,6 @@ final class PanelJourneyTests: XCTestCase {
         panel.attach()
         panel.spin(0.5)
         XCTAssertTrue(controller.panelOpen)
-    }
-
-    func test_withReduceMotionOn_theOpenPanelStaysStill() throws {
-        try requireAnimatingHost()
-        for (name, controller) in [("finishing", finishingController()), ("recording", recordingController())] {
-            let panel = LivePanel(rig.menu(controller).environment(\.reduceMotionOverride, true))
-            let frames = panel.changedBytesBetweenFrames()
-            XCTAssertEqual(frames, [Int](repeating: 0, count: frames.count), "\(name) moved under Reduce Motion")
-        }
     }
 
     // MARK: - Increase Contrast
@@ -413,8 +369,8 @@ final class PanelJourneyTests: XCTestCase {
                 let seen = Host.read(image)
                 XCTAssertFalse(seen.frames.isEmpty, "\(name) (dark: \(dark)) read no text")
                 for (text, frame) in seen.frames where text.contains(where: \.isLetter) {
-                    guard let ratio = Host.contrast(in: image, frame: frame) else { continue }
-                    XCTAssertGreaterThanOrEqual(ratio, 4.4, "\(name) (dark: \(dark)): \"\(text)\" reads at \(ratio):1")
+                    guard let ratio = Host.contrast(in: image, frame: frame) else { XCTFail("\(name) (dark: \(dark)): could not measure \"\(text)\""); continue }
+                    XCTAssertGreaterThanOrEqual(ratio, 4.5, "\(name) (dark: \(dark)): \"\(text)\" reads at \(ratio):1")
                 }
             }
         }

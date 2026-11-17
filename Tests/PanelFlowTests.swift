@@ -166,10 +166,14 @@ final class PanelFlowTests: XCTestCase {
 
     func test_sentScreen_expiresEvenIfThePanelWasNeverOpened() async {
         let controller = signedIn()
-        controller.recapHold = { 0.15 }
+        let clock = ManualClock()
+        controller.sleep = { await clock.sleep($0) }
+        let hold = controller.recapHold()
         finishCleanly(controller, cue: sentCue())
         XCTAssertNotNil(controller.recapCue)
-        try? await Task.sleep(nanoseconds: 600_000_000)
+        await clock.waitForSleepers(1)
+        await clock.advance(hold + 0.1)
+        for _ in 0..<100 where controller.recapCue != nil { try? await Task.sleep(nanoseconds: 10_000_000) }
         XCTAssertNil(controller.recapCue)
         let seen = panel(controller)
         XCTAssertTrue(seen.has("SERIES"), seen.text)
@@ -178,16 +182,22 @@ final class PanelFlowTests: XCTestCase {
 
     func test_aNewerCue_isNotClearedByTheOlderOnesTimer() async {
         let controller = signedIn()
-        controller.recapHold = { 0.3 }
+        let clock = ManualClock()
+        controller.sleep = { await clock.sleep($0) }
+        let hold = controller.recapHold()
         finishCleanly(controller, cue: sentCue())
-        try? await Task.sleep(nanoseconds: 200_000_000)
+        await clock.waitForSleepers(1)
+        await clock.advance(hold - 0.5)
         controller.apply(.recordStarted)
         controller.apply(.recordStopped)
         controller.apply(.finalized)
         controller.presentRecapCue(sentCue())
-        try? await Task.sleep(nanoseconds: 200_000_000)
+        await clock.waitForSleepers(2)
+        await clock.advance(0.6)
+        try? await Task.sleep(nanoseconds: 100_000_000)
         XCTAssertNotNil(controller.recapCue, "the first timer must not clear the second cue")
-        try? await Task.sleep(nanoseconds: 400_000_000)
+        await clock.advance(hold)
+        for _ in 0..<100 where controller.recapCue != nil { try? await Task.sleep(nanoseconds: 10_000_000) }
         XCTAssertNil(controller.recapCue)
     }
 
