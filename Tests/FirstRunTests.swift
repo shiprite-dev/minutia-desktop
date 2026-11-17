@@ -39,6 +39,32 @@ final class FirstRunTests: XCTestCase {
         XCTAssertEqual(registrations.count, 0)
     }
 
+    /// A build from before device ids still left its instance or last series behind.
+    func test_anInstallWithEarlierStateButNoDeviceId_isTreatedAsExisting() {
+        for key in [InstanceConfig.storageKey, AppController.lastSeriesKey] {
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set("x", forKey: key)
+            XCTAssertFalse(FirstRun.isFirstLaunch(defaults), key)
+
+            let registrations = Registrations()
+            FirstRun.defaultLaunchAtLogin(defaults, status: .notRegistered) { registrations.count += 1 }
+            XCTAssertEqual(registrations.count, 0, key)
+        }
+    }
+
+    /// Run from the DMG or Downloads, registering fails; moved to Applications, the next sign-in tries again.
+    func test_aFailedOrImpossibleRegistration_staysUndecided_andRetriesNextSignIn() {
+        _ = FirstRun.isFirstLaunch(defaults)
+        struct Failure: Error {}
+        FirstRun.defaultLaunchAtLogin(defaults, status: .notRegistered) { throw Failure() }
+        FirstRun.defaultLaunchAtLogin(defaults, status: .notFound) { XCTFail("not registrable") }
+        let registrations = Registrations()
+        FirstRun.defaultLaunchAtLogin(defaults, status: .notRegistered) { registrations.count += 1 }
+        XCTAssertEqual(registrations.count, 1)
+        FirstRun.defaultLaunchAtLogin(defaults, status: .notRegistered) { registrations.count += 1 }
+        XCTAssertEqual(registrations.count, 1)
+    }
+
     func test_theFirstSignIn_turnsLaunchAtLoginOn() {
         _ = FirstRun.isFirstLaunch(defaults)
         let registrations = Registrations()

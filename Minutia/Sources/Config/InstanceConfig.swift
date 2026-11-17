@@ -11,7 +11,7 @@ struct InstanceMeta: Codable, Equatable {
 /// Only public data lives here; the session secret stays in the Keychain via supabase-swift.
 enum InstanceConfig {
     static var defaults: UserDefaults = .standard
-    private static let storageKey = "app.minutia.instance"
+    static let storageKey = "app.minutia.instance"
 
     /// The managed cloud instance the companion connects to by default. Self-hosters
     /// change this to their own instance in Settings, which persists and thereafter wins.
