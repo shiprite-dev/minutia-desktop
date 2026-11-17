@@ -61,6 +61,17 @@ struct MenuContent: View {
     }
 }
 
+struct MenuLink: Equatable {
+    let title: String
+    let url: URL
+
+    /// An account with no series yet: connect a calendar (its meetings become series), or make one.
+    static func emptySeries(instance: URL) -> (primary: MenuLink, secondary: MenuLink) {
+        (MenuLink(title: "Connect Google Calendar", url: instance.appendingPathComponent("api/auth/google")),
+         MenuLink(title: "Create a series", url: instance.appendingPathComponent("series")))
+    }
+}
+
 private struct ModelStatusRow: View {
     @ObservedObject var store: ModelStore
 
@@ -98,20 +109,21 @@ private struct IdleView: View {
             }
 
             if controller.series.isEmpty {
+                let links = MenuLink.emptySeries(instance: controller.authManager.instance ?? InstanceConfig.resolvedInstance)
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("No series yet. Create one in Minutia on the web.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Button("Open Minutia") {
-                        NSWorkspace.shared.open(controller.authManager.instance ?? InstanceConfig.resolvedInstance)
+                    Button {
+                        NSWorkspace.shared.open(links.primary.url)
+                    } label: {
+                        Label(links.primary.title, systemImage: "calendar")
+                            .frame(maxWidth: .infinity)
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
+                    .buttonStyle(.borderedProminent)
+                    Button(links.secondary.title) { NSWorkspace.shared.open(links.secondary.url) }
+                        .buttonStyle(.link)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                Picker("Series", selection: $controller.selectedSeriesId) {
+                Picker("Series", selection: Binding(get: { controller.selectedSeriesId }, set: controller.pickSeries)) {
                     ForEach(controller.series) { series in
                         Text(series.name).tag(Optional(series.id))
                     }

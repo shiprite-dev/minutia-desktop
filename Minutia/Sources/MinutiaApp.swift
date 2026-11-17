@@ -287,13 +287,14 @@ final class AppController: NSObject, ObservableObject {
     /// True while the startup recovery sweep is finalizing a prior recording's orphaned upload.
     /// Drives a quiet in-menu row and folds recovery into the quit guard.
     @Published private(set) var recoveryActive: Bool = false
-    @Published var selectedSeriesId: UUID? {
-        didSet {
-            UserDefaults.standard.set(selectedSeriesId?.uuidString, forKey: Self.lastSeriesKey)
-        }
-    }
+    @Published private(set) var selectedSeriesId: UUID?
+    /// The user chose a series during the current detected meeting; detection then leaves it alone.
+    private var seriesPickedThisMeeting = false
+    /// Record points at a calendar meeting's series rather than the user's own choice; once that
+    /// meeting is over it goes back to last-used.
+    private var seriesFromDetection = false
 
-    let authManager = AuthManager()
+    let authManager: AuthManager
     let captureSession = CaptureSession()
     let notepad = NotepadController()
     let detector = MeetingDetector()
@@ -640,7 +641,7 @@ final class AppController: NSObject, ObservableObject {
     /// is set the moment the panel shows or is dismissed and cleared only when the mic goes inactive
     /// (confidence returns to `.none`), giving one prompt per continuous mic session. The panel wrapper
     /// creates no AppKit window until `show`, so holding it costs nothing under the headless test host.
-    private let meetingPromptPanel = MeetingPromptPanel()
+    let meetingPromptPanel = MeetingPromptPanel()
     private var promptSuppressedForSession = false
     private var promptExpiryTimer: Timer?
 
@@ -676,7 +677,9 @@ final class AppController: NSObject, ObservableObject {
     /// Single-flight guard for the startup recovery sweep.
     private var recoveryTask: Task<Void, Never>?
     private var recoverySlot = RecoverySlot()
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
+    private let openURL: (URL) -> Void
+    private let micCheck: () -> (status: AVAuthorizationStatus, hasInputDevice: Bool)
     private var screenLocked = false
     private var asleep = false
     private var checkinInFlight = false
@@ -732,7 +735,17 @@ final class AppController: NSObject, ObservableObject {
 
     private var canBeginRecording: Bool { !startInFlight && !signingOut && Self.canStartRecording(from: phase) }
 
-    private override init() {
+    init(
+        defaults: UserDefaults = .standard,
+        openURL: @escaping (URL) -> Void = { NSWorkspace.shared.open($0) },
+        micCheck: @escaping () -> (status: AVAuthorizationStatus, hasInputDevice: Bool) = {
+            (AVCaptureDevice.authorizationStatus(for: .audio), AVCaptureDevice.default(for: .audio) != nil)
+        }
+    ) {
+        self.defaults = defaults
+        self.authManager = AuthManager(defaults: defaults)
+        self.openURL = openURL
+        self.micCheck = micCheck
         super.init()
         ModelHub.offlineMode = true
         Self.registerNotificationCategories()
@@ -780,6 +793,12 @@ final class AppController: NSObject, ObservableObject {
             .sink { [weak self] confidence in self?.handleDetection(confidence) }
             .store(in: &cancellables)
 
+        detector.$liveAgendaItem
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] item in self?.liveMeetingChanged(item) }
+            .store(in: &cancellables)
+
         // Raw per-poll signals drive local end-detection while a recording keeps the mic active.
         detector.onRawSignals = { [weak self] signals in self?.handleRawSignals(signals) }
     }
@@ -799,11 +818,12 @@ final class AppController: NSObject, ObservableObject {
 
     // MARK: - Phase transitions
 
-    private func apply(_ event: AppEvent) {
+    func apply(_ event: AppEvent) {
         let next = phase.next(event)
         guard next != phase else { return }
         let previous = phase
         phase = next
+        restoreLastUsedAfterDetectedMeeting()
         switch Self.modelStoreCue(from: previous, to: next, signedIn: authManager.sessionIdentity.email != nil) {
         case .pause: modelStore.recordingDidStart()
         case .resume: Task { await modelStore.recordingDidStop() }
@@ -884,10 +904,6 @@ final class AppController: NSObject, ObservableObject {
     /// The first launch of a fresh install: point at the menu bar, since nothing else appears.
     func welcomeFirstLaunch() {
         showsMenuBarHint = true
-        Task {
-            let granted = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
-            if granted == true { Self.postNotification(title: "Minutia", body: FirstRun.menuBarHint) }
-        }
     }
 
     private func handleAuthChange(signedIn: Bool) {
@@ -899,7 +915,12 @@ final class AppController: NSObject, ObservableObject {
             // so rebind the detector explicitly: syncDetector re-points its agenda provider at the
             // new instance's client. loadSeries and runRecovery likewise re-run for the new instance.
             syncDetector()
-            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+            defaults.removeObject(forKey: FirstRun.signInPendingKey)
+            let pointsAtMenuBar = showsMenuBarHint
+            Task {
+                let granted = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+                if granted == true, pointsAtMenuBar { Self.postNotification(title: "Minutia", body: FirstRun.menuBarHint) }
+            }
             Task { await loadSeries() }
             Task { await modelStore.prepare(language: "en") }
             runRecovery()
@@ -929,25 +950,77 @@ final class AppController: NSObject, ObservableObject {
             clearPendingConsent(reason: nil)
             apply(.signedOut)
             series = []
+            openFirstRunSignInIfPending()
         }
     }
 
-    private func handleDetection(_ confidence: DetectionConfidence) {
+    /// A fresh install opens browser sign-in by itself once, as soon as its instance connection is
+    /// ready, even when that is a later reconnect after an offline first launch.
+    private func openFirstRunSignInIfPending() {
+        guard defaults.bool(forKey: FirstRun.signInPendingKey), authManager.client() != nil else { return }
+        openURL(authManager.beginBrowserSignIn(device: Host.current().localizedName ?? "Mac"))
+        defaults.removeObject(forKey: FirstRun.signInPendingKey)
+    }
+
+    func handleDetection(_ confidence: DetectionConfidence) {
         lastConfidence = confidence
         switch confidence {
         case .high(let app):
+            if MeetingPrompt.canPrompt(phase: phase) { selectLiveMeetingSeries(detector.liveAgendaItem) }
             apply(.meetingDetected(Self.detectionLabel(app)))
-            showMeetingPromptIfNeeded(app: app)
+            showMeetingPromptIfNeeded(MeetingPrompt.content(for: app, meeting: detector.liveAgendaItem?.title))
         case .none:
             // The corroborating signal is gone (mic released): retire a stale banner and reset the
             // prompt session so the next meeting can prompt again.
             if case .detected = phase { apply(.dismissedDetection) }
             resetMeetingPromptSession()
+            seriesPickedThisMeeting = false
+            restoreLastUsedAfterDetectedMeeting()
         case .soft:
             // Quiet by design: no phase change, no prompt, just the menu bar hint.
             break
         }
         refreshSoftHint()
+    }
+
+    /// Point Record at the calendar meeting happening now, unless the user already chose a series
+    /// for this meeting. Never persisted: last-used stays the user's own choice.
+    private func selectLiveMeetingSeries(_ live: AgendaItem?) {
+        guard !seriesPickedThisMeeting, let id = live?.seriesId,
+              series.contains(where: { $0.id == id }) else { return }
+        selectedSeriesId = id
+        seriesFromDetection = true
+    }
+
+    /// Runs when the mic session ends and again when the phase settles after a recording's
+    /// finalize (the mic releases mid-finalize), so recording the meeting still lands back here.
+    private func restoreLastUsedAfterDetectedMeeting() {
+        guard seriesFromDetection, Self.canStartRecording(from: phase) else { return }
+        if case .high = lastConfidence { return }
+        let ids = series.map(\.id)
+        selectedSeriesId = lastUsedSeriesId.flatMap { ids.contains($0) ? $0 : nil } ?? ids.first
+        seriesFromDetection = false
+    }
+
+    /// The calendar caught up with a meeting already detected (joined early, or the agenda poll
+    /// landed late): name it on the prompt still on screen and point Record at it.
+    private func liveMeetingChanged(_ item: AgendaItem?) {
+        guard case .high(let app) = lastConfidence, MeetingPrompt.canPrompt(phase: phase) else { return }
+        selectLiveMeetingSeries(item)
+        guard meetingPromptPanel.content != nil, let item else { return }
+        presentMeetingPrompt(MeetingPrompt.content(for: app, meeting: item.title))
+    }
+
+    private var lastUsedSeriesId: UUID? {
+        defaults.string(forKey: Self.lastSeriesKey).flatMap(UUID.init(uuidString:))
+    }
+
+    /// The Series picker: the user's own choice, remembered as last-used.
+    func pickSeries(_ id: UUID?) {
+        selectedSeriesId = id
+        seriesFromDetection = false
+        if case .high = lastConfidence { seriesPickedThisMeeting = true }
+        defaults.set(id?.uuidString, forKey: Self.lastSeriesKey)
     }
 
     // MARK: - Proactive meeting prompt
@@ -957,12 +1030,16 @@ final class AppController: NSObject, ObservableObject {
     /// promptable state. Confirming starts capture via the same `startRecording` path the in-menu
     /// banner uses (mic preflight included); dismissing suppresses re-prompt for the rest of the
     /// session.
-    private func showMeetingPromptIfNeeded(app: MeetingApp?) {
+    private func showMeetingPromptIfNeeded(_ content: MeetingPromptContent) {
         guard MeetingPrompt.shouldShow(
             isHigh: true, phase: phase, suppressedForSession: promptSuppressedForSession) else { return }
         promptSuppressedForSession = true
+        presentMeetingPrompt(content)
+    }
+
+    private func presentMeetingPrompt(_ content: MeetingPromptContent) {
         meetingPromptPanel.show(
-            content: MeetingPrompt.content(for: app),
+            content: content,
             onStart: { [weak self] in
                 self?.dismissMeetingPrompt()
                 self?.startRecording()
@@ -1118,13 +1195,15 @@ final class AppController: NSObject, ObservableObject {
     private func loadSeries() async {
         guard let client = authManager.client() else { return }
         guard let fetched = try? await client.recordableSeries() else { return }
+        seriesLoaded(fetched)
+    }
+
+    /// Record defaults to the meeting happening now, else the series in use, else last-used, else the first.
+    func seriesLoaded(_ fetched: [Series]) {
         series = fetched
-        let last = UserDefaults.standard.string(forKey: Self.lastSeriesKey).flatMap(UUID.init(uuidString:))
-        if let last, fetched.contains(where: { $0.id == last }) {
-            selectedSeriesId = last
-        } else if selectedSeriesId == nil || !fetched.contains(where: { $0.id == selectedSeriesId }) {
-            selectedSeriesId = fetched.first?.id
-        }
+        let ids = fetched.map(\.id)
+        selectedSeriesId = [selectedSeriesId, lastUsedSeriesId].compactMap { $0 }.first(where: ids.contains) ?? ids.first
+        if case .high = lastConfidence, MeetingPrompt.canPrompt(phase: phase) { selectLiveMeetingSeries(detector.liveAgendaItem) }
     }
 
     /// Re-fetch the recordable series so a series created on the web while the app was already open is
@@ -1140,10 +1219,9 @@ final class AppController: NSObject, ObservableObject {
     func startRecording() {
         guard canBeginRecording else { return }
         guard let client = authManager.client() else { return }
+        let mic = micCheck()
         switch Self.recordPreflight(
-            micStatus: AVCaptureDevice.authorizationStatus(for: .audio),
-            hasInputDevice: AVCaptureDevice.default(for: .audio) != nil,
-            hasSeries: selectedSeriesId != nil) {
+            micStatus: mic.status, hasInputDevice: mic.hasInputDevice, hasSeries: selectedSeriesId != nil) {
         case .micDenied:
             // Refuse before any server call: starting the RPC first would orphan an empty meeting.
             apply(.failed(CaptureSession.failureMessage(for: MicCapture.CaptureError.permissionDenied)))

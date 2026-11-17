@@ -18,9 +18,6 @@ struct SignInView: View {
     @State private var errorMessage: String?
     /// The in-flight connect, held so Cancel can stop a dead spinner and drop to the failure UI.
     @State private var connectTask: Task<Void, Never>?
-    /// True after the browser is opened for magic-link sign-in: shows a waiting state with a
-    /// "Start over" escape hatch, cleared when sign-in completes or a callback error arrives.
-    @State private var browserPending = false
     /// False when the last connect failure was deterministic (untrusted or not a Minutia
     /// instance), hiding the "Try again" affordance that could only loop the same verdict.
     @State private var retryable = true
@@ -60,7 +57,7 @@ struct SignInView: View {
     private var form: some View {
         Form {
             if authManager.isConnected {
-                if browserPending {
+                if authManager.awaitingBrowserSignIn {
                     // The browser was opened for magic-link sign-in: wait for the callback, but
                     // never trap the user here. "Start over" clears this and the pending flow.
                     Section("Signing in") {
@@ -140,12 +137,6 @@ struct SignInView: View {
         }
         .formStyle(.grouped)
         .task { await autoConnect() }
-        .onChange(of: authManager.userEmail) { _, email in
-            if email != nil { browserPending = false }
-        }
-        .onChange(of: authManager.callbackError) { _, error in
-            if error != nil { browserPending = false }
-        }
     }
 
     /// Connect to the resolved instance the moment the sign-in screen appears. Idempotent with
@@ -211,7 +202,6 @@ struct SignInView: View {
     private func signInWithBrowser() {
         errorMessage = nil
         authManager.callbackError = nil
-        browserPending = true
         let device = Host.current().localizedName ?? "Mac"
         NSWorkspace.shared.open(authManager.beginBrowserSignIn(device: device))
     }
@@ -219,7 +209,6 @@ struct SignInView: View {
     /// Abandon the browser sign-in the user started: clear the waiting state and drop the pending
     /// flow so a late callback for this attempt no longer binds.
     private func cancelBrowserSignIn() {
-        browserPending = false
         authManager.cancelBrowserSignIn()
     }
 

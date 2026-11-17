@@ -34,6 +34,12 @@ final class AuthManager: ObservableObject {
         let email: String?
     }
 
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
     deinit {
         authStateTask?.cancel()
     }
@@ -198,19 +204,29 @@ final class AuthManager: ObservableObject {
         }
     }
 
-    private var pendingAuth: PendingAuth? {
+    private(set) var pendingAuth: PendingAuth? {
         get {
-            guard let data = UserDefaults.standard.data(forKey: Self.pendingAuthKey),
+            guard let data = defaults.data(forKey: Self.pendingAuthKey),
                   let decoded = try? JSONDecoder().decode(PendingAuth.self, from: data) else { return nil }
             return decoded
         }
         set {
+            objectWillChange.send()
             guard let value = newValue, let data = try? JSONEncoder().encode(value) else {
-                UserDefaults.standard.removeObject(forKey: Self.pendingAuthKey)
+                defaults.removeObject(forKey: Self.pendingAuthKey)
                 return
             }
-            UserDefaults.standard.set(data, forKey: Self.pendingAuthKey)
+            defaults.set(data, forKey: Self.pendingAuthKey)
         }
+    }
+
+    /// A browser sign-in is under way (started from the menu or opened by the first launch) and has
+    /// not failed or expired: the sign-in screen waits on it instead of offering a second attempt,
+    /// which would replace the nonce and strand the first tab.
+    var awaitingBrowserSignIn: Bool {
+        guard let pendingAuth, callbackError == nil else { return false }
+        return Self.authCallbackDecision(
+            alreadySignedIn: false, pending: pendingAuth, callbackState: pendingAuth.nonce, now: Date()) == .accept
     }
 
     /// Extracts the magic-link token hash from a `minutia://auth-callback?token_hash=...` URL.
@@ -252,6 +268,19 @@ final class AuthManager: ObservableObject {
         try await task.value
     }
 
+    func adopt(_ client: SupabaseClient, instance: URL) async {
+        self.supabase = client
+        self.instance = instance
+        self.isConnected = true
+        observeAuthState(client)
+
+        // A prior session may already be in the Keychain: surface it so a relaunch lands signed
+        // in without re-prompting. A nil session must clear any previous instance's email so the
+        // user lands on sign-in rather than a phantom signed-in state.
+        let sessionEmail = (try? await client.auth.session)?.user.email
+        setSession(email: Self.resolvedEmail(priorEmail: userEmail, sessionEmail: sessionEmail))
+    }
+
     /// Fetch the instance's public connection details and build the Supabase client.
     /// Rehydrates `userEmail` from any Keychain-persisted session.
     func connect(instance: URL) async throws {
@@ -278,17 +307,8 @@ final class AuthManager: ObservableObject {
                 supabaseURL: meta.supabaseUrl,
                 supabaseKey: meta.supabaseAnonKey,
                 options: .init(auth: .init(storageKey: Self.sessionStorageKey(for: instance))))
-            self.supabase = client
-            self.instance = instance
-            self.isConnected = true
             InstanceConfig.stored = (instance: instance, meta: meta)
-            observeAuthState(client)
-
-            // A prior session may already be in the Keychain: surface it so a relaunch lands signed
-            // in without re-prompting. A nil session must clear any previous instance's email so the
-            // user lands on sign-in rather than a phantom signed-in state.
-            let sessionEmail = (try? await client.auth.session)?.user.email
-            setSession(email: Self.resolvedEmail(priorEmail: userEmail, sessionEmail: sessionEmail))
+            await adopt(client, instance: instance)
         } catch {
             // A failed (re)connect must not leave a stale client reporting connected, nor a
             // signed-in phase with no client behind it. Clearing the session drops the app to the

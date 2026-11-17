@@ -6,6 +6,9 @@ import ServiceManagement
 enum FirstRun {
     static let welcomedKey = "app.minutia.firstRunWelcomed"
     static let launchAtLoginDecidedKey = "app.minutia.launchAtLoginDecided"
+    /// Set on a fresh install's first launch and cleared once browser sign-in has actually opened,
+    /// so a first launch with no network still opens it on the next successful connect.
+    static let signInPendingKey = "app.minutia.firstRunSignInPending"
     static let menuBarHint = "Minutia is in your menu bar, top right"
 
     /// True on the first launch of a fresh install only. An install with any earlier state predates
@@ -18,6 +21,7 @@ enum FirstRun {
             recordLaunchAtLoginChoice(defaults)
             return false
         }
+        defaults.set(true, forKey: signInPendingKey)
         return true
     }
 
