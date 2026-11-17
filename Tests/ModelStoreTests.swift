@@ -146,6 +146,39 @@ private struct FakeHost: ModelHost {
 
     func isNetworkExpensiveOrConstrained() -> Bool { expensive }
     func freeDiskBytes(at url: URL) -> Int64 { freeBytes }
+    func observeConditions(_ handler: @escaping @Sendable () -> Void) {}
+}
+
+/// A host whose network and free space change mid-test, and whose condition observer the test fires.
+private final class ChangingHost: ModelHost, @unchecked Sendable {
+    let isAppleSilicon = true
+    let osVersion = OperatingSystemVersion(majorVersion: 15, minorVersion: 0, patchVersion: 0)
+    let appBuild = "100"
+    let osBuild = "24A335"
+    private let lock = NSLock()
+    private var _expensive: Bool
+    private var _freeBytes: Int64
+    private var handler: (@Sendable () -> Void)?
+
+    init(expensive: Bool = false, freeBytes: Int64 = 500 * 1_000_000_000) {
+        _expensive = expensive
+        _freeBytes = freeBytes
+    }
+
+    var expensive: Bool {
+        get { lock.withLock { _expensive } }
+        set { lock.withLock { _expensive = newValue } }
+    }
+
+    var freeBytes: Int64 {
+        get { lock.withLock { _freeBytes } }
+        set { lock.withLock { _freeBytes = newValue } }
+    }
+
+    func isNetworkExpensiveOrConstrained() -> Bool { expensive }
+    func freeDiskBytes(at url: URL) -> Int64 { freeBytes }
+    func observeConditions(_ handler: @escaping @Sendable () -> Void) { lock.withLock { self.handler = handler } }
+    func change() { lock.withLock { handler }?() }
 }
 
 /// Counts warm-ups. When `gated`, a warm-up waits until `release()` or task cancellation.
@@ -216,7 +249,7 @@ final class ModelStoreTests: XCTestCase {
     }
 
     private func makeStore(manifest: ModelManifest = Fixture.manifest(), transfer: FakeTransfer? = nil,
-                           host: FakeHost = FakeHost(), warmer: FakeWarmer = FakeWarmer()) -> ModelStore {
+                           host: ModelHost = FakeHost(), warmer: FakeWarmer = FakeWarmer()) -> ModelStore {
         ModelStore(manifest: manifest, root: root, transfer: transfer ?? FakeTransfer(manifest: manifest),
                    host: host, warmer: warmer, defaults: defaults)
     }
@@ -382,7 +415,7 @@ final class ModelStoreTests: XCTestCase {
     func test_everyBlockReason_hasSettingsText() {
         let reasons: [ModelBlockReason] = [.intelMac, .unsupportedOS, .noEntryForLanguage, .expensiveNetwork,
                                            .lowDisk(requiredBytes: 3_000_000_000, freeBytes: 1_000_000_000),
-                                           .recording]
+                                           .recording, .warmingAfterRecording]
         for reason in reasons {
             XCTAssertFalse(reason.settingsText.isEmpty, "\(reason)")
         }
@@ -658,7 +691,7 @@ final class ModelStoreTests: XCTestCase {
         XCTAssertEqual(store.status, .ready(revision: "en-rev-1"))
     }
 
-    func test_recordingStartDuringWarmUp_showsBlockedRecording_notWarming() async {
+    func test_recordingStartDuringWarmUpOfAHealthyModel_saysItIsGettingReady_notThatItWillDownload() async {
         _ = await readyEnglishStore()
         var host = FakeHost()
         host.appBuild = "101"
@@ -670,7 +703,11 @@ final class ModelStoreTests: XCTestCase {
         store.recordingDidStart()
         await launch.value
 
-        XCTAssertEqual(store.status, .blocked(.recording))
+        XCTAssertEqual(store.status, .blocked(.warmingAfterRecording))
+        XCTAssertEqual(ModelBlockReason.warmingAfterRecording.settingsText,
+                       "The on-device model will finish getting ready after your recording ends.")
+        XCTAssertEqual(ModelBlockReason.recording.settingsText,
+                       "The on-device model will download after your recording ends.")
     }
 
     func test_warmUpThatIgnoresCancellation_recordsNeitherHealthNorMarker_whenARecordingStarted() async {
@@ -685,7 +722,7 @@ final class ModelStoreTests: XCTestCase {
         await install.value
 
         XCTAssertNil(store.routableEntry(forLanguage: "en"), "a warm-up that finished after a recording start is not trusted")
-        XCTAssertEqual(store.status, .blocked(.recording))
+        XCTAssertEqual(store.status, .blocked(.warmingAfterRecording), "the files are verified; only the warm-up is left")
 
         let nextLaunchWarmer = FakeWarmer()
         let transfer = FakeTransfer(manifest: manifest)
@@ -735,6 +772,172 @@ final class ModelStoreTests: XCTestCase {
         XCTAssertNil(ModelStatus.warming.menuLabel)
     }
 
+    // MARK: Recovery without a relaunch
+
+    func test_meetingEndWithoutResume_neverPrepares_andTheNextPrepareIsNotHeldByTheRecording() async {
+        let transfer = FakeTransfer(manifest: Fixture.manifest())
+        let store = makeStore(transfer: transfer)
+        store.recordingDidStart()
+        await store.prepare(language: "en")
+        XCTAssertEqual(store.status, .blocked(.recording), "precondition")
+
+        await store.recordingDidStop(resume: false)
+
+        XCTAssertTrue(transfer.requests.isEmpty, "a sign-out never starts a download")
+        await store.prepare(language: "en")
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"))
+    }
+
+    func test_blockedOnAnExpensiveNetwork_downloadsOnItsOwn_whenThePathBecomesInexpensive() async {
+        let manifest = Fixture.manifest()
+        let transfer = FakeTransfer(manifest: manifest)
+        let host = ChangingHost(expensive: true)
+        let store = makeStore(manifest: manifest, transfer: transfer, host: host)
+        await store.prepare(language: "en")
+        XCTAssertEqual(store.status, .blocked(.expensiveNetwork), "precondition")
+
+        host.expensive = false
+        host.change()
+
+        let ready = await eventually(timeout: 2) { await MainActor.run { store.status == .ready(revision: "en-rev-1") } }
+        XCTAssertTrue(ready, "the store retries from the host's path change: \(store.status)")
+        XCTAssertEqual(Set(transfer.requests.map(\.url)), Set(en().files.map { en().url(for: $0) }))
+    }
+
+    func test_blockedOnLowDisk_downloadsOnItsOwn_whenFreeSpaceRises() async {
+        let required = 2 * en().totalBytes + 1_000_000_000
+        let host = ChangingHost(freeBytes: required - 1)
+        let store = makeStore(host: host)
+        await store.prepare(language: "en")
+        XCTAssertEqual(store.status, .blocked(.lowDisk(requiredBytes: required, freeBytes: required - 1)), "precondition")
+
+        host.freeBytes = required
+        await store.conditionsDidChange()
+
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"))
+    }
+
+    func test_conditionChanges_retryOncePerChange_neverWhileStillBlocked_andNeverFetchTwice() async {
+        executionTimeAllowance = 60
+        let manifest = Fixture.manifest()
+        let transfer = FakeTransfer(manifest: manifest)
+        let host = ChangingHost(expensive: true)
+        let store = makeStore(manifest: manifest, transfer: transfer, host: host)
+        await store.prepare(language: "en")
+        var emissions = 0
+        let sink = store.$status.dropFirst().sink { _ in emissions += 1 }
+        defer { sink.cancel() }
+
+        await store.conditionsDidChange()
+        await store.conditionsDidChange()
+        XCTAssertEqual(emissions, 0, "no re-run while the network is still expensive")
+
+        host.expensive = false
+        async let a: Void = store.conditionsDidChange()
+        async let b: Void = store.conditionsDidChange()
+        async let c: Void = store.conditionsDidChange()
+        _ = await (a, b, c)
+
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"))
+        let fetched = transfer.requests.map(\.url)
+        XCTAssertEqual(fetched.count, en().files.count, "each file is fetched once: \(fetched)")
+        XCTAssertEqual(Set(fetched).count, fetched.count)
+
+        await store.conditionsDidChange()
+        XCTAssertEqual(transfer.requests.count, en().files.count, "a ready model ignores further changes")
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"))
+    }
+
+    func test_conditionChange_whileRecording_neverRetries_andRecoveryStillWorksAfterIt() async {
+        let manifest = Fixture.manifest()
+        let transfer = FakeTransfer(manifest: manifest)
+        let host = ChangingHost(expensive: true)
+        let store = makeStore(manifest: manifest, transfer: transfer, host: host)
+        await store.prepare(language: "en")
+        store.recordingDidStart()
+
+        host.expensive = false
+        await store.conditionsDidChange()
+        XCTAssertTrue(transfer.requests.isEmpty, "no download competes with a recording or its upload")
+
+        host.expensive = true
+        await store.recordingDidStop()
+        XCTAssertEqual(store.status, .blocked(.expensiveNetwork))
+
+        host.expensive = false
+        await store.conditionsDidChange()
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"))
+    }
+
+    // MARK: Sign-out
+
+    func test_afterSignOut_aNetworkOrDiskChange_neverDownloads() async {
+        let manifest = Fixture.manifest()
+        let transfer = FakeTransfer(manifest: manifest)
+        let network = ChangingHost(expensive: true)
+        let offline = makeStore(manifest: manifest, transfer: transfer, host: network)
+        await offline.prepare(language: "en")
+        XCTAssertEqual(offline.status, .blocked(.expensiveNetwork), "precondition")
+
+        await offline.recordingDidStop(resume: false)
+        network.expensive = false
+        network.change()
+        await offline.conditionsDidChange()
+        _ = await eventually(timeout: 0.3) { !transfer.requests.isEmpty }
+
+        XCTAssertTrue(transfer.requests.isEmpty, "a signed-out store never downloads on a path change: \(transfer.requests)")
+        XCTAssertNotEqual(offline.status, .ready(revision: "en-rev-1"))
+
+        let upgraded = Fixture.manifest(enRevision: "en-rev-2")
+        let required = 2 * en(upgraded).totalBytes + 1_000_000_000
+        let diskTransfer = FakeTransfer(manifest: upgraded)
+        let disk = ChangingHost(freeBytes: required - 1)
+        let full = makeStore(manifest: upgraded, transfer: diskTransfer, host: disk)
+        await full.prepare(language: "en")
+        XCTAssertEqual(full.status, .blocked(.lowDisk(requiredBytes: required, freeBytes: required - 1)), "precondition")
+
+        await full.recordingDidStop(resume: false)
+        disk.freeBytes = required
+        disk.change()
+        await full.conditionsDidChange()
+        _ = await eventually(timeout: 0.3) { !diskTransfer.requests.isEmpty }
+
+        XCTAssertTrue(diskTransfer.requests.isEmpty, "a signed-out store never downloads when space frees up: \(diskTransfer.requests)")
+        XCTAssertNotEqual(full.status, .ready(revision: "en-rev-2"))
+    }
+
+    func test_afterSignOut_theNextSignInStillPrepares() async {
+        let manifest = Fixture.manifest()
+        let transfer = FakeTransfer(manifest: manifest)
+        let host = ChangingHost(expensive: true)
+        let store = makeStore(manifest: manifest, transfer: transfer, host: host)
+        await store.prepare(language: "en")
+        await store.recordingDidStop(resume: false)
+        host.expensive = false
+        await store.conditionsDidChange()
+        XCTAssertTrue(transfer.requests.isEmpty, "precondition: nothing downloads while signed out")
+
+        await store.prepare(language: "en")
+
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"))
+        XCTAssertEqual(Set(transfer.requests.map(\.url)), Set(en().files.map { en().url(for: $0) }))
+    }
+
+    func test_signOutMidDownload_cancelsTheTransfer_andNeverReachesReady() async {
+        let manifest = Fixture.manifest()
+        let weight = url("Encoder.mlmodelc/weights/weight.bin", in: en(manifest))
+        let transfer = FakeTransfer(manifest: manifest, gate: (weight, 20))
+        let store = makeStore(manifest: manifest, transfer: transfer)
+
+        let download = Task { await store.prepare(language: "en") }
+        await transfer.waitUntilGateReached()
+        await store.recordingDidStop(resume: false)
+        await download.value
+
+        XCTAssertEqual(transfer.cancellations, 1, "the in-flight transfer is cancelled on sign-out")
+        XCTAssertNotEqual(store.status, .ready(revision: "en-rev-1"))
+        XCTAssertNil(store.routableEntry(forLanguage: "en"))
+    }
 }
 
 private final class LockedFlags: @unchecked Sendable {

@@ -18,6 +18,7 @@ protocol ModelHost: Sendable {
     var osBuild: String { get }
     func isNetworkExpensiveOrConstrained() -> Bool
     func freeDiskBytes(at url: URL) -> Int64
+    func observeConditions(_ handler: @escaping @Sendable () -> Void)
 }
 
 /// Loads an entry's engine from its directory and runs one short transcription. Must stop and throw
@@ -33,6 +34,7 @@ enum ModelBlockReason: Equatable, Sendable {
     case expensiveNetwork
     case lowDisk(requiredBytes: Int64, freeBytes: Int64)
     case recording
+    case warmingAfterRecording
 
     /// Shown in Settings under the on-device model row.
     var settingsText: String {
@@ -44,6 +46,7 @@ enum ModelBlockReason: Equatable, Sendable {
         case .lowDisk(let required, let free):
             "Not enough free disk space for the on-device model: \(Self.gigabytes(required)) needed, \(Self.gigabytes(free)) free."
         case .recording: "The on-device model will download after your recording ends."
+        case .warmingAfterRecording: "The on-device model will finish getting ready after your recording ends."
         }
     }
 
@@ -93,6 +96,7 @@ final class ModelStore: ObservableObject {
         self.host = host
         self.warmer = warmer
         self.defaults = defaults
+        host.observeConditions { [weak self] in Task { @MainActor in await self?.conditionsDidChange() } }
     }
 
     /// `root/<revision>/<repoFolder>`, the directory handed to `ParakeetEngine.load`.
@@ -134,9 +138,25 @@ final class ModelStore: ObservableObject {
         warmTask?.cancel()
     }
 
-    func recordingDidStop() async {
+    func recordingDidStop(resume: Bool = true) async {
         recording = false
+        guard resume else {
+            lastLanguage = nil
+            running?.task.cancel()
+            warmTask?.cancel()
+            return
+        }
         if let lastLanguage { await prepare(language: lastLanguage) }
+    }
+
+    func conditionsDidChange() async {
+        guard !recording, let lastLanguage, case .blocked(let reason) = status else { return }
+        switch reason {
+        case .expensiveNetwork where !host.isNetworkExpensiveOrConstrained(): break
+        case .lowDisk(let required, _) where host.freeDiskBytes(at: root) >= required: break
+        default: return
+        }
+        await prepare(language: lastLanguage)
     }
 
     private struct VerificationFailed: LocalizedError {
@@ -176,7 +196,7 @@ final class ModelStore: ObservableObject {
         defer { warmTask = nil }
         var failure: Error?
         do { try await task.value } catch { failure = error }
-        if recording || task.isCancelled { return status = .blocked(.recording) }
+        if recording || task.isCancelled { return status = .blocked(.warmingAfterRecording) }
         if let failure {
             defaults.removeObject(forKey: healthKey(entry))
             defaults.removeObject(forKey: warmKey(entry))
