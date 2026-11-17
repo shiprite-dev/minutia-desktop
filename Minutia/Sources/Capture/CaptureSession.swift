@@ -38,6 +38,8 @@ final class CaptureSession: ObservableObject {
     struct StopResult {
         let expectedSegments: Int?
         let transcriptRequested: Bool
+        /// Set when a device meeting's local transcription failed and the stop finished in the cloud instead.
+        var localFailure: LocalTranscriber.Failure? = nil
     }
 
     enum CaptureError: Error { case notRunning, stalled, recordingUnfinished, alreadyRunning, invalidMeetingId, transcriptionBlocked(TranscriptionReason),
@@ -45,6 +47,7 @@ final class CaptureSession: ObservableObject {
 
     /// Ceiling for the stop-time network finalize (drain + upload + finalize + transcribe request).
     static let finalizeTimeout: TimeInterval = 60
+    static let recoveryUploadTimeout: TimeInterval = 900
 
     /// If no audio frames drain for this long while recording, the tap and mic have both stalled and
     /// the recording is silently frozen; the session flips to a fatal error rather than pinning a
@@ -56,6 +59,7 @@ final class CaptureSession: ObservableObject {
     private(set) var audioMayLeaveMac = true
     private var client: MinutiaClient?
     private var transcriber: LocalTranscriber?
+    private(set) var deviceOnly = false
     private var meetingId: String?
     private var directory: URL?
     private var startedAt: Date?
@@ -78,6 +82,7 @@ final class CaptureSession: ObservableObject {
         if case .blocked(let reason) = decision { throw CaptureError.transcriptionBlocked(reason) }
         if transcriber == nil, decision.mode != .cloud || deviceOnly { throw CaptureError.transcriptionBlocked(.modelNotReady) }
         guard pipeline == nil else { throw CaptureError.alreadyRunning }
+        self.deviceOnly = deviceOnly
         guard let canonical = UUID(uuidString: meetingId) else { throw CaptureError.invalidMeetingId }
 
         // Canonicalize to the lowercase meeting id the DB row and the storage RLS policy use;
@@ -176,10 +181,13 @@ final class CaptureSession: ObservableObject {
 
     /// Stops capture, drains fast-lane uploads, uploads the full recording, and requests the final
     /// transcription. Local files are deleted only once transcription has been accepted.
-    func stop(flushNotes: @escaping @Sendable () async throws -> Void = {}, recapOpened: Bool = false) async throws -> StopResult {
+    func stop(flushNotes: @escaping @Sendable () async throws -> Void = {}, recapOpened: Bool = false,
+              notifyLocalFailure: @escaping @Sendable (LocalTranscriber.Failure) async -> Void = { _ in },
+              onLocalOutcome: @escaping @Sendable (Bool) async -> Void = { _ in }) async throws -> StopResult {
         guard let pipeline, let queue, let client, let meetingId, let directory else {
             throw CaptureError.notRunning
         }
+        beginFinishing(audioMayLeaveMac: audioMayLeaveMac)
         // Teardown must happen even if uploadRecording/finalize throws below; otherwise `pipeline`
         // stays non-nil and every future `start` silently no-ops. The error still propagates.
         // cancelAll stops any segment retry loop still running after the finalize window (drained
@@ -199,50 +207,29 @@ final class CaptureSession: ObservableObject {
             self.micUnavailable = false
         }
 
-        if !audioMayLeaveMac, let transcriber {
+        if !audioMayLeaveMac {
+            guard let transcriber else { throw CaptureError.transcriptionBlocked(.modelNotReady) }
             guard let finished = pipeline.finishCapture() else { throw CaptureError.recordingUnfinished }
             let tail = finished.tailPieces.isEmpty ? [finished.finalSegment].compactMap { $0 } : finished.tailPieces
             return try await Self.finishOnDevice(
                 meetingId: meetingId, directory: directory, tail: tail,
                 durationSeconds: Double(finished.recording.frames) / MixPlan.sampleRate,
                 transcriber: transcriber, transport: client, recapOpened: recapOpened,
-                flushNotes: flushNotes, onStep: finishingStepReporter())
+                deviceOnly: deviceOnly, cloud: client,
+                flushNotes: flushNotes, onStep: finishingStepReporter(),
+                notifyLocalFailure: notifyLocalFailure, onLocalOutcome: onLocalOutcome)
         }
 
         // Without a finished recording the server has nothing to transcribe; throwing keeps the
         // directory so recovery uploads the readable fragmented file instead of deleting it.
         guard let finished = pipeline.finishCapture() else { throw CaptureError.recordingUnfinished }
-        if !finished.tailPieces.isEmpty {
-            for piece in finished.tailPieces { queue.enqueue(piece) }
-        } else if let finalSegment = finished.finalSegment {
-            queue.enqueue(finalSegment)
-        }
-
-        // Bound the network finalize so a stuck upload/finalize/transcribe (observed: a Kong 504 that
-        // hung 60s+, and indefinite hangs on repeated failures) throws instead of pinning the UI in
-        // .finalizing forever. TimeoutError propagates to the controller, which shows .error (Retry).
-        let outcome = try await withTimeout(seconds: Self.finalizeTimeout) {
-            let recording = finished.recording
-            async let uploadedPath = client.uploadRecording(meetingId: meetingId, fileURL: recording.fileURL)
-            let counts = await queue.drainAndWait()
-            let expected = Self.expectedSegments(
-                enqueued: counts.enqueued, registered: counts.registered,
-                segmentsDropped: finished.segmentsDropped)
-            let path = try await uploadedPath
-            let duration = Double(recording.frames) / MixPlan.sampleRate
-            let attrs = try? FileManager.default.attributesOfItem(atPath: recording.fileURL.path)
-            let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
-            try await client.finalizeMeeting(meetingId: meetingId, audioPath: path, duration: duration, sizeBytes: size)
-
-            // A failed requestTranscription must never read as an accepted transcript: it rethrows so
-            // the controller shows .failed (Retry re-runs refinalize) and the audio directory is kept
-            // below, deleted only when the request truly succeeds (a 2xx, or the terminal-503 the
-            // client treats as not-lost since the transcript assembles from fast-lane segments).
-            _ = try await NotepadFinalize.flushThenTranscribe(
-                flush: flushNotes,
-                requestTranscription: { try await client.requestTranscription(meetingId: meetingId, expectedSegments: expected, deferExtraction: true) })
-            return (counts: counts, expected: expected, transcriptRequested: true)
-        }
+        let outcome = try await Self.finishFastLane(
+            audioMayLeaveMac: audioMayLeaveMac, meetingId: meetingId, recording: finished.recording.fileURL,
+            durationSeconds: Double(finished.recording.frames) / MixPlan.sampleRate,
+            tail: finished.tailPieces.isEmpty ? [finished.finalSegment].compactMap { $0 } : finished.tailPieces,
+            segmentsDropped: finished.segmentsDropped,
+            enqueue: { queue.enqueue($0) }, drain: { await queue.drainAndWait() }, cloud: client,
+            flushNotes: flushNotes)
 
         segmentsUploaded = outcome.counts.uploaded
         segmentsTotal = outcome.counts.enqueued
@@ -250,11 +237,9 @@ final class CaptureSession: ObservableObject {
         if !recapOpened { Task { await client.warmSummary(meetingId: meetingId) } }
         Task { await Self.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId) } }
 
-        if outcome.transcriptRequested {
-            try? FileManager.default.removeItem(at: directory)
-        }
+        try? FileManager.default.removeItem(at: directory)
 
-        return StopResult(expectedSegments: outcome.expected, transcriptRequested: outcome.transcriptRequested)
+        return StopResult(expectedSegments: outcome.expected, transcriptRequested: true)
     }
 
     private func handleTick(peak: Float, closedCount: Int, framesDrained: Int) {
@@ -293,18 +278,58 @@ final class CaptureSession: ObservableObject {
     /// Ends the device stop in flight and clears its step.
     func endFinishing() { finishingGeneration += 1; finishingStep = nil }
 
-    /// What a device-mode stop is doing, shown by the finishing view. nil in cloud mode.
+    /// What a stop is doing, shown by the finishing view. nil until the first step is reported.
     enum FinishingStep: Equatable, Sendable {
         case preparingModel
         case transcribing(completed: Int, total: Int)
         case submitting
+        case startingOnDevice
+        case uploadingRecording
+        case fallingBackToCloud
 
         var label: String {
             switch self {
             case .preparingModel: "Preparing the speech model"
             case .transcribing(let completed, let total): "Transcribing on this Mac, \(completed) of \(total)"
             case .submitting: "Sending the transcript"
+            case .startingOnDevice: "Transcribing on this Mac"
+            case .uploadingRecording: "Uploading and requesting transcript"
+            case .fallingBackToCloud: "Couldn't transcribe on this Mac. Uploading instead."
             }
+        }
+    }
+
+    nonisolated static func finishingLabel(step: FinishingStep?, audioMayLeaveMac: Bool) -> String {
+        step?.label ?? (audioMayLeaveMac ? FinishingStep.uploadingRecording.label : FinishingStep.startingOnDevice.label)
+    }
+
+    func beginFinishing(audioMayLeaveMac: Bool) { finishingStep = audioMayLeaveMac ? .uploadingRecording : .startingOnDevice }
+
+    nonisolated static let notesFlushTimeout: TimeInterval = 10
+
+    nonisolated static func finishFastLane(
+        audioMayLeaveMac: Bool, meetingId: String, recording: URL, durationSeconds: Double,
+        tail: [SegmentWriter.ClosedSegment], segmentsDropped: Bool,
+        enqueue: @escaping @Sendable (SegmentWriter.ClosedSegment) -> Void,
+        drain: @escaping @Sendable () async -> (uploaded: Int, registered: Int, failed: Int, enqueued: Int),
+        cloud: any CloudFinalizeTransport,
+        flushNotes: @escaping @Sendable () async throws -> Void = {},
+        timeout: TimeInterval = finalizeTimeout
+    ) async throws -> (counts: (uploaded: Int, registered: Int, failed: Int, enqueued: Int), expected: Int?) {
+        guard audioMayLeaveMac else { throw CaptureRecovery.RecoveryError.audioStaysOnThisMac }
+        for piece in tail { enqueue(piece) }
+        return try await withTimeout(seconds: timeout) {
+            async let uploadedPath = cloud.uploadRecording(meetingId: meetingId, fileURL: recording)
+            let counts = await drain()
+            let expected = expectedSegments(enqueued: counts.enqueued, registered: counts.registered, segmentsDropped: segmentsDropped)
+            let path = try await uploadedPath
+            let attrs = try? FileManager.default.attributesOfItem(atPath: recording.path)
+            let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+            try await cloud.finalizeMeeting(meetingId: meetingId, audioPath: path, duration: durationSeconds, sizeBytes: size)
+            _ = try await NotepadFinalize.flushThenTranscribe(
+                flush: flushNotes,
+                requestTranscription: { try await cloud.requestTranscription(meetingId: meetingId, expectedSegments: expected, deferExtraction: true, strict: false) })
+            return (counts: counts, expected: expected)
         }
     }
 
@@ -316,7 +341,8 @@ final class CaptureSession: ObservableObject {
     /// waits, throws.
     nonisolated static func submitDeviceTranscript(
         meetingId: String, body: Data, transport: any DeviceTranscriptTransport,
-        sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }
+        sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
+        accepted: LockedFlag? = nil
     ) async throws {
         var attempt = 0
         while true {
@@ -324,7 +350,7 @@ final class CaptureSession: ObservableObject {
             var status: Int?
             var failure: Error?
             do { status = try await transport.submitDeviceTranscript(meetingId: meetingId, body: body) } catch { failure = error }
-            if let status, (200...299).contains(status) { return }
+            if let status, (200...299).contains(status) { accepted?.set(); return }
             if let status, (400...499).contains(status), ![401, 403, 408, 409, 429].contains(status) { throw CaptureError.transcriptRejected }
             let retryable: Bool
             if let status {
@@ -341,42 +367,95 @@ final class CaptureSession: ObservableObject {
         }
     }
 
+    nonisolated static func submitFailure(_ error: Error) -> any Error {
+        error is CancellationError ? error : CaptureError.transcriptNotSent
+    }
+
     /// The device-mode stop after capture has finished: finishes local transcription, writes
     /// `transcript.json`, marks the meeting as waiting for this Mac, submits it, deletes the directory on
     /// a 2xx, then warms the summary (unless the recap already opened) and ends the meeting.
     nonisolated static func finishOnDevice(
         meetingId: String, directory: URL, tail: [SegmentWriter.ClosedSegment], durationSeconds: Double,
         transcriber: LocalTranscriber, transport: any DeviceTranscriptTransport, recapOpened: Bool,
-        transcribeTimeout: TimeInterval? = nil,
+        deviceOnly: Bool = true, cloud: (any CloudFinalizeTransport)? = nil,
+        transcribeTimeout: TimeInterval? = nil, engineStopTimeout: TimeInterval = CaptureSession.engineStopTimeout,
+        cloudTimeout: TimeInterval = finalizeTimeout,
+        notesFlushTimeout: TimeInterval = CaptureSession.notesFlushTimeout,
         sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
         flushNotes: @escaping @Sendable () async throws -> Void = {},
-        onStep: @escaping @Sendable (FinishingStep) async -> Void = { _ in }
+        saved: [DeviceTranscript.Segment] = [],
+        onStep: @escaping @Sendable (FinishingStep) async -> Void = { _ in },
+        notifyLocalFailure: @escaping @Sendable (LocalTranscriber.Failure) async -> Void = { _ in },
+        onLocalOutcome: @escaping @Sendable (Bool) async -> Void = { _ in }
     ) async throws -> StopResult {
         guard durationSeconds > 0 else { throw CaptureError.nothingRecorded }
-        async let notesFlushed: Void = { try? await flushNotes() }()
-        let transcript: DeviceTranscript
+        let notes = Task { try? await flushNotes() }
+        defer { notes.cancel() }
+        var transcript: DeviceTranscript
         do {
             transcript = try await transcribeBounded(seconds: transcribeTimeout ?? localTranscriptionTimeout(durationSeconds: durationSeconds)) {
                 try await transcriber.finish(tail: tail, durationSeconds: durationSeconds, onStep: onStep)
             }
+            await onLocalOutcome(true)
         } catch CaptureError.localTranscriptionTimedOut {
-            await transcriber.cancel()
-            throw CaptureError.localTranscriptionTimedOut
+            Task { await transcriber.cancel() }
+            await onLocalOutcome(false)
+            guard !deviceOnly, let cloud else {
+                if deviceOnly {
+                    markNotified(directory)
+                    await notifyLocalFailure(.transcriptionTimedOut)
+                }
+                Task { await endMeetingIfAllowed { try await transport.endMeeting(meetingId: meetingId) } }
+                throw CaptureError.localTranscriptionTimedOut
+            }
+            markLocalFailed(directory)
+            await waitAtMost(seconds: notesFlushTimeout) { await notes.value }
+            await onStep(.fallingBackToCloud)
+            return try await finishInCloud(
+                meetingId: meetingId, directory: directory, durationSeconds: durationSeconds, failure: .transcriptionTimedOut,
+                transport: transport, cloud: cloud, recapOpened: recapOpened, timeout: cloudTimeout)
+        } catch let failure as LocalTranscriber.Failure {
+            Task { await transcriber.cancel() }
+            await onLocalOutcome(false)
+            guard !deviceOnly, let cloud else {
+                markNotified(directory)
+                await notifyLocalFailure(failure)
+                Task { await endMeetingIfAllowed { try await transport.endMeeting(meetingId: meetingId) } }
+                throw failure
+            }
+            markLocalFailed(directory)
+            await waitAtMost(seconds: notesFlushTimeout) { await notes.value }
+            await onStep(.fallingBackToCloud)
+            return try await finishInCloud(
+                meetingId: meetingId, directory: directory, durationSeconds: durationSeconds, failure: failure,
+                transport: transport, cloud: cloud, recapOpened: recapOpened, timeout: cloudTimeout)
+        } catch is CancellationError {
+            await waitAtMost(seconds: engineStopTimeout) { await transcriber.cancel() }
+            throw CancellationError()
+        }
+        if !saved.isEmpty {
+            transcript = DeviceTranscript.build(
+                source: transcript.source, language: transcript.language, durationSeconds: transcript.durationSeconds,
+                segments: transcript.segments + saved)
         }
         guard let fitted = transcript.fitted() else { throw CaptureError.transcriptTooLarge }
         let body = try fitted.encoded()
-        await notesFlushed
+        await waitAtMost(seconds: notesFlushTimeout) { await notes.value }
         try body.write(to: directory.appendingPathComponent(CaptureRecovery.transcriptName), options: .atomic)
+        try Task.checkCancellation()
         try? await transport.markAwaitingDeviceTranscript(meetingId: meetingId, durationSeconds: fitted.durationSeconds)
+        try Task.checkCancellation()
         await onStep(.submitting)
+        let accepted = LockedFlag()
         do {
             try await withTimeout(seconds: finalizeTimeout) {
-                try await submitDeviceTranscript(meetingId: meetingId, body: body, transport: transport, sleep: sleep)
+                try await submitDeviceTranscript(meetingId: meetingId, body: body, transport: transport, sleep: sleep, accepted: accepted)
             }
+        } catch where accepted.value {
         } catch CaptureError.transcriptRejected {
             throw CaptureError.transcriptRejected
         } catch {
-            throw CaptureError.transcriptNotSent
+            throw submitFailure(error)
         }
         try? FileManager.default.removeItem(at: directory)
         if !recapOpened { Task { await transport.warmSummary(meetingId: meetingId) } }
@@ -384,11 +463,63 @@ final class CaptureSession: ObservableObject {
         return StopResult(expectedSegments: nil, transcriptRequested: true)
     }
 
+    private nonisolated static func finishInCloud(
+        meetingId: String, directory: URL, durationSeconds: Double, failure: LocalTranscriber.Failure,
+        transport: any DeviceTranscriptTransport, cloud: any CloudFinalizeTransport, recapOpened: Bool,
+        timeout: TimeInterval
+    ) async throws -> StopResult {
+        let recording = directory.appendingPathComponent(CaptureRecovery.recordingName)
+        let accepted = LockedFlag()
+        do {
+            try await withTimeout(seconds: timeout) {
+                try await finalizeRecordingInCloud(
+                    meetingId: meetingId, recording: recording, duration: durationSeconds, cloud: cloud,
+                    deferExtraction: true, flushNotes: {}, accepted: accepted)
+            }
+        } catch where accepted.value {}
+        try? FileManager.default.removeItem(at: directory)
+        if !recapOpened { Task { await transport.warmSummary(meetingId: meetingId) } }
+        Task { await endMeetingIfAllowed { try await transport.endMeeting(meetingId: meetingId) } }
+        return StopResult(expectedSegments: nil, transcriptRequested: true, localFailure: failure)
+    }
+
+    nonisolated static func finalizeRecordingInCloud(
+        meetingId: String, recording: URL, duration: Double, cloud: any CloudFinalizeTransport,
+        deferExtraction: Bool, flushNotes: @escaping @Sendable () async throws -> Void, accepted: LockedFlag? = nil
+    ) async throws {
+        let path = try await cloud.uploadRecording(meetingId: meetingId, fileURL: recording)
+        try Task.checkCancellation()
+        let size = ((try? FileManager.default.attributesOfItem(atPath: recording.path)[.size]) as? NSNumber)?.int64Value ?? 0
+        try await cloud.finalizeMeeting(meetingId: meetingId, audioPath: path, duration: duration, sizeBytes: size)
+        _ = try await NotepadFinalize.flushThenTranscribe(
+            flush: flushNotes,
+            requestTranscription: {
+                let result = try await cloud.requestTranscription(meetingId: meetingId, expectedSegments: nil, deferExtraction: deferExtraction, strict: true)
+                accepted?.set()
+                return result
+            })
+    }
+
+    private nonisolated static func markNotified(_ directory: URL) {
+        guard var manifest = CaptureRecovery.loadManifest(from: directory) else { return }
+        manifest.notified = true
+        CaptureRecovery.saveManifest(manifest, to: directory)
+    }
+
+    nonisolated static func markLocalFailed(_ directory: URL) {
+        guard var manifest = CaptureRecovery.loadManifest(from: directory) else { return }
+        manifest.localFailed = true
+        CaptureRecovery.saveManifest(manifest, to: directory)
+    }
+
     /// How long Quit waits for a stop already in flight.
     nonisolated static func quitDeadline(audioMayLeaveMac: Bool, elapsedSeconds: TimeInterval,
                                          finalizeTimeout: TimeInterval = CaptureSession.finalizeTimeout) -> TimeInterval {
-        (audioMayLeaveMac ? 0 : localTranscriptionTimeout(durationSeconds: elapsedSeconds)) + finalizeTimeout + 5
+        (audioMayLeaveMac ? 0 : localTranscriptionTimeout(durationSeconds: elapsedSeconds) + notesFlushTimeout) + finalizeTimeout + 5
     }
+
+    /// How long a cancelled stop waits for the engine to stand down before giving up on it.
+    nonisolated static let engineStopTimeout: TimeInterval = 10
 
     /// Ceiling on local transcription at stop; past it the stop fails with a retryable error.
     nonisolated static func localTranscriptionTimeout(durationSeconds: Double) -> TimeInterval {
@@ -406,32 +537,44 @@ final class CaptureSession: ObservableObject {
             let lock = NSLock()
             var task: Task<Void, Never>?
             var job: Task<Void, Never>?
+            var continuation: CheckedContinuation<DeviceTranscript, Error>?
+            var cancelled = false
         }
-        final class Once: @unchecked Sendable {
-            private let lock = NSLock()
-            private var done = false
-            func first() -> Bool { lock.withLock { defer { done = true }; return !done } }
-        }
-        let once = Once()
+        let once = LockedFlag()
         let box = TimerBox()
-        return try await withCheckedThrowingContinuation { continuation in
-            box.lock.lock()
-            defer { box.lock.unlock() }
-            box.task = Task {
-                do { try await timer(seconds) } catch { return }
-                if once.first() {
-                    box.lock.withLock { box.job }?.cancel()
-                    continuation.resume(throwing: CaptureError.localTranscriptionTimedOut)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                box.lock.lock()
+                defer { box.lock.unlock() }
+                box.continuation = continuation
+                box.task = Task {
+                    do { try await timer(seconds) } catch { return }
+                    if once.claim() {
+                        box.lock.withLock { box.job }?.cancel()
+                        continuation.resume(throwing: CaptureError.localTranscriptionTimedOut)
+                    }
+                }
+                box.job = Task {
+                    do {
+                        let transcript = try await work()
+                        if once.claim() { continuation.resume(returning: transcript) }
+                    } catch {
+                        if once.claim() { continuation.resume(throwing: error) }
+                    }
+                    box.lock.withLock { box.task }?.cancel()
+                }
+                if box.cancelled, once.claim() {
+                    box.job?.cancel()
+                    box.task?.cancel()
+                    continuation.resume(throwing: CancellationError())
                 }
             }
-            box.job = Task {
-                do {
-                    let transcript = try await work()
-                    if once.first() { continuation.resume(returning: transcript) }
-                } catch {
-                    if once.first() { continuation.resume(throwing: error) }
-                }
-                box.lock.withLock { box.task }?.cancel()
+        } onCancel: {
+            let (job, task, continuation) = box.lock.withLock { box.cancelled = true; return (box.job, box.task, box.continuation) }
+            if let continuation, once.claim() {
+                job?.cancel()
+                task?.cancel()
+                continuation.resume(throwing: CancellationError())
             }
         }
     }
@@ -524,6 +667,15 @@ final class CaptureSession: ObservableObject {
         return "Recording stopped: \(error.localizedDescription)"
     }
 }
+
+/// The Automatic-mode fallback's network surface: the cloud finalize over the full recording on disk.
+protocol CloudFinalizeTransport {
+    func uploadRecording(meetingId: String, fileURL: URL) async throws -> String
+    func finalizeMeeting(meetingId: String, audioPath: String, duration: Double, sizeBytes: Int64) async throws
+    func requestTranscription(meetingId: String, expectedSegments: Int?, deferExtraction: Bool, strict: Bool) async throws
+}
+
+extension MinutiaClient: CloudFinalizeTransport {}
 
 /// Owns the audio hot path off the main actor: ring buffers, the tap and mic, the segment writer,
 /// and the 250ms mix/write tick. Reports the tick's peak level and any freshly closed segments

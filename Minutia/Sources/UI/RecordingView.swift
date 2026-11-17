@@ -22,6 +22,11 @@ struct RecordingView: View {
         return min(total, max(1, Int((level * Float(total)).rounded(.up))))
     }
 
+    static func progressLine(uploaded: Int, total: Int, audioMayLeaveMac: Bool, deviceOnly: Bool) -> String {
+        if audioMayLeaveMac { return "\(uploaded) of \(total) segments uploaded" }
+        return deviceOnly ? "Transcribing as you record. Audio stays on this Mac." : "Transcribing on this Mac as you record"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -34,7 +39,7 @@ struct RecordingView: View {
 
             LevelMeter(level: session.level)
 
-            Text("\(session.segmentsUploaded) of \(session.segmentsTotal) segments uploaded")
+            Text(Self.progressLine(uploaded: session.segmentsUploaded, total: session.segmentsTotal, audioMayLeaveMac: session.audioMayLeaveMac, deviceOnly: session.deviceOnly))
                 .font(.caption)
                 .foregroundStyle(.secondary)
 

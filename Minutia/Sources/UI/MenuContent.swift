@@ -204,7 +204,7 @@ private struct RecoveryRow: View {
         HStack(spacing: 8) {
             ProgressView()
                 .controlSize(.small)
-            Text("Finishing a previous recording upload…")
+            Text(AppController.recoveryRowLabel)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .font(.callout)
@@ -314,7 +314,7 @@ private struct FinalizingView: View {
                     }
                 }
             } else {
-                Text("Uploading and requesting transcript")
+                Text(CaptureSession.finishingLabel(step: session.finishingStep, audioMayLeaveMac: session.audioMayLeaveMac))
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }

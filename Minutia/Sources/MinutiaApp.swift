@@ -151,8 +151,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "Finishing upload"
-        alert.informativeText = "Minutia is still finishing a recording upload. Finish and quit, or keep it running?"
+        let session = AppController.shared.captureSession
+        let copy = AppController.quitAlert(capturingAudioMayLeaveMac: AppController.quitAlertUploads(
+            phase: AppController.shared.phase, audioMayLeaveMac: session.audioMayLeaveMac, step: session.finishingStep))
+        alert.messageText = copy.title
+        alert.informativeText = copy.message
         alert.addButton(withTitle: "Finish & Quit")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else {
@@ -438,7 +441,7 @@ final class AppController: NSObject, ObservableObject {
     /// outlives the timed-out network step.
     nonisolated private static let deviceTranscriptFailure = "This meeting could not be transcribed on this Mac. The recording is kept on this Mac."
 
-    nonisolated static func finalizeFailureMessage(for error: Error, host: String?) -> String {
+    nonisolated static func finalizeFailureMessage(for error: Error, host: String?, audioMayLeaveMac: Bool = true) -> String {
         if case MinutiaClientError.featureUnavailable = error {
             return "Transcription is not enabled for this account on \(host ?? "the server"). Your audio is saved. Ask your workspace admin to enable AI features."
         }
@@ -448,11 +451,15 @@ final class AppController: NSObject, ObservableObject {
         case .nothingRecorded?: return "Nothing was recorded, so there is no transcript to send."
         default: break
         }
-        if case CaptureRecovery.RecoveryError.transcriptNotFinished = error {
+        if let recovery = error as? CaptureRecovery.RecoveryError,
+           recovery == .transcriptNotFinished || recovery == .audioStaysOnThisMac {
             return deviceTranscriptFailure
         }
+        if error is LocalTranscriber.Failure { return deviceTranscriptFailure }
         if error is TimeoutError {
-            return "Finishing the recording timed out. Your audio is saved locally; Retry to finish uploading."
+            return audioMayLeaveMac
+                ? "Finishing the recording timed out. Your audio is saved locally; Retry to finish uploading."
+                : "Finishing the recording timed out. Your audio is saved on this Mac. Retry to finish."
         }
         return "Could not finish recording: \(error.localizedDescription)"
     }
@@ -480,6 +487,23 @@ final class AppController: NSObject, ObservableObject {
     /// Quitting must prompt when there is unfinished durable work: a recording in flight (or
     /// finalizing its upload), or a startup recovery sweep still rescuing a prior recording. Leaving
     /// without finishing would defer the upload to the next-launch recovery at best.
+    nonisolated static func quitAlertUploads(phase: AppPhase, audioMayLeaveMac: Bool, step: CaptureSession.FinishingStep?) -> Bool? {
+        switch phase {
+        case .recording, .finalizing: audioMayLeaveMac || step == .fallingBackToCloud
+        default: nil
+        }
+    }
+
+    nonisolated static func quitAlert(capturingAudioMayLeaveMac: Bool?) -> (title: String, message: String) {
+        switch capturingAudioMayLeaveMac {
+        case true?: ("Finishing upload", "Minutia is still finishing a recording upload. Finish and quit, or keep it running?")
+        case false?: ("Finishing transcription", "Minutia is still transcribing a meeting on this Mac. Finish and quit, or keep it running?")
+        case nil: ("Finishing a recording", "Minutia is still finishing a previous recording. Finish and quit, or keep it running?")
+        }
+    }
+
+    nonisolated static let recoveryRowLabel = "Finishing a previous recording…"
+
     nonisolated static func shouldConfirmQuit(phase: AppPhase, recoveryActive: Bool) -> Bool {
         if recoveryActive { return true }
         switch phase {
@@ -634,6 +658,7 @@ final class AppController: NSObject, ObservableObject {
     /// The instance capture started against, captured at start so the recap URL survives an instance
     /// switch made while the meeting was recording.
     private var recordingInstance: URL?
+    private var recordingLanguage: String?
     private var earlyRecapMeetingId: UUID?
     private var lastFailedStart: FailedStart?
     /// The instance the detector's agenda provider is currently bound to. When it changes (an
@@ -643,6 +668,7 @@ final class AppController: NSObject, ObservableObject {
     private var detectorBoundInstance: URL?
     /// Single-flight guard for the startup recovery sweep.
     private var recoveryTask: Task<Void, Never>?
+    private var recoverySlot = RecoverySlot()
     private let defaults = UserDefaults.standard
     private var screenLocked = false
     private var asleep = false
@@ -701,6 +727,7 @@ final class AppController: NSObject, ObservableObject {
 
     private override init() {
         super.init()
+        ModelHub.offlineMode = true
         Self.registerNotificationCategories()
         UNUserNotificationCenter.current().delegate = self
         observeCheckinTriggers()
@@ -734,6 +761,11 @@ final class AppController: NSObject, ObservableObject {
         authManager.$sessionIdentity
             .removeDuplicates()
             .sink { [weak self] identity in self?.handleAuthChange(signedIn: identity.email != nil) }
+            .store(in: &cancellables)
+
+        modelStore.$status
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] status in if Self.shouldRunRecovery(on: status) { self?.runRecovery() } }
             .store(in: &cancellables)
 
         detector.$confidence
@@ -858,6 +890,8 @@ final class AppController: NSObject, ObservableObject {
         } else {
             checkinTimer?.invalidate()
             checkinTimer = nil
+            recoveryTask?.cancel()
+            recoverySlot = RecoverySlot()
             if Self.shouldStopCaptureOnSignOut(phase: phase) {
                 // Keep the recording ids set until the finalize completes: a fast re-sign-in would
                 // otherwise let runRecovery see no active meeting and touch the still-finalizing
@@ -1182,31 +1216,58 @@ final class AppController: NSObject, ObservableObject {
     }
 
     private func launchCapture(meetingId: String, seriesId: UUID?, announce: Bool, client: MinutiaClient, routing: CaptureRouting) async throws {
+        recoverySlot.captureWillStart()
+        var recording = false
+        defer { if recoverySlot.captureDidEnd(recording: recording) { runRecovery() } }
         let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
+        if let task = recoveryTask {
+            task.cancel()
+            try? await withTimeout(seconds: 3) { await task.value }
+        }
         try captureSession.start(
             meetingId: meetingId, seriesId: seriesId, userId: userId, client: client,
             decision: routing.decision, deviceOnly: routing.deviceOnly, language: routing.language,
-            transcriber: deviceTranscriber(for: routing))
+            transcriber: routing.decision == .device ? deviceTranscriber(language: routing.language) : nil)
         notepad.begin(meetingId: meetingId, instance: client.instance, userId: userId, client: client)
         recordingMeetingId = UUID(uuidString: meetingId)
         recordingSeriesId = seriesId
         recordingInstance = client.instance
+        recordingLanguage = routing.language
         resetEndDetectionState(origin: Self.detectionOrigin(for: lastConfidence))
+        recording = true
         apply(.recordStarted)
         if announce { postRecordingStartedNotification() }
         captureToken += 1
         verifySoleRecorder(meetingId: meetingId, token: captureToken, client: client)
     }
 
-    private func deviceTranscriber(for routing: CaptureRouting) -> LocalTranscriber? {
-        guard routing.decision == .device, let language = routing.language,
+    private func deviceTranscriber(language: String?) -> LocalTranscriber? {
+        guard let language,
               let entry = modelStore.routableEntry(forLanguage: language),
               let model = ParakeetEngine.Model(rawValue: entry.id) else { return nil }
         let directory = modelStore.directory(for: entry)
         let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
-        return LocalTranscriber(source: .onDevice(entry, appVersion: appVersion), language: language) {
-            ModelHub.offlineMode = true
-            return try await ParakeetEngine.load(model, from: directory)
+        return LocalTranscriber(source: .onDevice(entry, appVersion: appVersion), language: language, guardFloor: model.guardFloor) {
+            try await ParakeetEngine.load(model, from: directory)
+        }
+    }
+
+    private func recoveryTranscriber(_ manifest: CaptureManifest) throws -> LocalTranscriber? {
+        guard let language = manifest.language else { return nil }
+        let routable = modelStore.routableEntry(forLanguage: language) != nil
+        switch CaptureRecovery.modelDecision(
+            status: modelStore.status, hasEntry: modelStore.manifest.entry(forLanguage: language) != nil, isRoutable: routable) {
+        case .unusable:
+            return nil
+        case .deferred:
+            switch modelStore.status {
+            case .idle, .ready:
+                if authManager.sessionIdentity.email != nil { Task { await modelStore.prepare(language: language, remember: false) } }
+            default: break
+            }
+            throw CaptureRecovery.RecoveryError.deferred
+        case .ready:
+            return deviceTranscriber(language: language)
         }
     }
 
@@ -1493,6 +1554,7 @@ final class AppController: NSObject, ObservableObject {
         // captureSession.stop() again (it would throw notRunning and flip the UI to error).
         guard case .recording = phase else { return }
         apply(.recordStopped)
+        captureSession.beginFinishing(audioMayLeaveMac: captureSession.audioMayLeaveMac)
         notepad.end()
         report(.stopped, meetingId: recordingMeetingId)
         let meetingId = recordingMeetingId
@@ -1511,23 +1573,39 @@ final class AppController: NSObject, ObservableObject {
                 await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance, autoRecap: true)
             }
         }
+        let local = localOutcomeHandlers()
         Task {
             do {
-                let result = try await captureSession.stop(flushNotes: { [notepad] in try await notepad.flushNow() }, recapOpened: early)
+                let result = try await captureSession.stop(
+                    flushNotes: { [notepad] in try await notepad.flushNow() }, recapOpened: early,
+                    notifyLocalFailure: local.notify, onLocalOutcome: local.outcome)
                 recordingMeetingId = nil
                 recordingSeriesId = nil
                 recordingInstance = nil
                 apply(.finalized)
+                runRecovery()
                 if !early, result.transcriptRequested, let meetingId, let instance, Self.opensRecap(for: reason) {
                     await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance)
                 }
             } catch {
+                captureSession.endFinishing()
                 // The durable directory survives a timed-out finalize, so Retry finishes the upload
                 // rather than starting a new recording.
                 lastFailedStart = meetingId.map { .finalize(meetingId: $0.uuidString) } ?? .series
-                apply(.failed(Self.finalizeFailureMessage(for: error, host: instance?.host)))
+                apply(.failed(Self.finalizeFailureMessage(for: error, host: instance?.host, audioMayLeaveMac: captureSession.audioMayLeaveMac)))
             }
         }
+    }
+
+    private func localOutcomeHandlers() -> (notify: @Sendable (LocalTranscriber.Failure) async -> Void, outcome: @Sendable (Bool) async -> Void) {
+        let onDevice = !captureSession.audioMayLeaveMac
+        let language = recordingLanguage
+        let store = modelStore
+        return (
+            { _ in await Self.postNotification(title: "Meeting not transcribed", body: Self.deviceTranscriptFailure) },
+            { succeeded in
+                if onDevice, let language { await store.recordLocalTranscription(succeeded: succeeded, language: language) }
+            })
     }
 
     /// Awaited stop+finalize for app termination. Runs the same sequence as `stopRecording` but the
@@ -1538,6 +1616,7 @@ final class AppController: NSObject, ObservableObject {
         switch Self.quitFinishAction(phase: phase) {
         case .stop:
             apply(.recordStopped)
+            captureSession.beginFinishing(audioMayLeaveMac: captureSession.audioMayLeaveMac)
             if let meetingId = recordingMeetingId, let client = authManager.client() {
                 let deviceId = DeviceIdentity.id(in: defaults)
                 try? await withTimeout(seconds: 3) {
@@ -1547,14 +1626,17 @@ final class AppController: NSObject, ObservableObject {
                 }
             }
             do {
-                _ = try await captureSession.stop(flushNotes: { [notepad] in try await notepad.flushNow() })
+                let local = localOutcomeHandlers()
+                _ = try await captureSession.stop(
+                    flushNotes: { [notepad] in try await notepad.flushNow() },
+                    notifyLocalFailure: local.notify, onLocalOutcome: local.outcome)
                 recordingMeetingId = nil
                 recordingSeriesId = nil
                 recordingInstance = nil
                 apply(.finalized)
             } catch {
                 // stop() threw, so recordingInstance was not cleared: it still names the host.
-                apply(.failed(Self.finalizeFailureMessage(for: error, host: recordingInstance?.host)))
+                apply(.failed(Self.finalizeFailureMessage(for: error, host: recordingInstance?.host, audioMayLeaveMac: captureSession.audioMayLeaveMac)))
             }
         case .awaitFinalizing:
             // A stop is already in flight (the user pressed Stop, then quit). Calling stop() again
@@ -1564,9 +1646,11 @@ final class AppController: NSObject, ObservableObject {
         case .none:
             break
         }
-        // Drain an in-flight startup recovery sweep too, so Finish & Quit does not abandon a prior
-        // recording's rescue. No-op when nothing is recovering (the task is already nil).
-        await recoveryTask?.value
+        // An in-flight recovery sweep is cancelled and given a moment to stand down; its directories stay for the next launch.
+        if let task = recoveryTask {
+            task.cancel()
+            try? await withTimeout(seconds: 5) { await task.value }
+        }
     }
 
     private func waitWhileFinalizing() async {
@@ -1583,14 +1667,17 @@ final class AppController: NSObject, ObservableObject {
     /// finalize each. Single-flight and best-effort: a failure leaves the directory for a later
     /// launch. The live recording's directory (if any) is never swept.
     private func runRecovery() {
-        guard recoveryTask == nil, let client = authManager.client(), let instance = authManager.instance else { return }
+        if case .recording = phase { return }
+        guard let client = authManager.client(), let instance = authManager.instance else { return }
+        guard recoverySlot.requestRun() else { return }
         let activeId = recordingMeetingId?.uuidString
         recoveryActive = true
         let notepad = notepad
-        recoveryTask = Task { [weak self] in
+        occupyRecoverySlot { [weak self] in
             let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
             let result = await Self.recoverAll(
                 client: client, instance: instance, connectedUserId: userId, excluding: activeId,
+                makeTranscriber: { manifest in try await self?.recoveryTranscriber(manifest) },
                 flushNotes: { id in try await notepad.flush(meetingId: id, client: client) })
             await notepad.replayPending(client: client)
             // Recovery is otherwise silent; tell the user each rescued meeting is being finished, and
@@ -1605,6 +1692,9 @@ final class AppController: NSObject, ObservableObject {
                     title: "Transcription unavailable",
                     body: "Transcription is not enabled for this account on \(instance.host ?? "the server"). The recording is saved.")
             }
+            if !result.keptOnThisMac.isEmpty {
+                Self.postNotification(title: "Meeting not transcribed", body: Self.deviceTranscriptFailure)
+            }
             // A recording that has failed to finalize past the attempt ceiling is treated as
             // deterministically dead: tell the user once, keep the audio, stop retrying it.
             if !result.exhausted.isEmpty {
@@ -1613,7 +1703,22 @@ final class AppController: NSObject, ObservableObject {
                     body: "A saved recording could not be finished after several attempts. The audio is kept in Application Support.")
             }
             self?.recoveryActive = false
-            self?.recoveryTask = nil
+        }
+    }
+
+    private func occupyRecoverySlot(_ work: @escaping @MainActor () async -> Void) {
+        let previous = recoveryTask
+        let task = Task {
+            await withTaskCancellationHandler { await previous?.value } onCancel: { previous?.cancel() }
+            await work()
+        }
+        recoveryTask = task
+        Task {
+            await task.value
+            if recoveryTask == task {
+                recoveryTask = nil
+                if recoverySlot.runDidFinish() { runRecovery() }
+            }
         }
     }
 
@@ -1625,15 +1730,69 @@ final class AppController: NSObject, ObservableObject {
         case transcriptionUnavailable
         case unreadable
         case retryLater
+        case keptOnThisMac
+        case deferred
+    }
+
+    nonisolated static func shouldRunRecovery(on status: ModelStatus) -> Bool {
+        switch status {
+        case .ready, .failed, .blocked(.intelMac), .blocked(.unsupportedOS): return true
+        default: return false
+        }
     }
 
     nonisolated static func recoveryOutcome(for error: Error?) -> RecoveryOutcome {
         guard let error else { return .recovered }
         if case MinutiaClientError.featureUnavailable = error { return .transcriptionUnavailable }
+        if error is CancellationError || error as? CaptureRecovery.RecoveryError == .deferred { return .deferred }
         if let recoveryError = error as? CaptureRecovery.RecoveryError,
-           recoveryError == .unreadableRecording || recoveryError == .audioStaysOnThisMac { return .unreadable }
+           recoveryError == .unreadableRecording { return .unreadable }
+        if error as? CaptureRecovery.RecoveryError == .audioStaysOnThisMac { return .keptOnThisMac }
         if case CaptureSession.CaptureError.transcriptRejected? = error as? CaptureSession.CaptureError { return .unreadable }
         return .retryLater
+    }
+
+    enum RefinalizeOutcome: Equatable {
+        case finalized
+        case cancelled
+        case failed(String)
+    }
+
+    nonisolated static func refinalizeOutcome(for error: Error?, host: String?, audioMayLeaveMac: Bool = true) -> RefinalizeOutcome {
+        guard let error else { return .finalized }
+        if error is CancellationError { return .cancelled }
+        return .failed(finalizeFailureMessage(for: error, host: host, audioMayLeaveMac: audioMayLeaveMac))
+    }
+
+    enum SweepReport: Equatable { case recovered, transcriptionUnavailable, keptOnThisMac, exhausted }
+
+    struct SweepStep: Equatable {
+        var save: CaptureManifest?
+        var report: SweepReport?
+    }
+
+    nonisolated static func sweepStep(manifest: CaptureManifest, outcome: RecoveryOutcome, sweep: RecoverySweep) -> SweepStep {
+        var updated = manifest
+        switch outcome {
+        case .recovered:
+            return SweepStep(save: nil, report: .recovered)
+        case .transcriptionUnavailable:
+            guard !manifest.notified else { return SweepStep(save: nil, report: nil) }
+            updated.notified = true
+            return SweepStep(save: updated, report: .transcriptionUnavailable)
+        case .keptOnThisMac:
+            updated.recoveryAttempts = maxRecoveryAttempts
+            updated.notified = true
+            return SweepStep(save: updated, report: manifest.notified ? nil : .keptOnThisMac)
+        case .unreadable:
+            updated.recoveryAttempts = maxRecoveryAttempts
+            return SweepStep(save: updated, report: .exhausted)
+        case .deferred:
+            return SweepStep(save: nil, report: nil)
+        case .retryLater:
+            updated.recoveryAttempts = sweep.nextAttempts
+            return SweepStep(save: updated, report: sweep.notifyOnExhaustion ? .exhausted : nil)
+        }
     }
 
     /// After this many consecutive failed finalizes a capture is treated as deterministically dead:
@@ -1667,13 +1826,16 @@ final class AppController: NSObject, ObservableObject {
     /// static so it stays testable and off the main actor.
     nonisolated static func recoverAll(
         client: MinutiaClient, instance: URL, connectedUserId: String?, excluding activeMeetingId: String?,
+        makeTranscriber: @escaping @Sendable (CaptureManifest) async throws -> LocalTranscriber? = { _ in nil },
         flushNotes: @escaping @Sendable (String) async throws -> Void = { _ in }
-    ) async -> (recovered: [CaptureManifest], transcriptionUnavailable: [CaptureManifest], exhausted: [CaptureManifest]) {
+    ) async -> (recovered: [CaptureManifest], transcriptionUnavailable: [CaptureManifest], keptOnThisMac: [CaptureManifest], exhausted: [CaptureManifest]) {
         var recovered: [CaptureManifest] = []
         var transcriptionUnavailable: [CaptureManifest] = []
+        var keptOnThisMac: [CaptureManifest] = []
         var exhausted: [CaptureManifest] = []
-        guard let root = try? CaptureStore.capturesRoot() else { return (recovered, transcriptionUnavailable, exhausted) }
+        guard let root = try? CaptureStore.capturesRoot() else { return (recovered, transcriptionUnavailable, keptOnThisMac, exhausted) }
         for dir in CaptureRecovery.recoverableDirectories(in: root, excluding: activeMeetingId) {
+            guard !Task.isCancelled else { break }
             guard let manifest = CaptureRecovery.loadManifest(from: dir) else {
                 logger.error("Recovery: unreadable manifest at \(dir.lastPathComponent, privacy: .public)")
                 continue
@@ -1690,52 +1852,44 @@ final class AppController: NSObject, ObservableObject {
             var caught: Error?
             do {
                 try await CaptureRecovery.recover(
-                    directory: dir, manifest: manifest, client: client,
+                    directory: dir, manifest: manifest, client: client, makeTranscriber: makeTranscriber,
                     flushNotes: { try await flushNotes(manifest.meetingId) })
             } catch {
                 caught = error
             }
-            switch recoveryOutcome(for: caught) {
+            if Task.isCancelled, caught != nil { break }
+            let outcome = recoveryOutcome(for: caught)
+            let step = sweepStep(manifest: manifest, outcome: outcome, sweep: sweep)
+            if let save = step.save { CaptureRecovery.saveManifest(save, to: dir) }
+            switch outcome {
             case .recovered:
                 try? FileManager.default.removeItem(at: dir)
                 if let notesRoot = try? NotepadStore.notesRoot() {
                     NotepadStore.removeIfSynced(meetingId: manifest.meetingId, in: notesRoot)
                 }
-                recovered.append(manifest)
             case .transcriptionUnavailable:
-                // Keep the directory: the audio is safe (uploaded + finalized) and the entitlement may
-                // be granted later. Never delete on featureUnavailable. Logged every sweep, but the
-                // user-facing notification fires once per directory (persisted `notified` flag).
                 logger.error("Recovery: transcription not enabled for meeting \(manifest.meetingId, privacy: .public)")
-                if !manifest.notified {
-                    var updated = manifest
-                    updated.notified = true
-                    CaptureRecovery.saveManifest(updated, to: dir)
-                    transcriptionUnavailable.append(manifest)
-                }
             case .unreadable:
-                // An unreadable recording never becomes readable: stop retrying at once and keep the audio.
-                var updated = manifest
-                updated.recoveryAttempts = maxRecoveryAttempts
-                CaptureRecovery.saveManifest(updated, to: dir)
                 logger.error("Recovery: unreadable recording for meeting \(manifest.meetingId, privacy: .public)")
-                exhausted.append(manifest)
             case .retryLater:
-                // Persist the incremented attempt count so the bound survives relaunches. Keep the
-                // audio; when the count reaches the ceiling, notify the user exactly once.
-                var updated = manifest
-                updated.recoveryAttempts = sweep.nextAttempts
-                CaptureRecovery.saveManifest(updated, to: dir)
                 logger.error("Recovery deferred for meeting \(manifest.meetingId, privacy: .public) attempt \(sweep.nextAttempts, privacy: .public): \(String(describing: caught), privacy: .public)")
-                if sweep.notifyOnExhaustion { exhausted.append(manifest) }
+            case .keptOnThisMac, .deferred:
+                break
+            }
+            switch step.report {
+            case .recovered?: recovered.append(manifest)
+            case .transcriptionUnavailable?: transcriptionUnavailable.append(manifest)
+            case .keptOnThisMac?: keptOnThisMac.append(manifest)
+            case .exhausted?: exhausted.append(manifest)
+            case nil: break
             }
         }
-        return (recovered, transcriptionUnavailable, exhausted)
+        return (recovered, transcriptionUnavailable, keptOnThisMac, exhausted)
     }
 
     nonisolated static func recoveryNotificationBody(transcriptionMode: TranscriptionMode) -> String {
         transcriptionMode == .device
-            ? "A meeting transcribed on this Mac has been sent."
+            ? "A meeting that didn't finish has been recovered. The recap is being prepared."
             : "A meeting that didn't finish uploading has been recovered. The recap is being prepared."
     }
 
@@ -1779,16 +1933,20 @@ final class AppController: NSObject, ObservableObject {
     private func refinalize(meetingId: String) {
         guard case .error = phase, let client = authManager.client() else { return }
         apply(.refinalizeStarted)
-        Task {
+        _ = recoverySlot.requestRun()
+        occupyRecoverySlot { [self] in
+            defer { captureSession.endFinishing() }
+            let dir = try? CaptureStore.capturesRoot()
+                .appendingPathComponent(meetingId.lowercased(), isDirectory: true)
+            let manifest = dir.flatMap { CaptureRecovery.loadManifest(from: $0) }
+            if let manifest { captureSession.beginFinishing(audioMayLeaveMac: manifest.audioMayLeaveMac) }
             do {
-                let dir = try CaptureStore.capturesRoot()
-                    .appendingPathComponent(meetingId.lowercased(), isDirectory: true)
-                guard let manifest = CaptureRecovery.loadManifest(from: dir) else {
-                    throw CaptureSession.CaptureError.notRunning
-                }
+                guard let dir, let manifest else { throw CaptureSession.CaptureError.notRunning }
                 try await CaptureRecovery.recover(
                     directory: dir, manifest: manifest, client: client,
-                    flushNotes: { [notepad] in try await notepad.flush(meetingId: meetingId, client: client) })
+                    makeTranscriber: { [weak self] in try await self?.recoveryTranscriber($0) },
+                    flushNotes: { [notepad] in try await notepad.flush(meetingId: meetingId, client: client) },
+                    onStep: captureSession.finishingStepReporter())
                 try? FileManager.default.removeItem(at: dir)
                 if let notesRoot = try? NotepadStore.notesRoot() {
                     NotepadStore.removeIfSynced(meetingId: meetingId, in: notesRoot)
@@ -1802,13 +1960,14 @@ final class AppController: NSObject, ObservableObject {
                         seriesId: manifest.seriesId.flatMap { UUID(uuidString: $0) },
                         instance: manifest.instanceURL)
                 }
-            } catch CaptureRecovery.RecoveryError.audioStaysOnThisMac {
-                apply(.finalized)
             } catch {
-                // Re-arm the finalize target: apply(.refinalizeStarted) moved through .finalizing,
-                // which retires lastFailedStart, so set it again before parking back in .error.
-                lastFailedStart = .finalize(meetingId: meetingId)
-                apply(.failed(Self.finalizeFailureMessage(for: error, host: authManager.instance?.host)))
+                switch Self.refinalizeOutcome(for: error, host: authManager.instance?.host, audioMayLeaveMac: manifest?.audioMayLeaveMac ?? true) {
+                case .finalized: apply(.finalized)
+                case .cancelled: break
+                case .failed(let message):
+                    lastFailedStart = .finalize(meetingId: meetingId)
+                    apply(.failed(message))
+                }
             }
         }
     }

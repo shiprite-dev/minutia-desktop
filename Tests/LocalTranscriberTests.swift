@@ -216,4 +216,161 @@ final class LocalTranscriberTests: XCTestCase {
             XCTFail("a load failure must surface")
         } catch {}
     }
+
+    // MARK: Segment failures, the stop guard, and the load bound
+
+    private func guarded(_ engine: ScriptedEngine, gate: LoadGate = LoadGate(open: true), loadFailure: Error? = nil,
+                         loadTimeout: TimeInterval = LocalTranscriber.loadTimeoutSeconds) -> LocalTranscriber {
+        LocalTranscriber(source: DeviceFixtures.source, language: "en", guardFloor: DeviceFixtures.ultra.guardFloor,
+                         loadTimeout: loadTimeout, loadEngine: gate.loader(engine, failure: loadFailure))
+    }
+
+    /// Enqueues segments 0 to count-2 as if recorded, and finishes with the last as the tail.
+    private func finishMeeting(_ local: LocalTranscriber, segments count: Int) async throws -> DeviceTranscript {
+        await local.startLoading()
+        for seq in 0..<(count - 1) { local.enqueue(DeviceFixtures.segment(seq, in: dir)) }
+        return try await local.finish(tail: [DeviceFixtures.segment(count - 1, in: dir)], durationSeconds: Double(count) * 300)
+    }
+
+    private func failure(of work: @escaping @Sendable () async throws -> DeviceTranscript,
+                         within seconds: TimeInterval = 5) async -> Error? {
+        let outcome = OutcomeBox()
+        Task {
+            do { _ = try await work(); outcome.set(nil) } catch { outcome.set(error) }
+        }
+        let settled = await eventually(timeout: seconds) { outcome.settled }
+        XCTAssertTrue(settled, "finish must settle within \(seconds)s")
+        return outcome.error
+    }
+
+    func test_oneFailedSegment_isDroppedFromTheTranscript_andTheRestStillTranscribe() async throws {
+        let local = guarded(DeviceFixtures.meetingEngine(8, failing: [3]))
+        let transcript = try await finishMeeting(local, segments: 8)
+        XCTAssertEqual(transcript.segments.map(\.text), DeviceFixtures.items(8, except: [3]))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("seg-3.transcript.json").path),
+                       "a failed segment leaves no partial transcript beside its audio")
+    }
+
+    func test_aMeetingThatTripsTheStopGuard_failsFinishAsQualityGuard() async {
+        let rows: [(String, ScriptedEngine, Int)] = [
+            ("two failed segments in a row", DeviceFixtures.meetingEngine(10, failing: [4, 5]), 10),
+            ("a quarter of eight segments under the floor", DeviceFixtures.meetingEngine(8, lowConfidence: [2, 6]), 8),
+            ("the only segment failing", DeviceFixtures.meetingEngine(1, failing: [0]), 1),
+        ]
+        for (label, engine, count) in rows {
+            let local = guarded(engine)
+            let error = await failure { try await self.finishMeeting(local, segments: count) }
+            XCTAssertEqual(error as? LocalTranscriber.Failure, .qualityGuard, "\(label): got \(String(describing: error))")
+        }
+    }
+
+    func test_theFirstFourSegmentsAllFailing_skipsLocalTranscriptionOfTheRest() async {
+        let engine = DeviceFixtures.meetingEngine(7, failing: [0, 1, 2, 3, 4, 5, 6])
+        let local = guarded(engine)
+        let error = await failure { try await self.finishMeeting(local, segments: 7) }
+        XCTAssertEqual(error as? LocalTranscriber.Failure, .qualityGuard, "got \(String(describing: error))")
+        XCTAssertEqual(engine.calls.filter { ["seg-4", "seg-5", "seg-6"].contains(String($0.prefix(5))) }, [],
+                       "segments after the early abort never reach the engine; got \(engine.calls)")
+    }
+
+    func test_aModelLoadError_failsFinishAsModelLoad_withoutRetryingTheLoadPerSegment() async {
+        let gate = LoadGate(open: true)
+        let local = guarded(DeviceFixtures.meetingEngine(3), gate: gate, loadFailure: CocoaError(.fileReadCorruptFile))
+        let error = await failure { try await self.finishMeeting(local, segments: 3) }
+        XCTAssertEqual(error as? LocalTranscriber.Failure, .modelLoad, "got \(String(describing: error))")
+        XCTAssertEqual(gate.loads, 1)
+    }
+
+    func test_theModelLoadTimeout_isTwoMinutes() {
+        XCTAssertEqual(LocalTranscriber.loadTimeoutSeconds, 120)
+    }
+
+    func test_aModelLoadPastItsTimeout_failsFinishAsTimedOut_withoutWaitingForTheLoad() async {
+        let gate = LoadGate()
+        let local = guarded(DeviceFixtures.meetingEngine(2), gate: gate, loadTimeout: 0.3)
+        let error = await failure { try await self.finishMeeting(local, segments: 2) }
+        gate.open()
+        XCTAssertEqual(error as? LocalTranscriber.Failure, .modelLoadTimedOut, "got \(String(describing: error))")
+    }
+
+    func test_aSlowModelLoadUnderItsTimeout_isNotAFailure() async throws {
+        let gate = LoadGate()
+        let local = guarded(DeviceFixtures.meetingEngine(2), gate: gate, loadTimeout: 5)
+        let finishing = Task { try await self.finishMeeting(local, segments: 2) }
+        try await Task.sleep(nanoseconds: 500_000_000)
+        gate.open()
+        let transcript = try await finishing.value
+        XCTAssertEqual(transcript.segments.map(\.text), DeviceFixtures.items(2))
+    }
+
+    // MARK: Cancel stops the engine before a recording starts
+
+    /// A recording starting cancels recovery, and the recording must not share the Neural Engine with a
+    /// transcription still running. A Core ML call does not stop when its task is cancelled, so cancel
+    /// waits for it to return, and the cancelled job never starts its next engine call.
+    func test_cancel_returnsOnlyOnceTheEngineCallInFlightHasReturned_evenWhenTheEngineIgnoresCancellation() async throws {
+        let engine = StubbornEngine(milliseconds: 600)
+        let local = LocalTranscriber(source: DeviceFixtures.source, language: "en", loadEngine: LoadGate(open: true).loader(engine))
+        await local.startLoading()
+        local.enqueue(DeviceFixtures.segment(0, in: dir))
+        let running = await eventually { engine.inFlight == 1 }
+        XCTAssertTrue(running, "precondition: the mic channel is being transcribed")
+
+        await local.cancel()
+
+        XCTAssertEqual(engine.inFlight, 0, "cancel returns only when no engine call is running")
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(engine.started, 1, "the cancelled job never starts its system channel")
+        let loaded = await local.isEngineLoaded
+        XCTAssertFalse(loaded, "cancel drops the engine")
+    }
+
+    /// A model load cannot be interrupted either. Cancel waits for it, and an engine that arrives after
+    /// cancel is released instead of kept.
+    func test_anEngineThatFinishesLoadingAfterCancel_isReleased_neverKept() async throws {
+        let gate = LoadGate()
+        let handedOut = WeakEngine()
+        let local = LocalTranscriber(source: DeviceFixtures.source, language: "en", loadEngine: {
+            let engine = ScriptedEngine()
+            handedOut.engine = engine
+            return try await gate.loader(engine)()
+        })
+        await local.startLoading()
+        let loading = await eventually { gate.loads == 1 }
+        XCTAssertTrue(loading, "precondition: the model is loading")
+
+        let cancelled = Finish()
+        let cancelling = Task { await local.cancel(); cancelled.record(nil) }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertFalse(cancelled.done, "cancel waits for the load in flight")
+        gate.open()
+        await cancelling.value
+
+        let loaded = await local.isEngineLoaded
+        XCTAssertFalse(loaded, "an engine that arrives after cancel is not kept")
+        let released = await eventually { handedOut.engine == nil }
+        XCTAssertTrue(released, "and nothing else holds it")
+        XCTAssertEqual(gate.loads, 1, "cancel never starts another load")
+    }
+
+    /// A job cancelled while it waits on a slow model load must not run once the load lands: a recording
+    /// that cancelled recovery would otherwise share the Neural Engine with a transcription of the mic.
+    func test_aJobCancelledWhileWaitingOnTheLoad_neverTranscribes_whenTheLoadFinishesAfterCancel() async throws {
+        let gate = LoadGate()
+        let engine = ScriptedEngine()
+        let local = LocalTranscriber(source: DeviceFixtures.source, language: "en", loadEngine: gate.loader(engine))
+        await local.startLoading()
+        local.enqueue(DeviceFixtures.segment(0, in: dir))
+        let loading = await eventually { gate.loads == 1 }
+        XCTAssertTrue(loading, "precondition: the model is loading")
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        let cancelling = Task { await local.cancel() }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        gate.open()
+        await cancelling.value
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertEqual(engine.calls, [], "the cancelled job makes no engine call")
+    }
 }

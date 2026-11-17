@@ -467,6 +467,26 @@ final class RequestTranscriptionStatusTests: XCTestCase {
             }
         }
     }
+
+    /// A device meeting's cloud fallback has no fast-lane segments to assemble a transcript from, so
+    /// strict treats the "not configured" 503 as a failure and the caller keeps the recording.
+    func test_requestTranscription_strict_throwsOn503_andStillAcceptsA2xx() async {
+        stub(status: 503)
+        do {
+            try await makeStubbedClient().requestTranscription(meetingId: "m1", expectedSegments: nil, strict: true)
+            XCTFail("a strict 503 must throw")
+        } catch MinutiaClientError.serverError(let status) {
+            XCTAssertEqual(status, 503)
+        } catch {
+            XCTFail("unexpected error \(error)")
+        }
+        stub(status: 200)
+        do {
+            try await makeStubbedClient().requestTranscription(meetingId: "m1", expectedSegments: nil, strict: true)
+        } catch {
+            XCTFail("a strict 200 unexpectedly threw \(error)")
+        }
+    }
 }
 
 /// The single tested seam that turns a transcribe-route (status, body) into a retry/terminal

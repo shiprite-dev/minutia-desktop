@@ -668,6 +668,19 @@ final class ModelStoreTests: XCTestCase {
         XCTAssertEqual(store.status, .ready(revision: manifest.entry(forLanguage: "ja")!.revision))
     }
 
+    /// Recovery prepares the model a rescued meeting needs without taking over the user's language: the
+    /// language prepared again after a recording is still the one the user asked for.
+    func test_aPrepareThatDoesNotRemember_preparesItsLanguage_butNeverReplacesTheUsersLanguage() async {
+        let store = await readyEnglishStore()
+
+        await store.prepare(language: "ja", remember: false)
+        XCTAssertEqual(store.routableEntry(forLanguage: "ja")?.id, "fake-ja", "the rescued meeting's language is prepared")
+
+        store.recordingDidStart()
+        await store.recordingDidStop()
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"), "the user's language is the one resumed after a recording")
+    }
+
     func test_recordingStartMidDownload_cancelsTheTransfer_andResumesFromDiskWhenItStops() async {
         let manifest = Fixture.manifest()
         let weight = url("Encoder.mlmodelc/weights/weight.bin", in: en(manifest))
@@ -937,6 +950,161 @@ final class ModelStoreTests: XCTestCase {
         XCTAssertEqual(transfer.cancellations, 1, "the in-flight transfer is cancelled on sign-out")
         XCTAssertNotEqual(store.status, .ready(revision: "en-rev-1"))
         XCTAssertNil(store.routableEntry(forLanguage: "en"))
+    }
+
+    // MARK: Local transcription failures
+
+    func test_twoLocalFailuresInARow_reverifyTheModelOnce_redownloadingACorruptFile() async throws {
+        XCTAssertEqual(ModelStore.failuresBeforeReverify, 2)
+        let manifest = Fixture.manifest()
+        let transfer = FakeTransfer(manifest: manifest)
+        let warmer = FakeWarmer()
+        let store = makeStore(manifest: manifest, transfer: transfer, warmer: warmer)
+        await store.prepare(language: "en")
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"), "precondition: English entry ready")
+        let installRequests = transfer.requests.count
+        try Data(repeating: 0xAB, count: 64).write(
+            to: store.directory(for: en(manifest)).appendingPathComponent("Encoder.mlmodelc/weights/weight.bin"))
+
+        await store.recordLocalTranscription(succeeded: false, language: "en")
+        XCTAssertEqual(transfer.requests.count, installRequests, "one failure does not re-verify")
+        XCTAssertEqual(warmer.calls, ["fake-en"])
+        XCTAssertTrue(store.healthyRevisions.contains("en-rev-1"), "one failure keeps the model routable")
+
+        await store.recordLocalTranscription(succeeded: false, language: "en")
+        _ = await eventually { warmer.calls.count == 2 && store.healthyRevisions.contains("en-rev-1") }
+        XCTAssertEqual(transfer.requests.dropFirst(installRequests).map(\.url), [url("Encoder.mlmodelc/weights/weight.bin", in: en(manifest))],
+                       "the second failure in a row re-verifies every file and re-downloads the corrupt one")
+        XCTAssertEqual(warmer.calls, ["fake-en", "fake-en"], "the re-verified model is warmed again")
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"))
+
+        await store.recordLocalTranscription(succeeded: false, language: "en")
+        _ = await eventually(timeout: 0.3) { warmer.calls.count > 2 }
+        XCTAssertEqual(warmer.calls.count, 2, "the re-verify resets the count, so the next failure alone does not repeat it")
+    }
+
+    /// The stop reports its local outcome while the store still treats the meeting as recording, so the
+    /// re-verify waits for `recordingDidStop` instead of being dropped.
+    func test_twoLocalFailuresReportedWhileRecording_reverifyOnceRecordingStops_redownloadingACorruptFile() async throws {
+        let manifest = Fixture.manifest()
+        let transfer = FakeTransfer(manifest: manifest)
+        let warmer = FakeWarmer()
+        let store = makeStore(manifest: manifest, transfer: transfer, warmer: warmer)
+        await store.prepare(language: "en")
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"), "precondition: English entry ready")
+        let installRequests = transfer.requests.count
+        try Data(repeating: 0xAB, count: 64).write(
+            to: store.directory(for: en(manifest)).appendingPathComponent("Encoder.mlmodelc/weights/weight.bin"))
+
+        store.recordingDidStart()
+        await store.recordLocalTranscription(succeeded: false, language: "en")
+        await store.recordLocalTranscription(succeeded: false, language: "en")
+        XCTAssertEqual(transfer.requests.count, installRequests, "nothing is fetched while a meeting is still finishing")
+        XCTAssertEqual(warmer.calls, ["fake-en"])
+
+        await store.recordingDidStop()
+        XCTAssertEqual(transfer.requests.dropFirst(installRequests).map(\.url), [url("Encoder.mlmodelc/weights/weight.bin", in: en(manifest))],
+                       "once recording stops every file is re-hashed and the corrupt one re-downloaded")
+        XCTAssertEqual(warmer.calls, ["fake-en", "fake-en"], "the re-verified model is warmed again")
+        XCTAssertEqual(store.status, .ready(revision: "en-rev-1"))
+    }
+
+    func test_twoLocalFailuresInARow_markTheModelUnhealthy_whenItCannotBeRevived() async {
+        _ = await readyEnglishStore()
+        let warmer = FakeWarmer(fails: true)
+        let broken = makeStore(warmer: warmer)
+        await broken.prepare(language: "en")
+        XCTAssertNotNil(broken.routableEntry(forLanguage: "en"), "precondition: healthy across relaunch")
+
+        await broken.recordLocalTranscription(succeeded: false, language: "en")
+        await broken.recordLocalTranscription(succeeded: false, language: "en")
+        _ = await eventually { !warmer.calls.isEmpty }
+
+        XCTAssertFalse(broken.healthyRevisions.contains("en-rev-1"))
+        XCTAssertNil(broken.routableEntry(forLanguage: "en"), "the next meeting is not routed to a model that keeps failing")
+        XCTAssertNil(makeStore().routableEntry(forLanguage: "en"), "unhealthy survives relaunch")
+    }
+
+    func test_aLocalSuccessBetweenFailures_resetsTheCount() async {
+        let manifest = Fixture.manifest()
+        let transfer = FakeTransfer(manifest: manifest)
+        let warmer = FakeWarmer()
+        let store = makeStore(manifest: manifest, transfer: transfer, warmer: warmer)
+        await store.prepare(language: "en")
+        let installRequests = transfer.requests.count
+
+        await store.recordLocalTranscription(succeeded: false, language: "en")
+        await store.recordLocalTranscription(succeeded: true, language: "en")
+        await store.recordLocalTranscription(succeeded: false, language: "en")
+
+        XCTAssertEqual(transfer.requests.count, installRequests)
+        XCTAssertEqual(warmer.calls, ["fake-en"], "no re-verify")
+        XCTAssertTrue(store.healthyRevisions.contains("en-rev-1"))
+    }
+
+    func test_localFailuresInARow_countAcrossMeetingsAndRelaunches() async {
+        let first = await readyEnglishStore()
+        await first.recordLocalTranscription(succeeded: false, language: "en")
+
+        let warmer = FakeWarmer()
+        let relaunched = makeStore(warmer: warmer)
+        await relaunched.prepare(language: "en")
+        XCTAssertEqual(warmer.calls, [], "precondition: an unchanged relaunch skips the warm-up")
+        await relaunched.recordLocalTranscription(succeeded: false, language: "en")
+        _ = await eventually { !warmer.calls.isEmpty && relaunched.status == .ready(revision: "en-rev-1") }
+
+        XCTAssertEqual(warmer.calls, ["fake-en"], "the failure before the relaunch counts toward the re-verify")
+        XCTAssertEqual(relaunched.status, .ready(revision: "en-rev-1"))
+    }
+
+    /// The stop reports its local outcome inline, so the second failure must hand the re-verify off
+    /// instead of holding the stop through a re-hash and re-download.
+    func test_theSecondLocalFailure_returnsWhileTheReverifyIsStillDownloading_andTheReverifyStillFinishes() async throws {
+        executionTimeAllowance = 60
+        _ = await readyEnglishStore()
+        let manifest = Fixture.manifest()
+        let weight = url("Encoder.mlmodelc/weights/weight.bin", in: en(manifest))
+        let transfer = FakeTransfer(manifest: manifest, gate: (weight, 20))
+        let warmer = FakeWarmer()
+        let store = makeStore(manifest: manifest, transfer: transfer, warmer: warmer)
+        await store.prepare(language: "en")
+        XCTAssertTrue(transfer.requests.isEmpty, "precondition: the relaunch fetched nothing")
+        try Data(repeating: 0xAB, count: 64).write(to: store.directory(for: en(manifest)).appendingPathComponent("Encoder.mlmodelc/weights/weight.bin"))
+
+        let started = Date()
+        await store.recordLocalTranscription(succeeded: false, language: "en")
+        await store.recordLocalTranscription(succeeded: false, language: "en")
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertLessThan(elapsed, 1, "the stop never waits on the re-verify's download")
+        XCTAssertEqual(warmer.calls, [], "the re-verify has not finished when the call returns")
+        await transfer.waitUntilGateReached()
+        XCTAssertEqual(transfer.requests.map(\.url), [weight], "the re-verify is running: it re-fetches the corrupt file")
+        transfer.release()
+        let finished = await eventually { warmer.calls == ["fake-en"] && store.status == .ready(revision: "en-rev-1") }
+        XCTAssertTrue(finished, "the re-verify still completes; status \(store.status), warm-ups \(warmer.calls)")
+        XCTAssertTrue(store.healthyRevisions.contains("en-rev-1"))
+    }
+
+    /// Signed out, the store has no meeting language to prepare for, so a re-verify threshold only drops
+    /// the model's health and never starts a download.
+    func test_localFailuresAfterSignOut_dropTheModelsHealth_butNeverDownload() async throws {
+        let manifest = Fixture.manifest()
+        let transfer = FakeTransfer(manifest: manifest)
+        let warmer = FakeWarmer()
+        let store = makeStore(manifest: manifest, transfer: transfer, warmer: warmer)
+        await store.prepare(language: "en")
+        let installRequests = transfer.requests.count
+        try Data(repeating: 0xAB, count: 64).write(to: store.directory(for: en(manifest)).appendingPathComponent("Encoder.mlmodelc/weights/weight.bin"))
+
+        await store.recordingDidStop(resume: false)
+        await store.recordLocalTranscription(succeeded: false, language: "en")
+        await store.recordLocalTranscription(succeeded: false, language: "en")
+        _ = await eventually(timeout: 0.5) { transfer.requests.count > installRequests || warmer.calls.count > 1 }
+
+        XCTAssertEqual(transfer.requests.count, installRequests, "a signed-out store never downloads: \(transfer.requests.dropFirst(installRequests))")
+        XCTAssertEqual(warmer.calls, ["fake-en"], "and never warms")
+        XCTAssertNil(store.routableEntry(forLanguage: "en"), "the failing model is no longer routed")
     }
 }
 

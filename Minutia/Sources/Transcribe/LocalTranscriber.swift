@@ -8,6 +8,16 @@ actor LocalTranscriber {
     static let idleUnloadSeconds: TimeInterval = 60
     /// FluidAudio's `ASRConstants.minimumAudioDurationSeconds`: shorter audio throws `invalidAudioData`.
     static let minimumSegmentSeconds: Double = 0.3
+    /// A model load running longer than this fails the meeting's local transcription.
+    static let loadTimeoutSeconds: TimeInterval = 120
+
+    /// Why a meeting's local transcription failed as a whole.
+    enum Failure: Error, Equatable {
+        case modelLoad
+        case modelLoadTimedOut
+        case qualityGuard
+        case transcriptionTimedOut
+    }
 
     /// Contents of `seg-N.transcript.json`: both channels, labeled and on the meeting clock.
     struct SegmentTranscript: Codable, Equatable {
@@ -22,19 +32,26 @@ actor LocalTranscriber {
     private let language: String
     private let unloadAfter: TimeInterval
     private let loadEngine: @Sendable () async throws -> any SpeechEngine
+    private let guardFloor: Double
+    private let loadTimeout: TimeInterval
 
     init(source: DeviceTranscript.Source, language: String,
          idleUnloadSeconds: TimeInterval = LocalTranscriber.idleUnloadSeconds,
+         guardFloor: Double = 0, loadTimeout: TimeInterval = LocalTranscriber.loadTimeoutSeconds,
          loadEngine: @escaping @Sendable () async throws -> any SpeechEngine) {
         self.source = source
         self.language = language
         unloadAfter = idleUnloadSeconds
+        self.guardFloor = guardFloor
+        self.loadTimeout = loadTimeout
         self.loadEngine = loadEngine
     }
 
     private var engine: (any SpeechEngine)?
     private var loadTask: Task<any SpeechEngine, Error>?
-    private var loadFailure: Error?
+    private var loadFailure: Failure?
+    private var loadStartedAt = Date()
+    private var verdicts: [Int: QualityGuard.Verdict] = [:]
     private var unloadTask: Task<Void, Never>?
 
     private let intakeLock = NSLock()
@@ -45,7 +62,7 @@ actor LocalTranscriber {
     var isEngineLoaded: Bool { engine != nil }
 
     func startLoading() {
-        guard engine == nil, loadTask == nil else { return }
+        guard engine == nil, loadTask == nil, loadFailure == nil else { return }
         beginLoad()
     }
 
@@ -62,18 +79,19 @@ actor LocalTranscriber {
             }
         }
         loadTask = task
-        loadFailure = nil
+        loadStartedAt = Date()
         return task
     }
 
     private func didLoad(_ loaded: any SpeechEngine) {
+        guard loadFailure == nil, !intakeLock.withLock({ cancelled }) else { return }
         engine = loaded
         loadTask = nil
     }
 
     private func didFailLoad(_ error: Error) {
         loadTask = nil
-        loadFailure = error
+        if !(error is CancellationError), loadFailure == nil { loadFailure = .modelLoad }
     }
 
     private var activeCount: Int { intakeLock.withLock { activeJobs } }
@@ -81,8 +99,34 @@ actor LocalTranscriber {
     private func engineForJob() async throws -> any SpeechEngine {
         unloadTask?.cancel()
         unloadTask = nil
+        if let loadFailure { throw loadFailure }
         if let engine { return engine }
-        return try await (loadTask ?? beginLoad()).value
+        let task = loadTask ?? beginLoad()
+        let remaining = max(0, loadTimeout - Date().timeIntervalSince(loadStartedAt))
+        do {
+            return try await Self.race(task, timeout: remaining)
+        } catch Failure.modelLoadTimedOut {
+            loadFailure = loadFailure ?? .modelLoadTimedOut
+            throw loadFailure!
+        } catch {
+            throw loadFailure ?? error
+        }
+    }
+
+    private static func race(_ task: Task<any SpeechEngine, Error>, timeout: TimeInterval) async throws -> any SpeechEngine {
+        let once = LockedFlag()
+        let claim: @Sendable () -> Bool = { once.claim() }
+        return try await withCheckedThrowingContinuation { continuation in
+            let timer = Task {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                if !Task.isCancelled, claim() { continuation.resume(throwing: Failure.modelLoadTimedOut) }
+            }
+            Task {
+                let result = await task.result
+                timer.cancel()
+                if claim() { continuation.resume(with: result) }
+            }
+        }
     }
 
     private func scheduleUnload() {
@@ -103,17 +147,43 @@ actor LocalTranscriber {
 
     private func run(_ segment: SegmentWriter.ClosedSegment) async throws -> [DeviceTranscript.Segment] {
         guard Double(segment.frames) / MixPlan.sampleRate >= Self.minimumSegmentSeconds else { return [] }
-        let engine = try await engineForJob()
-        let mine = try await engine.transcribe(.file(segment.micURL))
-        let theirs = try await engine.transcribe(.file(segment.sysURL))
-        let labeled = DeviceTranscript.labeled(mine, speaker: .me, offset: segment.offsetSeconds)
-            + DeviceTranscript.labeled(theirs, speaker: .them, offset: segment.offsetSeconds)
-        let saved = SegmentTranscript(seq: segment.seq, modelId: engine.modelId, segments: labeled)
-        try JSONEncoder().encode(saved).write(
-            to: segment.micURL.deletingLastPathComponent().appendingPathComponent(Self.transcriptName(seq: segment.seq)),
-            options: .atomic)
-        return labeled
+        guard !QualityGuard.abortsEarly(orderedVerdicts) else { return [] }
+        do {
+            let engine = try await engineForJob()
+            try Task.checkCancellation()
+            let mine = try await engine.transcribe(.file(segment.micURL))
+            try Task.checkCancellation()
+            let theirs = try await engine.transcribe(.file(segment.sysURL))
+            let verdict = QualityGuard.verdict(mine.segments + theirs.segments, floor: guardFloor)
+            guard verdict != .fail else { verdicts[segment.seq] = .fail; return [] }
+            let labeled = DeviceTranscript.labeled(mine, speaker: .me, offset: segment.offsetSeconds)
+                + DeviceTranscript.labeled(theirs, speaker: .them, offset: segment.offsetSeconds)
+            let saved = SegmentTranscript(seq: segment.seq, modelId: engine.modelId, segments: labeled)
+            try JSONEncoder().encode(saved).write(
+                to: segment.micURL.deletingLastPathComponent().appendingPathComponent(Self.transcriptName(seq: segment.seq)),
+                options: .atomic)
+            verdicts[segment.seq] = verdict
+            return labeled
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            verdicts[segment.seq] = .fail
+            return []
+        }
     }
+
+    /// Counts saved segment transcripts toward the meeting verdict, so recovery judges the whole meeting.
+    func seed(_ saved: [SegmentTranscript]) {
+        verdicts = Dictionary(saved.map { transcript in
+            (transcript.seq, QualityGuard.verdict(
+                transcript.segments.compactMap { segment in
+                    segment.confidence.map { SpeechSegment(start: segment.start, end: segment.end, text: segment.text, confidence: $0) }
+                },
+                floor: guardFloor))
+        }, uniquingKeysWith: { _, new in new })
+    }
+
+    private var orderedVerdicts: [QualityGuard.Verdict] { verdicts.sorted { $0.key < $1.key }.map(\.value) }
 
     private func jobFinished() {
         intakeLock.withLock { activeJobs -= 1 }
@@ -140,12 +210,17 @@ actor LocalTranscriber {
         })
     }
 
-    /// Cancels every pending job and the load, and drops the engine.
-    func cancel() {
+    /// Cancels every pending job and the load, waits for each to return (a Core ML call or model load
+    /// cannot be interrupted), then drops the engine.
+    func cancel() async {
         let pending = intakeLock.withLock { defer { jobs = []; cancelled = true }; return jobs }
-        pending.forEach { $0.cancel() }
-        loadTask?.cancel(); loadTask = nil
+        let load = loadTask
+        loadTask = nil
         unloadTask?.cancel(); unloadTask = nil
+        pending.forEach { $0.cancel() }
+        load?.cancel()
+        for job in pending { _ = await job.result }
+        _ = await load?.result
         engine = nil
     }
 
@@ -163,6 +238,7 @@ actor LocalTranscriber {
             await onStep(.transcribing(completed: index + 1, total: all.count))
         }
         if let loadFailure { throw loadFailure }
+        guard QualityGuard.passes(orderedVerdicts) else { throw Failure.qualityGuard }
         scheduleUnload()
         return DeviceTranscript.build(source: source, language: language, durationSeconds: durationSeconds, segments: segments)
     }

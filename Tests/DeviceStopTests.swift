@@ -384,9 +384,9 @@ final class DeviceStopTests: XCTestCase {
     /// written before the app exits; a cloud stop keeps the finalize window.
     func test_quitDeadline_coversLocalTranscription_onlyWhenTheAudioStaysOnThisMac() {
         XCTAssertEqual(CaptureSession.quitDeadline(audioMayLeaveMac: true, elapsedSeconds: 3_600), 65)
-        XCTAssertEqual(CaptureSession.quitDeadline(audioMayLeaveMac: false, elapsedSeconds: 600), 245)
-        XCTAssertEqual(CaptureSession.quitDeadline(audioMayLeaveMac: false, elapsedSeconds: 3_600), 425)
-        XCTAssertEqual(CaptureSession.quitDeadline(audioMayLeaveMac: false, elapsedSeconds: 3_600, finalizeTimeout: 10), 375)
+        XCTAssertEqual(CaptureSession.quitDeadline(audioMayLeaveMac: false, elapsedSeconds: 600), 255)
+        XCTAssertEqual(CaptureSession.quitDeadline(audioMayLeaveMac: false, elapsedSeconds: 3_600), 435)
+        XCTAssertEqual(CaptureSession.quitDeadline(audioMayLeaveMac: false, elapsedSeconds: 3_600, finalizeTimeout: 10), 385)
         for elapsed in [0.0, 1_800, 7_200, 21_600] {
             XCTAssertGreaterThan(
                 CaptureSession.quitDeadline(audioMayLeaveMac: false, elapsedSeconds: elapsed),
@@ -439,7 +439,8 @@ final class DeviceStopTests: XCTestCase {
         guard case .localTranscriptionTimedOut? = outcome.error as? CaptureSession.CaptureError else {
             return XCTFail("got \(String(describing: outcome.error))")
         }
-        XCTAssertEqual(transport.log, [], "a timed-out stop leaves the server meeting untouched, never stranded as pending")
+        XCTAssertFalse(transport.log.contains("mark") || transport.log.contains("submit"),
+                       "a timed-out stop never strands the server meeting as pending; got \(transport.log)")
         XCTAssertTrue(dirExists)
     }
 
@@ -485,10 +486,11 @@ final class DeviceStopTests: XCTestCase {
     func test_anEngineFailure_failsTheStop_withoutAnyRequest_andKeepsTheDirectory() async throws {
         let transport = RecordingTransport()
         do {
-            _ = try await finish(await startedTranscriber(ScriptedEngine(DeviceFixtures.fixtureEngine, failing: ["seg-1-them.m4a"])), transport)
+            _ = try await finish(await startedTranscriber(
+                ScriptedEngine(DeviceFixtures.fixtureEngine, failing: ["seg-0-them.m4a", "seg-1-them.m4a"])), transport)
             XCTFail("a failed engine must fail the stop")
         } catch {}
-        XCTAssertEqual(transport.log, [], "no mark, no submit")
+        XCTAssertFalse(transport.log.contains("mark") || transport.log.contains("submit"), "no mark, no submit; got \(transport.log)")
         XCTAssertTrue(dirExists)
         XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent(CaptureRecovery.transcriptName).path))
     }

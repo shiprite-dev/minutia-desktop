@@ -1,10 +1,9 @@
 import XCTest
-import Supabase
 @testable import Minutia
 
 /// Retry and the startup sweep resend a device meeting's finished `transcript.json`
-/// (`CaptureRecovery.resubmitDeviceTranscript`, which `recover` runs for a device manifest). A
-/// device directory with no finished transcript is a real failure, never a silent "finalized".
+/// (`CaptureRecovery.resubmitDeviceTranscript`, which `recover` runs for a device manifest that has
+/// one). A device directory without one is DeviceFallbackTests' recovery section.
 final class DeviceResubmitTests: XCTestCase {
     private var dir: URL!
     private let instance = URL(string: "http://127.0.0.1:1")!
@@ -40,11 +39,6 @@ final class DeviceResubmitTests: XCTestCase {
         CaptureManifest(
             meetingId: DeviceFixtures.meetingId, seriesId: nil, instanceURL: instance, userId: userId,
             createdAt: Date(timeIntervalSince1970: 0), transcriptionMode: mode, deviceOnly: deviceOnly, language: "en")
-    }
-
-    private func unreachableClient() -> MinutiaClient {
-        MinutiaClient(instance: instance, supabase: SupabaseClient(supabaseURL: instance, supabaseKey: "anon-key"),
-                      tokenProvider: { "token" })
     }
 
     func test_theTranscriptFileName_isWhatTheStopWrites() {
@@ -99,9 +93,11 @@ final class DeviceResubmitTests: XCTestCase {
         XCTAssertEqual(AppController.recoveryOutcome(for: CaptureSession.CaptureError.transcriptRejected), .unreadable)
     }
 
-    func test_recoveryNotification_forADeviceMeeting_saysItWasSent_neverUploading() {
+    /// A device meeting's recovery may finish on this Mac or, for Automatic, in the cloud; the manifest
+    /// cannot tell which, so the notice claims neither and never says uploading.
+    func test_recoveryNotification_forADeviceMeeting_neverMentionsUploading_orWhereItWasTranscribed() {
         let device = AppController.recoveryNotificationBody(transcriptionMode: .device)
-        XCTAssertEqual(device, "A meeting transcribed on this Mac has been sent.")
+        XCTAssertEqual(device, "A meeting that didn't finish has been recovered. The recap is being prepared.")
         XCTAssertFalse(device.lowercased().contains("upload"), device)
         XCTAssertEqual(AppController.recoveryNotificationBody(transcriptionMode: .cloud),
                        "A meeting that didn't finish uploading has been recovered. The recap is being prepared.")
@@ -113,20 +109,6 @@ final class DeviceResubmitTests: XCTestCase {
         XCTAssertEqual(error as? CaptureRecovery.RecoveryError, .transcriptNotFinished)
         XCTAssertEqual(transport.log, [])
         XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("seg-0-me.m4a").path))
-    }
-
-    /// `recover` (Retry and the startup sweep) routes a device manifest to the resubmit path, so with
-    /// no transcript it fails as unfinished before any network call, never as "audio stays here".
-    func test_recover_aDeviceManifestWithoutATranscript_failsAsUnfinished_beforeAnyNetworkCall() async {
-        for deviceOnly in [false, true] {
-            do {
-                try await CaptureRecovery.recover(directory: dir, manifest: manifest(.device, deviceOnly: deviceOnly), client: unreachableClient())
-                XCTFail("deviceOnly=\(deviceOnly): must fail")
-            } catch {
-                XCTAssertEqual(error as? CaptureRecovery.RecoveryError, .transcriptNotFinished, "deviceOnly=\(deviceOnly): got \(error)")
-            }
-        }
-        XCTAssertTrue(dirExists)
     }
 
     func test_recoverySweep_picksUpADeviceRecording_onTheSameInstanceAndUserOnly() {

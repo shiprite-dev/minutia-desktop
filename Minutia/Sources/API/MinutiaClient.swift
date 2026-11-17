@@ -409,7 +409,7 @@ struct MinutiaClient {
         if response.value.isEmpty { throw MinutiaClientError.meetingNotWritable }
     }
 
-    func requestTranscription(meetingId: String, expectedSegments: Int?, deferExtraction: Bool = false) async throws {
+    func requestTranscription(meetingId: String, expectedSegments: Int?, deferExtraction: Bool = false, strict: Bool = false) async throws {
         let token = try await tokenProvider()
         let request = Self.finalTranscribeRequest(instance: instance, meetingId: meetingId, expectedSegments: expectedSegments, deferExtraction: deferExtraction, token: token)
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -430,7 +430,7 @@ struct MinutiaClient {
             // assembled from the fast-lane segments, so it alone is not a hard failure. Every other
             // terminal 4xx must throw so the caller never treats the request as accepted and deletes
             // the local audio with no server transcript (data loss).
-            if status == 503 { return }
+            if status == 503 && !strict { return }
             throw MinutiaClientError.serverError(status: status)
         }
     }

@@ -108,13 +108,13 @@ final class ModelStore: ObservableObject {
     /// Makes the entry for `language` healthy and warm: gates, downloads missing files, verifies,
     /// warms up, records health, then prunes superseded revisions. Safe to call on every launch,
     /// after sign-in and whenever the meeting language changes.
-    func prepare(language: String) async {
-        lastLanguage = language
+    func prepare(language: String, remember: Bool = true) async {
+        if remember { lastLanguage = language }
         if let current = running {
             await current.task.value
-            guard language == lastLanguage else { return }
+            guard !remember || language == lastLanguage else { return }
             if current.language == language, !current.task.isCancelled { return }
-            return await prepare(language: language)
+            return await prepare(language: language, remember: remember)
         }
         let id = UUID()
         let task = Task {
@@ -131,6 +131,26 @@ final class ModelStore: ObservableObject {
     }
 
     var healthyRevisions: Set<String> { Set(manifest.entries.filter(isHealthy).map(\.revision)) }
+
+    /// Consecutive failed local transcriptions, across meetings and relaunches, that mark the model unhealthy.
+    static let failuresBeforeReverify = 2
+
+    /// Records how a meeting's local transcription ended for `language`'s entry. The
+    /// `failuresBeforeReverify`th failure in a row clears its health and warm markers and re-runs
+    /// `prepare` (sha256 re-verify, re-download of bad files, warm-up) once, in the background; a success resets the count.
+    func recordLocalTranscription(succeeded: Bool, language: String) async {
+        guard let entry = manifest.entry(forLanguage: language) else { return }
+        let key = "ModelStore.localFailures.\(entry.revision)"
+        let failures = succeeded ? 0 : defaults.integer(forKey: key) + 1
+        guard failures >= Self.failuresBeforeReverify else { return defaults.set(failures, forKey: key) }
+        defaults.set(0, forKey: key)
+        defaults.removeObject(forKey: healthKey(entry))
+        defaults.removeObject(forKey: warmKey(entry))
+        if lastLanguage == nil { return }
+        if recording { lastLanguage = language } else {
+            Task { guard self.lastLanguage != nil else { return }; await self.prepare(language: language) }
+        }
+    }
 
     func recordingDidStart() {
         recording = true
