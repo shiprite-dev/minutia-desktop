@@ -27,7 +27,7 @@ final class URLProtocolStub: URLProtocol {
 private func makeStubbedClient() -> MinutiaClient {
     MinutiaClient(
         instance: URL(string: "https://minutia.example.com")!,
-        supabase: SupabaseClient(supabaseURL: URL(string: "https://supabase.example.com")!, supabaseKey: "anon-key"),
+        supabase: testSupabase(URL(string: "https://supabase.example.com")!),
         tokenProvider: { "test-access-token" }
     )
 }

@@ -123,6 +123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // relying on that alone leaves a freshly launched app unconnected until the user clicks it.
         // AuthManager.ensureConnected is single-flight and idempotent, so this racing MenuContent's
         // own restoreSession() is safe.
+        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
         Task { @MainActor in await AppController.shared.restoreSession() }
     }
 
