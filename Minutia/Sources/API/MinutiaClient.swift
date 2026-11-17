@@ -430,7 +430,7 @@ struct MinutiaClient {
             // assembled from the fast-lane segments, so it alone is not a hard failure. Every other
             // terminal 4xx must throw so the caller never treats the request as accepted and deletes
             // the local audio with no server transcript (data loss).
-            if status == 503 { return }
+            if status == 503 && !strict { return }
             throw MinutiaClientError.serverError(status: status)
         }
     }

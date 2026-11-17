@@ -112,7 +112,20 @@ enum CaptureRecovery {
         flushNotes: @escaping @Sendable () async throws -> Void = {},
         sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }
     ) async throws {
-        try await resubmitDeviceTranscript(directory: directory, meetingId: manifest.meetingId, transport: transport, sleep: sleep)
+        let saved = try? Data(contentsOf: directory.appendingPathComponent(transcriptName))
+        if let saved, (try? JSONDecoder().decode(DeviceTranscript.self, from: saved)) != nil {
+            return try await resubmitDeviceTranscript(directory: directory, meetingId: manifest.meetingId, transport: transport, sleep: sleep)
+        }
+        if manifest.deviceOnly { throw RecoveryError.audioStaysOnThisMac }
+        let recordingURL = directory.appendingPathComponent(recordingName)
+        guard let duration = await readableAudioDuration(of: recordingURL) else { throw RecoveryError.unreadableRecording }
+        let path = try await cloud.uploadRecording(meetingId: manifest.meetingId, fileURL: recordingURL)
+        let size = ((try? FileManager.default.attributesOfItem(atPath: recordingURL.path)[.size]) as? NSNumber)?.int64Value ?? 0
+        try await cloud.finalizeMeeting(meetingId: manifest.meetingId, audioPath: path, duration: duration, sizeBytes: size)
+        _ = try await NotepadFinalize.flushThenTranscribe(
+            flush: flushNotes,
+            requestTranscription: { try await cloud.requestTranscription(meetingId: manifest.meetingId, expectedSegments: nil, deferExtraction: false, strict: true) })
+        try? FileManager.default.removeItem(at: directory)
     }
 
     /// nil when the file is missing, has no audio track, or has no positive finite duration.

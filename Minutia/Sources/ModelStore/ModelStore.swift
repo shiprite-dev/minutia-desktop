@@ -146,7 +146,7 @@ final class ModelStore: ObservableObject {
         defaults.set(0, forKey: key)
         defaults.removeObject(forKey: healthKey(entry))
         defaults.removeObject(forKey: warmKey(entry))
-        await prepare(language: language)
+        if recording { lastLanguage = language } else { await prepare(language: language) }
     }
 
     func recordingDidStart() {

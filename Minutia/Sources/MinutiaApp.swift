@@ -1514,14 +1514,12 @@ final class AppController: NSObject, ObservableObject {
                 await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance, autoRecap: true)
             }
         }
-        let onDevice = !captureSession.audioMayLeaveMac
-        let language = recordingLanguage
+        let local = localOutcomeHandlers()
         Task {
             do {
                 let result = try await captureSession.stop(
                     flushNotes: { [notepad] in try await notepad.flushNow() }, recapOpened: early,
-                    notifyLocalFailure: { _ in await Self.postNotification(title: "Meeting not transcribed", body: Self.deviceTranscriptFailure) })
-                if onDevice, let language { await modelStore.recordLocalTranscription(succeeded: result.localFailure == nil, language: language) }
+                    notifyLocalFailure: local.notify, onLocalOutcome: local.outcome)
                 recordingMeetingId = nil
                 recordingSeriesId = nil
                 recordingInstance = nil
@@ -1530,15 +1528,23 @@ final class AppController: NSObject, ObservableObject {
                     await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance)
                 }
             } catch {
-                if onDevice, let language, error is LocalTranscriber.Failure {
-                    await modelStore.recordLocalTranscription(succeeded: false, language: language)
-                }
                 // The durable directory survives a timed-out finalize, so Retry finishes the upload
                 // rather than starting a new recording.
                 lastFailedStart = meetingId.map { .finalize(meetingId: $0.uuidString) } ?? .series
                 apply(.failed(Self.finalizeFailureMessage(for: error, host: instance?.host)))
             }
         }
+    }
+
+    private func localOutcomeHandlers() -> (notify: @Sendable (LocalTranscriber.Failure) async -> Void, outcome: @Sendable (Bool) async -> Void) {
+        let onDevice = !captureSession.audioMayLeaveMac
+        let language = recordingLanguage
+        let store = modelStore
+        return (
+            { _ in await Self.postNotification(title: "Meeting not transcribed", body: Self.deviceTranscriptFailure) },
+            { succeeded in
+                if onDevice, let language { await store.recordLocalTranscription(succeeded: succeeded, language: language) }
+            })
     }
 
     /// Awaited stop+finalize for app termination. Runs the same sequence as `stopRecording` but the
@@ -1558,7 +1564,10 @@ final class AppController: NSObject, ObservableObject {
                 }
             }
             do {
-                _ = try await captureSession.stop(flushNotes: { [notepad] in try await notepad.flushNow() })
+                let local = localOutcomeHandlers()
+                _ = try await captureSession.stop(
+                    flushNotes: { [notepad] in try await notepad.flushNow() },
+                    notifyLocalFailure: local.notify, onLocalOutcome: local.outcome)
                 recordingMeetingId = nil
                 recordingSeriesId = nil
                 recordingInstance = nil
@@ -1643,7 +1652,8 @@ final class AppController: NSObject, ObservableObject {
         guard let error else { return .recovered }
         if case MinutiaClientError.featureUnavailable = error { return .transcriptionUnavailable }
         if let recoveryError = error as? CaptureRecovery.RecoveryError,
-           recoveryError == .unreadableRecording || recoveryError == .audioStaysOnThisMac { return .unreadable }
+           recoveryError == .unreadableRecording { return .unreadable }
+        if error as? CaptureRecovery.RecoveryError == .audioStaysOnThisMac { return .keptOnThisMac }
         if case CaptureSession.CaptureError.transcriptRejected? = error as? CaptureSession.CaptureError { return .unreadable }
         return .retryLater
     }
@@ -1725,7 +1735,11 @@ final class AppController: NSObject, ObservableObject {
                     CaptureRecovery.saveManifest(updated, to: dir)
                     transcriptionUnavailable.append(manifest)
                 }
-            case .unreadable, .keptOnThisMac:
+            case .keptOnThisMac:
+                var updated = manifest
+                updated.recoveryAttempts = maxRecoveryAttempts
+                CaptureRecovery.saveManifest(updated, to: dir)
+            case .unreadable:
                 // An unreadable recording never becomes readable: stop retrying at once and keep the audio.
                 var updated = manifest
                 updated.recoveryAttempts = maxRecoveryAttempts

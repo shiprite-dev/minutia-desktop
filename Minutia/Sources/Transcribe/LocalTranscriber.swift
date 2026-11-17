@@ -16,6 +16,7 @@ actor LocalTranscriber {
         case modelLoad
         case modelLoadTimedOut
         case qualityGuard
+        case transcriptionTimedOut
     }
 
     /// Contents of `seg-N.transcript.json`: both channels, labeled and on the meeting clock.

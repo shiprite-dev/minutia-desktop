@@ -238,9 +238,10 @@ final class DeviceFallbackTests: XCTestCase {
     /// an Automatic fallback that finished in the cloud, one whose upload failed, and a timeout.
     func test_aLocalFailure_isReportedOnce_whetherTheCloudFallbackLandsFailsOrNeverRuns() async throws {
         var rows: [(label: String, deviceOnly: Bool, cloud: RecordingCloud, breakage: Breakage?)] = []
-        for breakage in breakages {
-            rows.append(("Automatic, \(breakage.label)", false, RecordingCloud(), breakage))
-            rows.append(("On this Mac only, \(breakage.label)", true, RecordingCloud(), breakage))
+        for deviceOnly in [false, true] {
+            for breakage in breakages {
+                rows.append(("\(deviceOnly ? "On this Mac only" : "Automatic"), \(breakage.label)", deviceOnly, RecordingCloud(), breakage))
+            }
         }
         rows.append(("Automatic, the fallback upload fails", false, RecordingCloud(failure: URLError(.cannotConnectToHost)),
                      Breakage(label: "guard", engine: DeviceFixtures.meetingEngine(4, lowConfidence: [0, 1]), segments: 4,
