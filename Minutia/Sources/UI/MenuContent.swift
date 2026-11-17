@@ -10,10 +10,6 @@ enum Celebration {
     static func hold(reduceMotion: Bool) -> TimeInterval {
         (reduceMotion ? 0 : 0.18 + CheckReveal.drawDuration + CheckReveal.popHold) + 1.6
     }
-
-    static func visible(cue: RecapCue?, phase: AppPhase) -> Bool {
-        cue != nil && phase == .idle
-    }
 }
 
 enum PanelHaptic {
@@ -46,7 +42,6 @@ struct MenuContent: View {
     @ObservedObject var controller: AppController
     @ObservedObject var updater: UpdaterController
     @Environment(\.motionReduced) private var reduceMotion
-    @State private var visible = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -68,7 +63,7 @@ struct MenuContent: View {
                 switch controller.phase {
                 case .signedOut:
                     SignInView(authManager: controller.authManager, showsMenuBarHint: controller.showsMenuBarHint)
-                case .idle where Celebration.visible(cue: controller.recapCue, phase: controller.phase):
+                case .idle where controller.recapCue != nil:
                     DoneContent(onOpenRecap: { controller.openRecapFromCue() })
                 case .idle:
                     IdleHost(controller: controller, detectedVia: nil)
@@ -100,13 +95,13 @@ struct MenuContent: View {
             Footer(updater: updater)
         }
         .frame(width: Space.panelWidth)
-        .environment(\.panelVisible, visible)
+        .environment(\.panelVisible, controller.panelOpen)
         .environment(\.consentPending, controller.pendingRecordConsent != nil)
         .animation(Motion.resolved(Motion.settle, reduce: reduceMotion), value: controller.phase)
         .animation(Motion.resolved(Motion.settle, reduce: reduceMotion), value: controller.recapCue)
         .sensoryFeedback(trigger: controller.phase) { old, new in PanelHaptic.feedback(from: old, to: new) }
-        .onAppear { visible = true }
-        .onDisappear { visible = false }
+        .onAppear { controller.panelOpened() }
+        .onDisappear { controller.panelClosed() }
     }
 }
 

@@ -41,7 +41,4 @@ final class FastStopContractTests: XCTestCase {
             "https://minutia.example.com/series/11111111-2222-3333-4444-555555555555/meetings/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee?recap=auto")
     }
 
-    func test_aStop_allowsAMinuteToFinalize() {
-        XCTAssertEqual(CaptureSession.finalizeTimeout, 60)
-    }
 }

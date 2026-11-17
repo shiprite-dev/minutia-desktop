@@ -18,7 +18,7 @@ struct PrimaryButtonStyle: ButtonStyle {
 
 struct SecondaryButtonStyle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled
-    @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.contrastResolved) private var contrast
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -33,7 +33,7 @@ struct SecondaryButtonStyle: ButtonStyle {
 }
 
 struct QuietButtonStyle: ButtonStyle {
-    @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.contrastResolved) private var contrast
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -54,7 +54,7 @@ enum Hairline {
 }
 
 struct HairlineRule: View {
-    @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.contrastResolved) private var contrast
 
     var body: some View {
         Rectangle()
@@ -67,7 +67,7 @@ struct Eyebrow: View {
     let text: String
     var live = false
     @Environment(\.motionReduced) private var reduceMotion
-    @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.contrastResolved) private var contrast
     @Environment(\.panelVisible) private var visible
 
     var body: some View {
@@ -98,7 +98,7 @@ struct NoticeRow<Icon: View, Content: View>: View {
     let kind: NoticeKind
     @ViewBuilder let icon: Icon
     @ViewBuilder let content: Content
-    @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.contrastResolved) private var contrast
 
     var body: some View {
         HStack(alignment: .top, spacing: Space.x2) {

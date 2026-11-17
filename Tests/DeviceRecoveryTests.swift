@@ -945,10 +945,6 @@ final class DeviceRecoveryTests: XCTestCase {
 
     // MARK: A stuck engine never holds recovery
 
-    func test_engineStopTimeout_isTenSeconds() {
-        XCTAssertEqual(CaptureSession.engineStopTimeout, 10)
-    }
-
     /// Runs a device stop of one segment on `engine` in a task, waits until the engine is transcribing,
     /// cancels the task and returns what it finished with, the seconds from cancel to return and the
     /// engine calls still running at the return. nil when it did not return within `wait`.

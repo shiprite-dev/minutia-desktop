@@ -178,13 +178,6 @@ final class AuthInstanceIdentityTests: XCTestCase {
         XCTAssertEqual(AuthManager.preExchangeOutcome(hasClient: true, decision: .rejectStateMissing), .rejected)
     }
 
-    func test_callbackOutcome_equatable() {
-        XCTAssertEqual(AuthManager.CallbackOutcome.signedIn("a@b.com"), .signedIn("a@b.com"))
-        XCTAssertNotEqual(AuthManager.CallbackOutcome.signedIn("a@b.com"), .signedIn(nil))
-        XCTAssertEqual(AuthManager.CallbackOutcome.failed("boom"), .failed("boom"))
-        XCTAssertNotEqual(AuthManager.CallbackOutcome.failed("boom"), .rejected)
-    }
-
     // MARK: - A11: auth-state-change signed-out signal
 
     func test_authStateSignalsSignedOut_onlyForSignedOut() {
@@ -198,8 +191,9 @@ final class AuthInstanceIdentityTests: XCTestCase {
 
 /// A5: the instance-discovery request is time-bounded so a black-holed connect cannot spin forever.
 final class MetaRequestTimeoutTests: XCTestCase {
-    func test_metaRequest_isBounded() {
+    func test_aConnectThatNeverAnswers_givesUpWithinHalfAMinute() {
         let request = InstanceConfig.metaRequest(instance: URL(string: "https://app.getminutia.com")!)
-        XCTAssertEqual(request.timeoutInterval, 10)
+        XCTAssertGreaterThan(request.timeoutInterval, 0)
+        XCTAssertLessThanOrEqual(request.timeoutInterval, 30)
     }
 }

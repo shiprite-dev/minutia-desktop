@@ -1,72 +1,36 @@
-import AVFoundation
 import SwiftUI
 import XCTest
 @testable import Minutia
 
 @MainActor
 final class PanelFlowTests: XCTestCase {
-    private let weekly = Series(id: UUID(), name: "Weekly Eng Sync")
-    private let boardPrep = Series(id: UUID(), name: "Board prep")
-    private let instance = URL(string: "https://minutia.example.com")!
-    private var suite: String!
-    private var defaults: UserDefaults!
-    private var opened: [URL] = []
-    private var announcements: [String] = []
-    private var controllers: [AppController] = []
-    private let updater = UpdaterController()
+    private var rig: PanelRig!
+    private var weekly: Series { rig.weekly }
+    private var boardPrep: Series { rig.boardPrep }
+    private var instance: URL { rig.instance }
+    private var announcements: [String] { rig.announcements }
+    private var opened: [URL] { rig.opened }
 
-    override func setUp() async throws {
-        suite = "PanelFlowTests.\(UUID().uuidString)"
-        defaults = UserDefaults(suiteName: suite)
-        opened = []
-        announcements = []
-    }
+    override func setUp() async throws { rig = PanelRig() }
 
-    override func tearDown() async throws {
-        for controller in controllers {
-            controller.handleDetection(.none)
-            controller.authManager.cancelBrowserSignIn()
-        }
-        controllers = []
-        defaults.removePersistentDomain(forName: suite)
-    }
+    override func tearDown() async throws { rig.tearDown() }
 
-    private func controller() -> AppController {
-        let controller = AppController(
-            defaults: defaults, openURL: { [weak self] in self?.opened.append($0) }, micCheck: { (.authorized, true) })
-        controller.announce = { [weak self] in self?.announcements.append($0) }
-        controllers.append(controller)
-        return controller
-    }
-
-    private func signedIn(series: [Series]? = nil) -> AppController {
-        let controller = controller()
-        controller.apply(.signedIn)
-        controller.seriesLoaded(series ?? [weekly, boardPrep])
-        return controller
-    }
-
-    private func panel(_ controller: AppController, dark: Bool = false) -> Seen {
-        Host.text(MenuContent(controller: controller, updater: updater), dark: dark)
-    }
-
-    private func sentCue() -> RecapCue { RecapCue(meetingId: UUID(), seriesId: boardPrep.id, instance: instance) }
-
-    private func finishCleanly(_ controller: AppController, cue: RecapCue?) {
-        controller.apply(.recordStarted)
-        controller.apply(.recordStopped)
-        controller.apply(.finalized)
-        controller.presentRecapCue(cue)
-    }
+    private func controller() -> AppController { rig.controller() }
+    private func signedIn(series: [Series]? = nil) -> AppController { rig.signedIn(series: series) }
+    private func panel(_ controller: AppController, dark: Bool = false) -> Seen { rig.panel(controller, dark: dark) }
+    private func sentCue() -> RecapCue { rig.sentCue() }
+    private func finishCleanly(_ controller: AppController, cue: RecapCue?) { rig.finishCleanly(controller, cue: cue) }
 
     // MARK: - Which screen shows for each phase
 
     func test_signedOut_showsSignIn() async {
         let controller = controller()
         await controller.authManager.adopt(testSupabase(instance), instance: instance)
-        let seen = panel(controller)
+        let seen = rig.panel(controller, scale: 4)
+        XCTAssertTrue(seen.has("Record a meeting. Get the issues log."), seen.text)
         XCTAssertTrue(seen.has("Sign in with browser"), seen.text)
-        XCTAssertFalse(seen.has("SERIES"), seen.text)
+        XCTAssertTrue(seen.has("Use email instead"), seen.text)
+        XCTAssertFalse(seen.has("Weekly Eng Sync"), seen.text)
     }
 
     func test_idle_showsRecordUnderSeries() {
@@ -80,7 +44,9 @@ final class PanelFlowTests: XCTestCase {
         let controller = signedIn()
         controller.apply(.meetingDetected("Zoom"))
         for dark in [false, true] {
-            XCTAssertTrue(panel(controller, dark: dark).has(AppController.detectionBannerText(via: "Zoom")), "dark: \(dark)")
+            let seen = panel(controller, dark: dark)
+            XCTAssertTrue(seen.has(AppController.detectionBannerText(via: "Zoom")), "dark: \(dark) \(seen.text)")
+            XCTAssertTrue(seen.has("Record"), "dark: \(dark) \(seen.text)")
         }
     }
 
@@ -101,7 +67,7 @@ final class PanelFlowTests: XCTestCase {
         controller.captureSession.beginFinishing(audioMayLeaveMac: true)
         let seen = panel(controller)
         XCTAssertTrue(seen.has("Uploading and requesting transcript"), seen.text)
-        XCTAssertTrue(seen.has("You can close this"), seen.text)
+        XCTAssertTrue(seen.has("You can close this. Minutia finishes in the background."), seen.text)
         XCTAssertFalse(seen.has("Stop"), seen.text)
     }
 
@@ -166,6 +132,7 @@ final class PanelFlowTests: XCTestCase {
         let seen = panel(controller)
         XCTAssertTrue(seen.has("Sent. Your recap is on its way"), seen.text)
         XCTAssertTrue(seen.has("Open recap"), seen.text)
+        XCTAssertFalse(seen.has("Recap is ready"), seen.text)
         XCTAssertFalse(seen.has("SERIES"), seen.text)
         XCTAssertEqual(announcements.filter { $0 == "Sent. Your recap is on its way" }.count, 1)
     }
@@ -260,8 +227,7 @@ final class PanelFlowTests: XCTestCase {
     func test_pendingWebRecord_showsOneVermilionFill_andKeepsRecordAsASecondChoice() {
         let controller = signedIn()
         controller.promptRecordConsent(meetingId: UUID().uuidString)
-        let view = MenuContent(controller: controller, updater: updater)
-        XCTAssertEqual(Host.fillBands(view, atPoint: 30), 1)
+        XCTAssertEqual(Host.fills(rig.menu(controller)).count, 1)
         let seen = panel(controller)
         XCTAssertTrue(seen.has("Record this meeting from your browser?"), seen.text)
         XCTAssertTrue(seen.has("Start recording"), seen.text)

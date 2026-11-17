@@ -69,6 +69,7 @@ private struct PanelVisibleKey: EnvironmentKey { static let defaultValue = true 
 private struct ConsentPendingKey: EnvironmentKey { static let defaultValue = false }
 
 private struct ReduceMotionOverrideKey: EnvironmentKey { static let defaultValue: Bool? = nil }
+private struct ContrastOverrideKey: EnvironmentKey { static let defaultValue: ColorSchemeContrast? = nil }
 
 extension EnvironmentValues {
     var reduceMotionOverride: Bool? {
@@ -77,6 +78,13 @@ extension EnvironmentValues {
     }
 
     var motionReduced: Bool { reduceMotionOverride ?? accessibilityReduceMotion }
+
+    var contrastOverride: ColorSchemeContrast? {
+        get { self[ContrastOverrideKey.self] }
+        set { self[ContrastOverrideKey.self] = newValue }
+    }
+
+    var contrastResolved: ColorSchemeContrast { contrastOverride ?? colorSchemeContrast }
 
     var panelVisible: Bool {
         get { self[PanelVisibleKey.self] }

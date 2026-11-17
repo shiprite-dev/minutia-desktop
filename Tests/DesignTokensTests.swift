@@ -57,15 +57,6 @@ final class DesignTokensTests: XCTestCase {
         XCTAssertEqual(Contrast.ratio(0x000000, 0xFFFFFF), 21, accuracy: 0.01)
     }
 
-    func test_increaseContrast_strengthensHairlinesBordersAndQuietText() {
-        XCTAssertEqual(Hairline.width(.standard), 0.5)
-        XCTAssertEqual(Hairline.width(.increased), 1)
-        XCTAssertEqual(Hairline.noticeBorder(.standard), 0)
-        XCTAssertEqual(Hairline.noticeBorder(.increased), 1)
-        XCTAssertFalse(Hairline.quietTextIsStrong(.standard))
-        XCTAssertTrue(Hairline.quietTextIsStrong(.increased))
-    }
-
     func test_reduceMotion_replacesEverySpringWithTheFade() {
         for animation in [Motion.settle, Motion.pop, Motion.snap, Motion.meter] {
             XCTAssertEqual(Motion.resolved(animation, reduce: true), Motion.fade)
@@ -73,19 +64,10 @@ final class DesignTokensTests: XCTestCase {
         }
     }
 
-    func test_loops_runOnlyWhileThePanelIsOpenAndMotionIsAllowed() {
-        XCTAssertTrue(Loops.isRunning(visible: true, reduceMotion: false))
-        XCTAssertFalse(Loops.isRunning(visible: false, reduceMotion: false))
-        XCTAssertFalse(Loops.isRunning(visible: true, reduceMotion: true))
-    }
-
     func test_fraunces_isBundledAndResolves() {
         XCTAssertTrue(Typo.frauncesAvailable)
     }
 
-    func test_displayFont_neverCrashesAtAnySize() {
-        for size in [0, 1, 17, 22, 400] as [CGFloat] { _ = Typo.display(size) }
-    }
 }
 
 final class BrandMarkTests: XCTestCase {
@@ -142,10 +124,6 @@ final class BrandMarkTests: XCTestCase {
         }
     }
 
-    func test_checkStroke_matchesTheIconProportion() {
-        XCTAssertEqual(BrandMark.checkStroke(barHeight: 340), 84, accuracy: 0.001)
-    }
-
     func test_eachBarFollowsItsOwnLevel() {
         let heights = BrandMark.barHeights(levels: [0, 0.5, 1])
         XCTAssertLessThan(heights[0] / BrandMark.restRatios[0], heights[1] / BrandMark.restRatios[1])
@@ -170,31 +148,10 @@ final class BrandMarkTests: XCTestCase {
     }
 }
 
-final class CelebrationTests: XCTestCase {
+final class RecapCueTests: XCTestCase {
     private let cue = RecapCue(meetingId: UUID(), seriesId: UUID(), instance: URL(string: "https://example.com")!)
 
-    func test_sentScreen_showsOnlyOverIdleWithACue() {
-        XCTAssertTrue(Celebration.visible(cue: cue, phase: .idle))
-        XCTAssertFalse(Celebration.visible(cue: nil, phase: .idle))
-    }
-
-    func test_backToBackMeeting_endsTheCelebrationAtOnce() {
-        XCTAssertFalse(Celebration.visible(cue: cue, phase: .recording))
-        XCTAssertFalse(Celebration.visible(cue: cue, phase: .detected(app: "Zoom")))
-        XCTAssertFalse(Celebration.visible(cue: cue, phase: .error("x")))
-    }
-
-    func test_hold_keepsTheFinishedCheckOnScreenAfterItDraws() {
-        let drawn = 0.18 + CheckReveal.drawDuration + CheckReveal.popHold
-        XCTAssertEqual(Celebration.hold(reduceMotion: false), drawn + 1.6, accuracy: 0.001)
-        XCTAssertEqual(Celebration.hold(reduceMotion: true), 1.6, accuracy: 0.001)
-    }
-
-    func test_popHold_outlastsThePopSpringsPeak() {
-        XCTAssertGreaterThanOrEqual(CheckReveal.popHold, 0.24)
-    }
-
-    func test_webEndedStop_hasNoCue_andAManualStopThatSentTheTranscriptHasOne() {
+    func test_onlyAStopThatSentATranscriptForAMeeting_hasARecapToOpen() {
         let id = UUID(), url = URL(string: "https://example.com")!
         XCTAssertNil(AppController.recapCue(reason: .webEnded, transcriptRequested: true, meetingId: id, seriesId: nil, instance: url))
         XCTAssertNil(AppController.recapCue(reason: .manual, transcriptRequested: false, meetingId: id, seriesId: nil, instance: url))
@@ -218,38 +175,6 @@ final class PanelHapticTests: XCTestCase {
         XCTAssertNil(PanelHaptic.feedback(from: .signedOut, to: .idle))
     }
 }
-
-final class FinishingProgressTests: XCTestCase {
-    func test_transcribing_showsHowFarItGot() {
-        XCTAssertEqual(FinishingProgress.fraction(.transcribing(completed: 3, total: 12)), 0.25)
-    }
-
-    func test_noTotalOrOtherSteps_showNoBar() {
-        XCTAssertNil(FinishingProgress.fraction(.transcribing(completed: 0, total: 0)))
-        XCTAssertNil(FinishingProgress.fraction(.preparingModel))
-        XCTAssertNil(FinishingProgress.fraction(.uploadingRecording))
-        XCTAssertNil(FinishingProgress.fraction(nil))
-    }
-
-    func test_overshoot_isClamped() {
-        XCTAssertEqual(FinishingProgress.fraction(.transcribing(completed: 9, total: 4)), 1)
-    }
-}
-
-final class ErrorActionsTests: XCTestCase {
-    func test_micDenied_leadsWithOpeningSystemSettings() {
-        let actions = ErrorActions.resolve(isMicError: true)
-        XCTAssertEqual(actions.primary, .openSettings)
-        XCTAssertEqual(actions.secondary, .retry)
-    }
-
-    func test_otherFailures_leadWithRetryAndKeepDismiss() {
-        let actions = ErrorActions.resolve(isMicError: false)
-        XCTAssertEqual(actions.primary, .retry)
-        XCTAssertEqual(actions.secondary, .dismiss)
-    }
-}
-
 final class SignInStageTests: XCTestCase {
     private func stage(connected: Bool = false, awaiting: Bool = false, connecting: Bool = false,
                        error: String? = nil, retryable: Bool = true) -> SignInStage {

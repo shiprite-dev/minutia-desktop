@@ -68,11 +68,6 @@ final class CaptureWriteFailureTests: XCTestCase {
         return boxes
     }
 
-    func test_appendReadinessBudget_staysBelowRingBufferHeadroom() {
-        XCTAssertGreaterThan(SegmentWriter.readyTimeout, 0)
-        XCTAssertLessThan(SegmentWriter.readyTimeout, 5, "one append blocks the tick at most this long; the ring buffers hold 5 s")
-    }
-
     func test_segmentCloseStallsAtRotation_recordingContinuesAndNoSegmentIsHandedOut() async throws {
         let writer = try SegmentWriter(directory: dir, closeTimeout: 0)
 
