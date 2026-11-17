@@ -113,14 +113,8 @@ actor LocalTranscriber {
         }
     }
 
-    private final class Once: @unchecked Sendable {
-        private let lock = NSLock()
-        private var done = false
-        func claim() -> Bool { lock.withLock { defer { done = true }; return !done } }
-    }
-
     private static func race(_ task: Task<any SpeechEngine, Error>, timeout: TimeInterval) async throws -> any SpeechEngine {
-        let once = Once()
+        let once = LockedFlag()
         let claim: @Sendable () -> Bool = { once.claim() }
         return try await withCheckedThrowingContinuation { continuation in
             let timer = Task {
@@ -156,6 +150,7 @@ actor LocalTranscriber {
         guard !QualityGuard.abortsEarly(orderedVerdicts) else { return [] }
         do {
             let engine = try await engineForJob()
+            try Task.checkCancellation()
             let mine = try await engine.transcribe(.file(segment.micURL))
             try Task.checkCancellation()
             let theirs = try await engine.transcribe(.file(segment.sysURL))

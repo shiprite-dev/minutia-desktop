@@ -109,12 +109,12 @@ final class ModelStore: ObservableObject {
     /// warms up, records health, then prunes superseded revisions. Safe to call on every launch,
     /// after sign-in and whenever the meeting language changes.
     func prepare(language: String, remember: Bool = true) async {
-        lastLanguage = language
+        if remember { lastLanguage = language }
         if let current = running {
             await current.task.value
-            guard language == lastLanguage else { return }
+            guard !remember || language == lastLanguage else { return }
             if current.language == language, !current.task.isCancelled { return }
-            return await prepare(language: language)
+            return await prepare(language: language, remember: remember)
         }
         let id = UUID()
         let task = Task {

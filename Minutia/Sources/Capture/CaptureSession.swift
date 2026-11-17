@@ -326,7 +326,7 @@ final class CaptureSession: ObservableObject {
     nonisolated static func submitDeviceTranscript(
         meetingId: String, body: Data, transport: any DeviceTranscriptTransport,
         sleep: @escaping @Sendable (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
-        accepted: AcceptedBox? = nil
+        accepted: LockedFlag? = nil
     ) async throws {
         var attempt = 0
         while true {
@@ -410,7 +410,7 @@ final class CaptureSession: ObservableObject {
                 meetingId: meetingId, directory: directory, durationSeconds: durationSeconds, failure: failure,
                 transport: transport, cloud: cloud, recapOpened: recapOpened, timeout: cloudTimeout)
         } catch is CancellationError {
-            await transcriber.cancel()
+            await waitAtMost(seconds: engineStopTimeout) { await transcriber.cancel() }
             throw CancellationError()
         }
         if !saved.isEmpty {
@@ -426,7 +426,7 @@ final class CaptureSession: ObservableObject {
         try? await transport.markAwaitingDeviceTranscript(meetingId: meetingId, durationSeconds: fitted.durationSeconds)
         try Task.checkCancellation()
         await onStep(.submitting)
-        let accepted = AcceptedBox()
+        let accepted = LockedFlag()
         do {
             try await withTimeout(seconds: finalizeTimeout) {
                 try await submitDeviceTranscript(meetingId: meetingId, body: body, transport: transport, sleep: sleep, accepted: accepted)
@@ -449,7 +449,7 @@ final class CaptureSession: ObservableObject {
         timeout: TimeInterval
     ) async throws -> StopResult {
         let recording = directory.appendingPathComponent(CaptureRecovery.recordingName)
-        let accepted = AcceptedBox()
+        let accepted = LockedFlag()
         do {
             try await withTimeout(seconds: timeout) {
                 try await finalizeRecordingInCloud(
@@ -465,7 +465,7 @@ final class CaptureSession: ObservableObject {
 
     nonisolated static func finalizeRecordingInCloud(
         meetingId: String, recording: URL, duration: Double, cloud: any CloudFinalizeTransport,
-        deferExtraction: Bool, flushNotes: @escaping @Sendable () async throws -> Void, accepted: AcceptedBox? = nil
+        deferExtraction: Bool, flushNotes: @escaping @Sendable () async throws -> Void, accepted: LockedFlag? = nil
     ) async throws {
         let path = try await cloud.uploadRecording(meetingId: meetingId, fileURL: recording)
         try Task.checkCancellation()
@@ -520,12 +520,7 @@ final class CaptureSession: ObservableObject {
             var continuation: CheckedContinuation<DeviceTranscript, Error>?
             var cancelled = false
         }
-        final class Once: @unchecked Sendable {
-            private let lock = NSLock()
-            private var done = false
-            func first() -> Bool { lock.withLock { defer { done = true }; return !done } }
-        }
-        let once = Once()
+        let once = LockedFlag()
         let box = TimerBox()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -534,7 +529,7 @@ final class CaptureSession: ObservableObject {
                 box.continuation = continuation
                 box.task = Task {
                     do { try await timer(seconds) } catch { return }
-                    if once.first() {
+                    if once.claim() {
                         box.lock.withLock { box.job }?.cancel()
                         continuation.resume(throwing: CaptureError.localTranscriptionTimedOut)
                     }
@@ -542,13 +537,13 @@ final class CaptureSession: ObservableObject {
                 box.job = Task {
                     do {
                         let transcript = try await work()
-                        if once.first() { continuation.resume(returning: transcript) }
+                        if once.claim() { continuation.resume(returning: transcript) }
                     } catch {
-                        if once.first() { continuation.resume(throwing: error) }
+                        if once.claim() { continuation.resume(throwing: error) }
                     }
                     box.lock.withLock { box.task }?.cancel()
                 }
-                if box.cancelled, once.first() {
+                if box.cancelled, once.claim() {
                     box.job?.cancel()
                     box.task?.cancel()
                     continuation.resume(throwing: CancellationError())
@@ -556,7 +551,7 @@ final class CaptureSession: ObservableObject {
             }
         } onCancel: {
             let (job, task, continuation) = box.lock.withLock { box.cancelled = true; return (box.job, box.task, box.continuation) }
-            if let continuation, once.first() {
+            if let continuation, once.claim() {
                 job?.cancel()
                 task?.cancel()
                 continuation.resume(throwing: CancellationError())

@@ -646,8 +646,7 @@ final class AppController: NSObject, ObservableObject {
     private var detectorBoundInstance: URL?
     /// Single-flight guard for the startup recovery sweep.
     private var recoveryTask: Task<Void, Never>?
-    private var rerunRecovery = false
-    private var startingCapture = false
+    private var recoverySlot = RecoverySlot()
     private let defaults = UserDefaults.standard
     private var screenLocked = false
     private var asleep = false
@@ -744,7 +743,7 @@ final class AppController: NSObject, ObservableObject {
 
         modelStore.$status
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] status in if case .ready = status { self?.runRecovery() } }
+            .sink { [weak self] status in if Self.shouldRunRecovery(on: status) { self?.runRecovery() } }
             .store(in: &cancellables)
 
         detector.$confidence
@@ -869,6 +868,8 @@ final class AppController: NSObject, ObservableObject {
         } else {
             checkinTimer?.invalidate()
             checkinTimer = nil
+            recoveryTask?.cancel()
+            recoverySlot = RecoverySlot()
             if Self.shouldStopCaptureOnSignOut(phase: phase) {
                 // Keep the recording ids set until the finalize completes: a fast re-sign-in would
                 // otherwise let runRecovery see no active meeting and touch the still-finalizing
@@ -1193,8 +1194,9 @@ final class AppController: NSObject, ObservableObject {
     }
 
     private func launchCapture(meetingId: String, seriesId: UUID?, announce: Bool, client: MinutiaClient, routing: CaptureRouting) async throws {
-        startingCapture = true
-        defer { startingCapture = false }
+        recoverySlot.captureWillStart()
+        var recording = false
+        defer { if recoverySlot.captureDidEnd(recording: recording) { runRecovery() } }
         let userId = try? await client.supabase.auth.session.user.id.uuidString.lowercased()
         if let task = recoveryTask {
             task.cancel()
@@ -1210,6 +1212,7 @@ final class AppController: NSObject, ObservableObject {
         recordingInstance = client.instance
         recordingLanguage = routing.language
         resetEndDetectionState(origin: Self.detectionOrigin(for: lastConfidence))
+        recording = true
         apply(.recordStarted)
         if announce { postRecordingStartedNotification() }
         captureToken += 1
@@ -1236,7 +1239,8 @@ final class AppController: NSObject, ObservableObject {
             return nil
         case .deferred:
             switch modelStore.status {
-            case .idle, .ready: Task { await modelStore.prepare(language: language) }
+            case .idle, .ready:
+                if authManager.sessionIdentity.email != nil { Task { await modelStore.prepare(language: language, remember: false) } }
             default: break
             }
             throw CaptureRecovery.RecoveryError.deferred
@@ -1639,8 +1643,8 @@ final class AppController: NSObject, ObservableObject {
     /// launch. The live recording's directory (if any) is never swept.
     private func runRecovery() {
         if case .recording = phase { return }
-        guard !startingCapture, let client = authManager.client(), let instance = authManager.instance else { return }
-        guard recoveryTask == nil else { rerunRecovery = true; return }
+        guard let client = authManager.client(), let instance = authManager.instance else { return }
+        guard recoverySlot.requestRun() else { return }
         let activeId = recordingMeetingId?.uuidString
         recoveryActive = true
         let notepad = notepad
@@ -1688,7 +1692,7 @@ final class AppController: NSObject, ObservableObject {
             await task.value
             if recoveryTask == task {
                 recoveryTask = nil
-                if rerunRecovery { rerunRecovery = false; runRecovery() }
+                if recoverySlot.runDidFinish() { runRecovery() }
             }
         }
     }
@@ -1706,8 +1710,10 @@ final class AppController: NSObject, ObservableObject {
     }
 
     nonisolated static func shouldRunRecovery(on status: ModelStatus) -> Bool {
-        if case .ready = status { return true }
-        return false
+        switch status {
+        case .ready, .failed, .blocked(.intelMac), .blocked(.unsupportedOS): return true
+        default: return false
+        }
     }
 
     nonisolated static func recoveryOutcome(for error: Error?) -> RecoveryOutcome {
@@ -1900,6 +1906,7 @@ final class AppController: NSObject, ObservableObject {
     private func refinalize(meetingId: String) {
         guard case .error = phase, let client = authManager.client() else { return }
         apply(.refinalizeStarted)
+        _ = recoverySlot.requestRun()
         occupyRecoverySlot { [self] in
             defer { captureSession.endFinishing() }
             do {

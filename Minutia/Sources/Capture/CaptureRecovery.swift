@@ -80,13 +80,6 @@ struct CaptureManifest: Codable, Equatable {
 /// A directory is recoverable once it holds both a manifest and the full `recording.m4a`; the
 /// sweep mirrors `CaptureSession.stop`'s finalize so a rescued meeting reaches the same server
 /// state as a cleanly stopped one.
-final class AcceptedBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var accepted = false
-    var value: Bool { lock.withLock { accepted } }
-    func set() { lock.withLock { accepted = true } }
-}
-
 enum CaptureRecovery {
     static let manifestName = "manifest.json"
     static let recordingName = "recording.m4a"
@@ -102,7 +95,7 @@ enum CaptureRecovery {
         if case .blocked(let reason) = status, reason == .intelMac || reason == .unsupportedOS { return .unusable }
         if isRoutable { return .ready }
         switch status {
-        case .failed, .blocked(.noEntryForLanguage): return .unusable
+        case .failed: return .unusable
         default: return .deferred
         }
     }
@@ -121,7 +114,7 @@ enum CaptureRecovery {
               (try? JSONDecoder().decode(DeviceTranscript.self, from: data)) != nil else {
             throw RecoveryError.transcriptNotFinished
         }
-        let accepted = AcceptedBox()
+        let accepted = LockedFlag()
         do {
             try await CaptureSession.submitDeviceTranscript(meetingId: meetingId, body: data, transport: transport, sleep: sleep, accepted: accepted)
         } catch where accepted.value {
@@ -170,13 +163,11 @@ enum CaptureRecovery {
             var missing: [SegmentWriter.ClosedSegment] = []
             var saved: [LocalTranscriber.SegmentTranscript] = []
             var covered = 0.0
-            var clock = duration
-            for segment in await readableSegments(in: directory) {
+            for segment in await readableSegments(in: directory, segmentSeconds: segmentSeconds) {
                 let seconds = segment.frames > 0
                     ? Double(segment.frames) / MixPlan.sampleRate
                     : await readableAudioDuration(of: segment.micURL) ?? 0
                 covered += seconds
-                if let start = segment.startSeconds { clock = max(clock, start + seconds) }
                 if let transcript = savedTranscript(in: directory, seq: segment.seq) {
                     saved.append(transcript)
                 } else {
@@ -189,7 +180,7 @@ enum CaptureRecovery {
                 await transcriber.seed(saved)
                 do {
                     _ = try await CaptureSession.finishOnDevice(
-                        meetingId: manifest.meetingId, directory: directory, tail: missing, durationSeconds: clock,
+                        meetingId: manifest.meetingId, directory: directory, tail: missing, durationSeconds: duration,
                         transcriber: transcriber, transport: transport, recapOpened: true, deviceOnly: manifest.deviceOnly,
                         cloud: cloud, cloudTimeout: cloudTimeout, sleep: sleep, flushNotes: flushNotes,
                         saved: saved.flatMap(\.segments), onStep: onStep)
@@ -202,7 +193,7 @@ enum CaptureRecovery {
                 throw RecoveryError.audioStaysOnThisMac
             }
         }
-        let accepted = AcceptedBox()
+        let accepted = LockedFlag()
         do {
             try await withTimeout(seconds: cloudTimeout) {
                 try await CaptureSession.finalizeRecordingInCloud(
@@ -234,9 +225,10 @@ enum CaptureRecovery {
     static func readableSegments(in directory: URL, segmentSeconds: Double = SegmentWriter.segmentSeconds) async -> [SegmentWriter.ClosedSegment] {
         let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
         var segments: [SegmentWriter.ClosedSegment] = []
-        for segment in names.compactMap({ recoveredSegment(in: directory, name: $0) }).sorted(by: { $0.seq < $1.seq }) {
+        for var segment in names.compactMap({ recoveredSegment(in: directory, name: $0) }).sorted(by: { $0.seq < $1.seq }) {
             guard await readableAudioDuration(of: segment.micURL) != nil,
                   await readableAudioDuration(of: segment.sysURL) != nil else { continue }
+            segment.startSeconds = Double(segment.seq) * segmentSeconds
             segments.append(segment)
         }
         let pieces = names.compactMap { name -> Int? in
@@ -245,11 +237,11 @@ enum CaptureRecovery {
         }.sorted()
         guard let first = pieces.first,
               !FileManager.default.fileExists(atPath: directory.appendingPathComponent("seg-\(first)-me.m4a").path) else { return segments }
-        var start = Double(first) * SegmentWriter.segmentSeconds
+        var start = Double(first) * segmentSeconds
         for seq in pieces {
             let mic = directory.appendingPathComponent("tail-\(seq)-me.m4a")
             let sys = directory.appendingPathComponent("tail-\(seq)-them.m4a")
-            guard let seconds = await readableAudioDuration(of: mic), await readableAudioDuration(of: sys) != nil else { continue }
+            guard let seconds = await readableAudioDuration(of: mic), await readableAudioDuration(of: sys) != nil else { break }
             segments.append(SegmentWriter.ClosedSegment(
                 seq: seq, micURL: mic, sysURL: sys, frames: Int64(seconds * MixPlan.sampleRate), startSeconds: start))
             start += seconds
