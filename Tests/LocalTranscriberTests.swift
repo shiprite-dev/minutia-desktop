@@ -302,4 +302,54 @@ final class LocalTranscriberTests: XCTestCase {
         let transcript = try await finishing.value
         XCTAssertEqual(transcript.segments.map(\.text), DeviceFixtures.items(2))
     }
+
+    // MARK: Cancel stops the engine before a recording starts
+
+    /// A recording starting cancels recovery, and the recording must not share the Neural Engine with a
+    /// transcription still running. A Core ML call does not stop when its task is cancelled, so cancel
+    /// waits for it to return, and the cancelled job never starts its next engine call.
+    func test_cancel_returnsOnlyOnceTheEngineCallInFlightHasReturned_evenWhenTheEngineIgnoresCancellation() async throws {
+        let engine = StubbornEngine(milliseconds: 600)
+        let local = LocalTranscriber(source: DeviceFixtures.source, language: "en", loadEngine: LoadGate(open: true).loader(engine))
+        await local.startLoading()
+        local.enqueue(DeviceFixtures.segment(0, in: dir))
+        let running = await eventually { engine.inFlight == 1 }
+        XCTAssertTrue(running, "precondition: the mic channel is being transcribed")
+
+        await local.cancel()
+
+        XCTAssertEqual(engine.inFlight, 0, "cancel returns only when no engine call is running")
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(engine.started, 1, "the cancelled job never starts its system channel")
+        let loaded = await local.isEngineLoaded
+        XCTAssertFalse(loaded, "cancel drops the engine")
+    }
+
+    /// A model load cannot be interrupted either. Cancel waits for it, and an engine that arrives after
+    /// cancel is released instead of kept.
+    func test_anEngineThatFinishesLoadingAfterCancel_isReleased_neverKept() async throws {
+        let gate = LoadGate()
+        let handedOut = WeakEngine()
+        let local = LocalTranscriber(source: DeviceFixtures.source, language: "en", loadEngine: {
+            let engine = ScriptedEngine()
+            handedOut.engine = engine
+            return try await gate.loader(engine)()
+        })
+        await local.startLoading()
+        let loading = await eventually { gate.loads == 1 }
+        XCTAssertTrue(loading, "precondition: the model is loading")
+
+        let cancelled = Finish()
+        let cancelling = Task { await local.cancel(); cancelled.record(nil) }
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertFalse(cancelled.done, "cancel waits for the load in flight")
+        gate.open()
+        await cancelling.value
+
+        let loaded = await local.isEngineLoaded
+        XCTAssertFalse(loaded, "an engine that arrives after cancel is not kept")
+        let released = await eventually { handedOut.engine == nil }
+        XCTAssertTrue(released, "and nothing else holds it")
+        XCTAssertEqual(gate.loads, 1, "cancel never starts another load")
+    }
 }

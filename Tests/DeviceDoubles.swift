@@ -43,6 +43,40 @@ final class ScriptedEngine: SpeechEngine, @unchecked Sendable {
     }
 }
 
+/// A `SpeechEngine` whose every call takes `milliseconds` and ignores cancellation, like a Core ML call
+/// already running on the Neural Engine. Counts the calls started and the calls still running.
+final class StubbornEngine: SpeechEngine, @unchecked Sendable {
+    let modelId = "parakeet-ultra@95eaa59"
+    private let lock = NSLock()
+    private let milliseconds: Int
+    private var _inFlight = 0
+    private var _started = 0
+
+    init(milliseconds: Int) { self.milliseconds = milliseconds }
+
+    var inFlight: Int { lock.withLock { _inFlight } }
+    var started: Int { lock.withLock { _started } }
+
+    func transcribe(_ audio: SpeechAudio) async throws -> SpeechResult {
+        lock.withLock { _inFlight += 1; _started += 1 }
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(milliseconds)) { continuation.resume() }
+        }
+        lock.withLock { _inFlight -= 1 }
+        return SpeechResult(modelId: modelId, segments: [])
+    }
+}
+
+/// Holds a weak reference to the engine a loader handed out, to prove nothing keeps it.
+final class WeakEngine: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var _engine: ScriptedEngine?
+    var engine: ScriptedEngine? {
+        get { lock.withLock { _engine } }
+        set { lock.withLock { _engine = newValue } }
+    }
+}
+
 /// Holds every engine load until `open()`, and counts loads.
 final class LoadGate: @unchecked Sendable {
     private let lock = NSLock()

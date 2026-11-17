@@ -88,6 +88,12 @@ enum CaptureRecovery {
 
     static let transcriptName = "transcript.json"
 
+    enum ModelDecision: Equatable { case ready, deferred, unusable }
+
+    static func modelDecision(status: ModelStatus, hasEntry: Bool, isRoutable: Bool) -> ModelDecision {
+        .ready
+    }
+
     /// Segment audio must cover this share of the recording before its transcript may stand for the meeting.
     static let minimumCoverage = 0.9
 
