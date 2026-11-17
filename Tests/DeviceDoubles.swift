@@ -9,14 +9,18 @@ final class ScriptedEngine: SpeechEngine, @unchecked Sendable {
     private let results: [String: [SpeechSegment]]
     private let failing: Set<String>
     private let hanging: Set<String>
+    private let cancelling: Set<String>
     private var _calls: [String] = []
     private var _cancelled: [String] = []
 
-    /// `hanging` files never finish (until cancelled), like a wedged Core ML call.
-    init(_ results: [String: [SpeechSegment]] = [:], failing: Set<String> = [], hanging: Set<String> = []) {
+    /// `hanging` files never finish (until cancelled), like a wedged Core ML call. `cancelling` files
+    /// throw `CancellationError`, like a job cancelled mid-call.
+    init(_ results: [String: [SpeechSegment]] = [:], failing: Set<String> = [], hanging: Set<String> = [],
+         cancelling: Set<String> = []) {
         self.results = results
         self.failing = failing
         self.hanging = hanging
+        self.cancelling = cancelling
     }
 
     var calls: [String] { lock.withLock { _calls } }
@@ -28,6 +32,7 @@ final class ScriptedEngine: SpeechEngine, @unchecked Sendable {
         let name = url.lastPathComponent
         lock.withLock { _calls.append(name) }
         if failing.contains(name) { throw CocoaError(.fileReadCorruptFile) }
+        if cancelling.contains(name) { throw CancellationError() }
         if hanging.contains(name) {
             do { try await Task.sleep(nanoseconds: 3_600_000_000_000) } catch {
                 lock.withLock { _cancelled.append(name) }

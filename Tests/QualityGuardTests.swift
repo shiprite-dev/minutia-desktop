@@ -31,7 +31,8 @@ final class QualityGuardTests: XCTestCase {
     }
 
     func test_englishThenJapanese_fails() {
-        XCTAssertFalse(QualityGuard.passes(QualityGuard.windows([speech(at: 0, confidence: 0.93), speech(at: 30, confidence: 0.59)]), floor: floor))
+        XCTAssertFalse(QualityGuard.passes(QualityGuard.windows([speech(at: 0, confidence: 0.93), speech(at: 30, confidence: 0.59),
+                                                                 speech(at: 60, confidence: 0.59)]), floor: floor))
     }
 
     func test_oneLowWindowInALongMeeting_passes() {
@@ -50,8 +51,14 @@ final class QualityGuardTests: XCTestCase {
         XCTAssertEqual(windows[0].speechSeconds, 12, accuracy: 1e-9)
     }
 
-    func test_oneFailingWindowOfFour_tripsAtTheShareBoundary() {
+    func test_oneFailingWindowOfFour_passes_becauseTheShareRuleNeedsFiveJudgedWindows() {
+        XCTAssertEqual(QualityGuard.minWindowsForShareRule, 5)
         let segments = (0..<4).map { speech(at: Double($0) * 30, confidence: $0 == 0 ? 0.5 : 0.9) }
+        XCTAssertTrue(QualityGuard.passes(QualityGuard.windows(segments), floor: floor))
+    }
+
+    func test_aQuarterOfEightWindowsFailingApart_tripsTheShareRule() {
+        let segments = (0..<8).map { speech(at: Double($0) * 30, confidence: $0 == 0 || $0 == 7 ? 0.5 : 0.9) }
         XCTAssertFalse(QualityGuard.passes(QualityGuard.windows(segments), floor: floor))
     }
 
@@ -85,11 +92,20 @@ final class QualityGuardTests: XCTestCase {
         }
     }
 
-    func test_stopGuard_tripsAtAQuarterFailing_orTwoInARow_butToleratesOneLoneFailure() {
+    func test_stopGuard_tripsAtAQuarterFailingOfFiveOrMore_orTwoInARow_orNothingPassing_butToleratesOneLoneFailure() {
         let p = QualityGuard.Verdict.pass, f = QualityGuard.Verdict.fail, u = QualityGuard.Verdict.unjudged
         let rows: [(String, [QualityGuard.Verdict], Bool)] = [
             ("one failed segment in an otherwise passing meeting", [p, p, p, f, p, p, p, p], true),
-            ("one of four failing is exactly a quarter", [p, p, p, f], false),
+            ("a short meeting tolerates one bad segment at the end", [p, p, p, f], true),
+            ("a short meeting tolerates one bad segment in the middle", [p, f, p], true),
+            ("two of four failing apart is under five judged windows", [f, p, f, p], true),
+            ("silence does not count toward the five judged windows", [u, u, f, p, f, p], true),
+            ("two of five failing apart trips the share rule", [f, p, f, p, p], false),
+            ("one of five failing stays under a quarter", [p, p, p, p, f], true),
+            ("two of eight failing apart is exactly a quarter", [f, p, p, p, p, p, p, f], false),
+            ("two failing in a short meeting", [f, f], false),
+            ("the only judged segment failing", [f], false),
+            ("the only judged segment failing among silence", [u, f, u], false),
             ("two of ten apart stays under a quarter", [f, p, p, p, p, f, p, p, p, p], true),
             ("two in a row in a long meeting", [p, p, p, p, f, f, p, p, p, p], false),
             ("every segment failing", [f, f, f], false),

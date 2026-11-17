@@ -254,7 +254,8 @@ final class LocalTranscriberTests: XCTestCase {
     func test_aMeetingThatTripsTheStopGuard_failsFinishAsQualityGuard() async {
         let rows: [(String, ScriptedEngine, Int)] = [
             ("two failed segments in a row", DeviceFixtures.meetingEngine(10, failing: [4, 5]), 10),
-            ("a quarter of the segments under the floor", DeviceFixtures.meetingEngine(4, lowConfidence: [2]), 4),
+            ("a quarter of eight segments under the floor", DeviceFixtures.meetingEngine(8, lowConfidence: [2, 6]), 8),
+            ("the only segment failing", DeviceFixtures.meetingEngine(1, failing: [0]), 1),
         ]
         for (label, engine, count) in rows {
             let local = guarded(engine)

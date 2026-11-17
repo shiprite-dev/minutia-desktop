@@ -10,6 +10,7 @@ enum QualityGuard {
     static let windowSeconds = 30.0
     static let minSpeechSeconds = 3.0
     static let maxFailingShare = 0.25
+    static let minWindowsForShareRule = 5
 
     struct Window: Codable, Equatable, Sendable {
         let start: Double

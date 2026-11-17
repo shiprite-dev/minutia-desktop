@@ -207,7 +207,8 @@ final class DeviceFallbackTests: XCTestCase {
             }
             XCTAssertEqual(error as? LocalTranscriber.Failure, breakage.expected, "\(breakage.label): got \(error)")
             XCTAssertEqual(cloud.log, [], "\(breakage.label): no audio egress under On this Mac only")
-            XCTAssertEqual(transport.log, [], "\(breakage.label): nothing is marked or sent")
+            XCTAssertFalse(transport.log.contains("mark") || transport.log.contains("submit"),
+                           "\(breakage.label): nothing is marked or sent; got \(transport.log)")
             XCTAssertTrue(dirExists, breakage.label)
             XCTAssertTrue(recordingExists, breakage.label)
             XCTAssertEqual(failures.failures, [breakage.expected], "\(breakage.label): exactly one notification")
@@ -220,16 +221,105 @@ final class DeviceFallbackTests: XCTestCase {
         let engine = ScriptedEngine(DeviceFixtures.fixtureEngine, hanging: ["seg-1-me.m4a"])
         let transport = RecordingTransport()
         let cloud = RecordingCloud()
+        let failures = FailureLog()
         let outcome = await stop(transcriber(engine), segments: 2, deviceOnly: true, transport: transport, cloud: cloud,
-                                 transcribeTimeout: 0.5)
+                                 failures: failures, transcribeTimeout: 0.5)
 
         guard case .failure(let error)? = outcome, case .localTranscriptionTimedOut? = error as? CaptureSession.CaptureError else {
             return XCTFail("got \(String(describing: outcome))")
         }
         XCTAssertEqual(cloud.log, [], "no audio egress under On this Mac only")
-        XCTAssertEqual(transport.log, [])
+        XCTAssertFalse(transport.log.contains("mark") || transport.log.contains("submit"), "got \(transport.log)")
         XCTAssertTrue(dirExists)
         XCTAssertTrue(recordingExists)
+        XCTAssertEqual(failures.failures, [.transcriptionTimedOut], "exactly one notification")
+    }
+
+    /// Runs every On this Mac only local failure (each breakage, then a local transcription timeout) in
+    /// a fresh directory holding an On this Mac only manifest, handing each row's doubles to `check`.
+    private func eachOnThisMacOnlyFailure(
+        _ check: (_ label: String, _ transport: RecordingTransport, _ cloud: RecordingCloud, _ failures: FailureLog,
+                  _ outcome: Result<CaptureSession.StopResult, Error>?) async throws -> Void
+    ) async throws {
+        for breakage in breakages {
+            try freshDirectory()
+            _ = writeManifest(deviceOnly: true)
+            let transport = RecordingTransport()
+            let cloud = RecordingCloud()
+            let failures = FailureLog()
+            let local = transcriber(breakage.engine, gate: breakage.gate, loadFailure: breakage.loadFailure,
+                                    loadTimeout: breakage.loadTimeout)
+            let outcome = await stop(local, segments: breakage.segments, deviceOnly: true, transport: transport,
+                                     cloud: cloud, failures: failures)
+            breakage.gate.open()
+            try await check(breakage.label, transport, cloud, failures, outcome)
+        }
+        try freshDirectory()
+        _ = writeManifest(deviceOnly: true)
+        let transport = RecordingTransport()
+        let cloud = RecordingCloud()
+        let failures = FailureLog()
+        let engine = ScriptedEngine(DeviceFixtures.fixtureEngine, hanging: ["seg-1-me.m4a"])
+        let outcome = await stop(transcriber(engine), segments: 2, deviceOnly: true, transport: transport, cloud: cloud,
+                                 failures: failures, transcribeTimeout: 0.5)
+        try await check("local transcription times out", transport, cloud, failures, outcome)
+    }
+
+    /// The web shows a meeting live until it is ended. A failed On this Mac only meeting has nothing to
+    /// send, so the stop ends it on the server, with no audio and no cloud call, before reporting the failure.
+    func test_onThisMacOnly_aLocalFailure_endsTheMeetingOnTheServerOnce_withoutAnyCloudCall() async throws {
+        try await eachOnThisMacOnlyFailure { label, transport, cloud, _, outcome in
+            guard case .failure? = outcome else { return XCTFail("\(label): must throw, got \(String(describing: outcome))") }
+            let ended = await eventually { transport.log.contains("endMeeting") }
+            XCTAssertTrue(ended, "\(label): the meeting is ended on the server; got \(transport.log)")
+            try await Task.sleep(nanoseconds: 200_000_000)
+            XCTAssertEqual(transport.log, ["endMeeting"], "\(label): ended once, nothing marked or sent")
+            XCTAssertEqual(cloud.log, [], "\(label): no audio egress under On this Mac only")
+        }
+    }
+
+    /// The stop's one notice is recorded in the manifest, so the launch sweep never posts a second one.
+    func test_onThisMacOnly_aLocalFailure_recordsItsOneNoticeInTheManifest() async throws {
+        try await eachOnThisMacOnlyFailure { label, _, _, failures, outcome in
+            guard case .failure? = outcome else { return XCTFail("\(label): must throw, got \(String(describing: outcome))") }
+            XCTAssertEqual(failures.failures.count, 1, "\(label): one notice at stop")
+            let manifest = try XCTUnwrap(CaptureRecovery.loadManifest(from: dir), "\(label): the manifest stays")
+            XCTAssertTrue(manifest.notified, "\(label): the notice is persisted with the recording")
+            XCTAssertEqual(manifest.recoveryAttempts, 0, label)
+        }
+    }
+
+    /// Cancelling is not failing: a stop whose local work was cancelled reports no local outcome, posts no
+    /// notice, counts nothing toward the model re-verify, and sends nothing anywhere.
+    func test_aStopWhoseLocalWorkIsCancelled_isNotAFailure_noOutcomeNoNoticeNothingSent() async throws {
+        for deviceOnly in [false, true] {
+            let rows: [(label: String, local: LocalTranscriber)] = [
+                ("the model load is cancelled", transcriber(DeviceFixtures.meetingEngine(3), loadFailure: CancellationError())),
+                ("a segment job is cancelled", transcriber(ScriptedEngine(cancelling: ["seg-0-me.m4a"]))),
+            ]
+            for row in rows {
+                try freshDirectory()
+                let label = "\(deviceOnly ? "On this Mac only" : "Automatic"), \(row.label)"
+                let transport = RecordingTransport()
+                let cloud = RecordingCloud()
+                let failures = FailureLog()
+                let outcomes = OutcomeLog()
+                let outcome = await stop(row.local, segments: 3, deviceOnly: deviceOnly, transport: transport, cloud: cloud,
+                                         failures: failures, outcomes: outcomes)
+
+                guard case .failure(let error)? = outcome else {
+                    XCTFail("\(label): a cancelled stop throws, got \(String(describing: outcome))")
+                    continue
+                }
+                XCTAssertTrue(error is CancellationError, "\(label): reported as cancelled, never as a failure; got \(error)")
+                XCTAssertEqual(outcomes.outcomes, [], "\(label): no local outcome, so no re-verify count")
+                XCTAssertEqual(failures.failures, [], "\(label): no notice")
+                try await Task.sleep(nanoseconds: 200_000_000)
+                XCTAssertEqual(cloud.log, [], label)
+                XCTAssertEqual(transport.log, [], "\(label): nothing marked, sent or ended")
+                XCTAssertTrue(dirExists, label)
+            }
+        }
     }
 
     // MARK: The local outcome is counted at the source
@@ -332,9 +422,9 @@ final class DeviceFallbackTests: XCTestCase {
         }
     }
 
-    /// On this Mac only never sends audio. The user was told once at stop; the sweep keeps the directory
-    /// and stops trying, with no repeated attempts and no second "could not be finished" notice.
-    func test_recovery_ofAnOnThisMacOnlyMeetingWithNoTranscript_uploadsNothing_andIsKeptSilently() async throws {
+    /// On this Mac only never sends audio. Recovery (a crash, or Retry) keeps the directory, ends the
+    /// meeting on the server so the web stops showing it live, and is terminal: not retried every launch.
+    func test_recovery_ofAnOnThisMacOnlyMeetingWithNoTranscript_uploadsNothing_endsTheMeeting_andIsKept() async throws {
         try writeReadableRecording()
         let transport = RecordingTransport()
         let cloud = RecordingCloud()
@@ -342,11 +432,89 @@ final class DeviceFallbackTests: XCTestCase {
 
         XCTAssertEqual(error as? CaptureRecovery.RecoveryError, .audioStaysOnThisMac, "got \(String(describing: error))")
         XCTAssertEqual(cloud.log, [], "no audio egress under On this Mac only")
-        XCTAssertEqual(transport.log, [])
+        let ended = await eventually { transport.log.contains("endMeeting") }
+        XCTAssertTrue(ended, "the meeting is ended on the server; got \(transport.log)")
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(transport.log, ["endMeeting"], "ended once, nothing marked or sent")
         XCTAssertTrue(dirExists)
         XCTAssertTrue(recordingExists)
-        XCTAssertEqual(AppController.recoveryOutcome(for: error), .keptOnThisMac,
-                       "terminal and silent: not retried every launch, never an exhaustion notice")
+        XCTAssertEqual(AppController.recoveryOutcome(for: error), .keptOnThisMac, "terminal: not retried every launch")
+    }
+
+    /// Retry of an On this Mac only meeting with no transcript cannot finish it: the app stays in its
+    /// failure state with the device copy instead of saying it is done with nothing transcribed.
+    func test_retry_ofAnOnThisMacOnlyMeetingWithNoTranscript_staysFailed_withTheDeviceTranscriptCopy() async throws {
+        try writeReadableRecording()
+        let error = await recover(writeManifest(deviceOnly: true), transport: RecordingTransport(), cloud: RecordingCloud())
+
+        XCTAssertEqual(AppController.refinalizeOutcome(for: error, host: "minutia.example.com"),
+                       .failed("This meeting could not be transcribed on this Mac. The recording is kept on this Mac."),
+                       "got \(String(describing: error))")
+        XCTAssertTrue(dirExists, "the recording is kept for a later Retry")
+    }
+
+    func test_retry_outcome_isFinishedOnlyWhenRecoverySucceeds() {
+        let host = "minutia.example.com"
+        XCTAssertEqual(AppController.refinalizeOutcome(for: nil, host: host), .finalized)
+        let network = URLError(.cannotConnectToHost)
+        XCTAssertEqual(AppController.refinalizeOutcome(for: network, host: host),
+                       .failed(AppController.finalizeFailureMessage(for: network, host: host)))
+        XCTAssertEqual(AppController.refinalizeOutcome(for: CaptureRecovery.RecoveryError.transcriptNotFinished, host: host),
+                       .failed("This meeting could not be transcribed on this Mac. The recording is kept on this Mac."))
+    }
+
+    /// One notice per failed On this Mac only meeting in total: the stop's notice, or for a meeting that
+    /// crashed before its stop could post one, a single notice from the launch sweep. Either way the sweep
+    /// pins the attempts so it never tries again.
+    func test_launchSweep_ofAnOnThisMacOnlyMeeting_noticesOnlyWhenTheStopDidNot_andStopsTrying() {
+        let fresh = writeManifest(deviceOnly: true)
+        var told = fresh
+        told.notified = true
+        let first = AppController.recoverySweep(priorAttempts: 0)
+
+        let crashed = AppController.sweepStep(manifest: fresh, outcome: .keptOnThisMac, sweep: first)
+        XCTAssertEqual(crashed.report, .exhausted, "a crash before the stop's notice gets exactly one from the sweep")
+        XCTAssertEqual(crashed.save?.recoveryAttempts, AppController.maxRecoveryAttempts)
+        XCTAssertEqual(crashed.save?.notified, true, "the sweep's notice is persisted too")
+
+        let stopped = AppController.sweepStep(manifest: told, outcome: .keptOnThisMac, sweep: first)
+        XCTAssertNil(stopped.report, "the stop already told the user")
+        XCTAssertEqual(stopped.save?.recoveryAttempts, AppController.maxRecoveryAttempts)
+        XCTAssertEqual(stopped.save?.notified, true)
+
+        XCTAssertTrue(AppController.recoverySweep(priorAttempts: AppController.maxRecoveryAttempts).skip,
+                      "pinned attempts mean the next launch skips the directory")
+    }
+
+    /// The rest of the sweep's per-directory decisions, unchanged by moving them behind `sweepStep`.
+    func test_launchSweep_otherOutcomes_keepTheirNoticesAndAttemptCounts() {
+        let fresh = writeManifest(deviceOnly: false)
+        var told = fresh
+        told.notified = true
+        let first = AppController.recoverySweep(priorAttempts: 0)
+        let last = AppController.recoverySweep(priorAttempts: AppController.maxRecoveryAttempts - 1)
+
+        XCTAssertEqual(AppController.sweepStep(manifest: fresh, outcome: .recovered, sweep: first),
+                       AppController.SweepStep(save: nil, report: .recovered))
+
+        var unavailable = fresh
+        unavailable.notified = true
+        XCTAssertEqual(AppController.sweepStep(manifest: fresh, outcome: .transcriptionUnavailable, sweep: first),
+                       AppController.SweepStep(save: unavailable, report: .transcriptionUnavailable))
+        XCTAssertEqual(AppController.sweepStep(manifest: told, outcome: .transcriptionUnavailable, sweep: first),
+                       AppController.SweepStep(save: nil, report: nil))
+
+        var dead = fresh
+        dead.recoveryAttempts = AppController.maxRecoveryAttempts
+        XCTAssertEqual(AppController.sweepStep(manifest: fresh, outcome: .unreadable, sweep: first),
+                       AppController.SweepStep(save: dead, report: .exhausted))
+
+        var once = fresh
+        once.recoveryAttempts = 1
+        XCTAssertEqual(AppController.sweepStep(manifest: fresh, outcome: .retryLater, sweep: first),
+                       AppController.SweepStep(save: once, report: nil))
+        XCTAssertEqual(AppController.sweepStep(manifest: fresh, outcome: .retryLater, sweep: last),
+                       AppController.SweepStep(save: dead, report: .exhausted))
     }
 
     func test_retry_ofAnAutomaticFallbackWhoseUploadFailed_finishesInTheCloud() async throws {

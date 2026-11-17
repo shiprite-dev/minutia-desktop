@@ -1658,6 +1658,45 @@ final class AppController: NSObject, ObservableObject {
         return .retryLater
     }
 
+    enum RefinalizeOutcome: Equatable {
+        case finalized
+        case failed(String)
+    }
+
+    nonisolated static func refinalizeOutcome(for error: Error?, host: String?) -> RefinalizeOutcome {
+        guard let error else { return .finalized }
+        if error as? CaptureRecovery.RecoveryError == .audioStaysOnThisMac { return .finalized }
+        return .failed(finalizeFailureMessage(for: error, host: host))
+    }
+
+    enum SweepReport: Equatable { case recovered, transcriptionUnavailable, exhausted }
+
+    struct SweepStep: Equatable {
+        var save: CaptureManifest?
+        var report: SweepReport?
+    }
+
+    nonisolated static func sweepStep(manifest: CaptureManifest, outcome: RecoveryOutcome, sweep: RecoverySweep) -> SweepStep {
+        var updated = manifest
+        switch outcome {
+        case .recovered:
+            return SweepStep(save: nil, report: .recovered)
+        case .transcriptionUnavailable:
+            guard !manifest.notified else { return SweepStep(save: nil, report: nil) }
+            updated.notified = true
+            return SweepStep(save: updated, report: .transcriptionUnavailable)
+        case .keptOnThisMac:
+            updated.recoveryAttempts = maxRecoveryAttempts
+            return SweepStep(save: updated, report: nil)
+        case .unreadable:
+            updated.recoveryAttempts = maxRecoveryAttempts
+            return SweepStep(save: updated, report: .exhausted)
+        case .retryLater:
+            updated.recoveryAttempts = sweep.nextAttempts
+            return SweepStep(save: updated, report: sweep.notifyOnExhaustion ? .exhausted : nil)
+        }
+    }
+
     /// After this many consecutive failed finalizes a capture is treated as deterministically dead:
     /// the sweep stops attempting it (the audio is kept) so a launch loop never retries it forever.
     static let maxRecoveryAttempts = 5
