@@ -10,11 +10,13 @@ import SwiftUI
 @MainActor
 final class MeetingPromptPanel {
     private var panel: NSPanel?
+    private(set) var content: MeetingPromptContent?
 
     private var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
     func show(content: MeetingPromptContent, onStart: @escaping () -> Void, onDismiss: @escaping () -> Void) {
         teardown()
+        self.content = content
 
         let hosting = NSHostingView(
             rootView: MeetingPromptView(content: content, onStart: onStart, onDismiss: onDismiss))
@@ -70,6 +72,7 @@ final class MeetingPromptPanel {
     }
 
     func dismiss() {
+        content = nil
         guard let panel else { return }
         self.panel = nil
         if reduceMotion {

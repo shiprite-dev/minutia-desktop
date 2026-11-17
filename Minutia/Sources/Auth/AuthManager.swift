@@ -198,7 +198,7 @@ final class AuthManager: ObservableObject {
         }
     }
 
-    private var pendingAuth: PendingAuth? {
+    private(set) var pendingAuth: PendingAuth? {
         get {
             guard let data = UserDefaults.standard.data(forKey: Self.pendingAuthKey),
                   let decoded = try? JSONDecoder().decode(PendingAuth.self, from: data) else { return nil }
@@ -252,6 +252,19 @@ final class AuthManager: ObservableObject {
         try await task.value
     }
 
+    func adopt(_ client: SupabaseClient, instance: URL) async {
+        self.supabase = client
+        self.instance = instance
+        self.isConnected = true
+        observeAuthState(client)
+
+        // A prior session may already be in the Keychain: surface it so a relaunch lands signed
+        // in without re-prompting. A nil session must clear any previous instance's email so the
+        // user lands on sign-in rather than a phantom signed-in state.
+        let sessionEmail = (try? await client.auth.session)?.user.email
+        setSession(email: Self.resolvedEmail(priorEmail: userEmail, sessionEmail: sessionEmail))
+    }
+
     /// Fetch the instance's public connection details and build the Supabase client.
     /// Rehydrates `userEmail` from any Keychain-persisted session.
     func connect(instance: URL) async throws {
@@ -278,17 +291,8 @@ final class AuthManager: ObservableObject {
                 supabaseURL: meta.supabaseUrl,
                 supabaseKey: meta.supabaseAnonKey,
                 options: .init(auth: .init(storageKey: Self.sessionStorageKey(for: instance))))
-            self.supabase = client
-            self.instance = instance
-            self.isConnected = true
             InstanceConfig.stored = (instance: instance, meta: meta)
-            observeAuthState(client)
-
-            // A prior session may already be in the Keychain: surface it so a relaunch lands signed
-            // in without re-prompting. A nil session must clear any previous instance's email so the
-            // user lands on sign-in rather than a phantom signed-in state.
-            let sessionEmail = (try? await client.auth.session)?.user.email
-            setSession(email: Self.resolvedEmail(priorEmail: userEmail, sessionEmail: sessionEmail))
+            await adopt(client, instance: instance)
         } catch {
             // A failed (re)connect must not leave a stale client reporting connected, nor a
             // signed-in phase with no client behind it. Clearing the session drops the app to the

@@ -123,7 +123,7 @@ private struct IdleView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                Picker("Series", selection: $controller.selectedSeriesId) {
+                Picker("Series", selection: Binding(get: { controller.selectedSeriesId }, set: controller.pickSeries)) {
                     ForEach(controller.series) { series in
                         Text(series.name).tag(Optional(series.id))
                     }

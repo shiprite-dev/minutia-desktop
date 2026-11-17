@@ -83,12 +83,13 @@ enum DetectionRules {
         return .soft
     }
 
-    /// The earliest agenda item with a meeting URL whose window covers `now`, allowing a 2-minute
-    /// grace period before `startAt` so detection can fire slightly ahead of the scheduled start.
+    /// The most recently started agenda item with a meeting URL whose window covers `now`, allowing a
+    /// 2-minute grace period before `startAt` so detection can fire slightly ahead of the scheduled
+    /// start. Back to back, joining the next meeting a minute early names the next meeting.
     static func liveAgendaItem(_ items: [AgendaItem], now: Date) -> AgendaItem? {
         items
             .filter { $0.meetingUrl != nil }
             .filter { now >= $0.startAt.addingTimeInterval(-120) && now <= $0.endAt }
-            .min { $0.startAt < $1.startAt }
+            .max { $0.startAt < $1.startAt }
     }
 }

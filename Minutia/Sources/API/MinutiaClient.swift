@@ -12,7 +12,7 @@ struct Meeting: Codable {
     let title: String
 }
 
-struct AgendaItem: Codable {
+struct AgendaItem: Codable, Equatable {
     let seriesId: UUID?
     let meetingId: UUID?
     let title: String

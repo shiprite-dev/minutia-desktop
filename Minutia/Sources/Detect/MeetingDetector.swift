@@ -39,7 +39,7 @@ final class MeetingDetector: ObservableObject {
     private let agendaCacheTTL: TimeInterval = 60
 
     /// The calendar event the latest poll found happening now, if any.
-    private(set) var liveAgendaItem: AgendaItem?
+    @Published var liveAgendaItem: AgendaItem?
 
     private var micActive = false
     /// The previous poll's raw browser-input hit, so a browser meeting must persist across two
