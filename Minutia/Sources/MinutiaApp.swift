@@ -244,15 +244,15 @@ struct MenuBarIcon: View {
     }
 }
 
-/// An outstanding request to record, triggered by the browser via `minutia://record`. Capture
-/// never starts from the deep link itself: this pending consent gates it behind an explicit user
-/// confirm (notification action or in-menu banner).
 struct RecapCue: Equatable {
     let meetingId: UUID
     let seriesId: UUID?
     let instance: URL
 }
 
+/// An outstanding request to record, triggered by the browser via `minutia://record`. Capture
+/// never starts from the deep link itself: this pending consent gates it behind an explicit user
+/// confirm (notification action or in-menu banner).
 struct PendingRecordConsent: Equatable {
     let meetingId: String
     let requestedAt: Date
@@ -297,6 +297,8 @@ final class AppController: NSObject, ObservableObject {
     /// so and offer the recap. Cleared by the panel after its hold and by any phase change.
     @Published private(set) var recapCue: RecapCue?
     var announce: (String) -> Void = { AccessibilityNotification.Announcement($0).post() }
+    var recapHold: () -> TimeInterval = { Celebration.hold(reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion) }
+    private var recapExpiry: Task<Void, Never>?
     @Published private(set) var selectedSeriesId: UUID?
     /// The user chose a series during the current detected meeting; detection then leaves it alone.
     private var seriesPickedThisMeeting = false
@@ -672,7 +674,8 @@ final class AppController: NSObject, ObservableObject {
     private var cancellables: Set<AnyCancellable> = []
     private var lastConfidence: DetectionConfidence = .none
     private var recordingMeetingId: UUID?
-    var recordingSeriesId: UUID?
+    private(set) var recordingSeriesId: UUID?
+    func useRecordingSeries(_ id: UUID?) { recordingSeriesId = id }
     var recordingSeriesName: String? { series.first { $0.id == recordingSeriesId }?.name }
     /// The instance capture started against, captured at start so the recap URL survives an instance
     /// switch made while the meeting was recording.
@@ -834,7 +837,7 @@ final class AppController: NSObject, ObservableObject {
         guard next != phase else { return }
         let previous = phase
         phase = next
-        recapCue = nil
+        clearRecapCue()
         if next == .recording, previous != .recording { announce("Recording started") }
         restoreLastUsedAfterDetectedMeeting()
         switch Self.modelStoreCue(from: previous, to: next, signedIn: authManager.sessionIdentity.email != nil) {
@@ -1338,7 +1341,7 @@ final class AppController: NSObject, ObservableObject {
             transcriber: routing.decision == .device ? deviceTranscriber(language: routing.language) : nil)
         notepad.begin(meetingId: meetingId, instance: client.instance, userId: userId, client: client)
         recordingMeetingId = UUID(uuidString: meetingId)
-        recordingSeriesId = seriesId
+        useRecordingSeries(seriesId)
         recordingInstance = client.instance
         recordingLanguage = routing.language
         resetEndDetectionState(origin: Self.detectionOrigin(for: lastConfidence))
@@ -1663,9 +1666,18 @@ final class AppController: NSObject, ObservableObject {
         guard let cue, phase == .idle else { return }
         recapCue = cue
         announce("Sent. Your recap is on its way")
+        let hold = recapHold()
+        recapExpiry = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(hold * 1_000_000_000))
+            if !Task.isCancelled { self?.clearRecapCue() }
+        }
     }
 
-    func clearRecapCue() { recapCue = nil }
+    func clearRecapCue() {
+        recapExpiry?.cancel()
+        recapExpiry = nil
+        recapCue = nil
+    }
 
     func openRecapFromCue() {
         guard let cue = recapCue else { return }

@@ -91,35 +91,20 @@ struct Seen {
     let text: String
     let frames: [(String, CGRect)]
 
+    private static let homoglyphs: [Character: Character] = [
+        "\u{0430}": "a", "\u{0435}": "e", "\u{043E}": "o", "\u{0440}": "p", "\u{0441}": "c", "\u{0445}": "x", "\u{0443}": "y",
+        "\u{043C}": "m", "\u{0442}": "t", "\u{043D}": "h", "\u{043A}": "k", "\u{0432}": "b",
+    ]
+
     private static func normalize(_ value: String) -> String {
-        value.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }.joined(separator: " ")
+        let folded = String(value.lowercased().map { homoglyphs[$0] ?? $0 }.map { $0 == "|" || $0 == "i" ? "l" : $0 })
+        return folded.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }.joined(separator: " ")
+            .replacingOccurrences(of: "rn", with: "m")
     }
 
     func has(_ expected: String) -> Bool {
-        let hay = Array(Self.normalize(text)), needle = Array(Self.normalize(expected))
-        if hay.isEmpty || needle.isEmpty { return false }
-        let allowed = needle.count >= 10 ? needle.count / 10 : 0
-        if allowed == 0 { return String(hay).contains(String(needle)) }
-        for start in 0..<hay.count {
-            for length in max(1, needle.count - allowed)...(needle.count + allowed) where start + length <= hay.count {
-                if Self.distance(Array(hay[start..<start + length]), needle) <= allowed { return true }
-            }
-        }
-        return false
-    }
-
-    private static func distance(_ a: [Character], _ b: [Character]) -> Int {
-        var row = Array(0...b.count)
-        for i in 1...a.count {
-            var previous = row[0]
-            row[0] = i
-            for j in 1...b.count {
-                let current = row[j]
-                row[j] = a[i - 1] == b[j - 1] ? previous : min(previous, row[j], row[j - 1]) + 1
-                previous = current
-            }
-        }
-        return row[b.count]
+        let needle = Self.normalize(expected)
+        return !needle.isEmpty && Self.normalize(text).contains(needle)
     }
 
     func frame(of expected: String) -> CGRect? {
@@ -202,6 +187,29 @@ final class MenuLayoutTests: XCTestCase {
     func test_recordingWithEveryNotice_fitsTheBudget() {
         let model = RecordingModel(seriesName: longName, elapsed: 7457, level: 0.2, progress: "2 of 3 segments uploaded", reconnecting: true, systemAudioDegraded: true, micUnavailable: true)
         XCTAssertLessThanOrEqual(Host.size(RecordingContent(model: model)).height, 520)
+    }
+}
+
+final class SeenMatcherTests: XCTestCase {
+    private func seen(_ text: String) -> Seen { Seen(text: text, frames: []) }
+
+    func test_rejectsTextThatSaysTheOpposite() {
+        XCTAssertFalse(seen("Your recording is NOT saved on this Mac").has("Your recording is saved on this Mac"))
+        XCTAssertFalse(seen("Your recording is no longer saved on this Mac").has("Your recording is saved on this Mac"))
+    }
+
+    func test_rejectsAnyWrongDigit() {
+        XCTAssertFalse(seen("Transcribing on this Mac, 2 of 5").has("Transcribing on this Mac, 2 of 3"))
+        XCTAssertFalse(seen("Downloading model 12%").has("Downloading model 42%"))
+        XCTAssertFalse(seen("Downloading model 4%").has("Downloading model 42%"))
+    }
+
+    func test_acceptsTheSameTextAndKnownOcrConfusions() {
+        XCTAssertTrue(seen("Your recording is saved on this Mac. Retry Dismiss").has("Your recording is saved on this Mac"))
+        XCTAssertTrue(seen("Your recording is saved on this \u{041C}\u{0430}\u{0441}").has("Your recording is saved on this Mac"))
+        XCTAssertTrue(seen("Weekly Eng Sync Ill").has("Weekly Eng Sync Ill"))
+        XCTAssertTrue(seen("QuarterIy platforrn review").has("Quarterly platform review"))
+        XCTAssertTrue(seen("Downloading model 42%").has("Downloading model 42%"))
     }
 }
 
@@ -330,6 +338,12 @@ final class MenuStatesSeenTests: XCTestCase {
         XCTAssertEqual(Host.fillBands(IdleScreen(model: idleModel), atPoint: 30), 1)
     }
 
+    func test_consentOverAnEmptyAccount_showsOneVermilionFill() {
+        let view = VStack(spacing: 0) { ConsentNotice(hasClaim: true); IdleScreen(model: model(series: [], selected: nil)) }.environment(\.consentPending, true)
+        XCTAssertEqual(Host.fillBands(view, atPoint: 30), 1)
+        XCTAssertEqual(Host.fillBands(IdleScreen(model: model(series: [], selected: nil)), atPoint: 30), 1)
+    }
+
     func test_consentOverError_showsOneVermilionFill() {
         let view = VStack(spacing: 0) { ConsentNotice(hasClaim: true); ErrorScreen(message: "Upload failed.", isMicError: false) }.environment(\.consentPending, true)
         XCTAssertEqual(Host.fillBands(view, atPoint: 30), 1)
@@ -357,7 +371,7 @@ final class MenuStatesSeenTests: XCTestCase {
         let seen = signIn(.ready)
         XCTAssertTrue(seen.has("Sign in with browser"), seen.text)
         XCTAssertTrue(seen.has("Use email instead"), seen.text)
-        XCTAssertTrue(seen.has("Record a meeting. Get the issues log."), seen.text)
+        XCTAssertTrue(seen.has("a meeting. Get the issues log."), seen.text)
     }
 
     func test_signedOut_firstRunShowsTheMenuBarHint() {

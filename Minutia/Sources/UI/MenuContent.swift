@@ -47,7 +47,6 @@ struct MenuContent: View {
     @ObservedObject var updater: UpdaterController
     @Environment(\.motionReduced) private var reduceMotion
     @State private var visible = true
-    @State private var holdTask: Task<Void, Never>?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -108,14 +107,6 @@ struct MenuContent: View {
         .sensoryFeedback(trigger: controller.phase) { old, new in PanelHaptic.feedback(from: old, to: new) }
         .onAppear { visible = true }
         .onDisappear { visible = false }
-        .onChange(of: controller.recapCue, initial: true) { _, cue in
-            holdTask?.cancel()
-            guard cue != nil else { return }
-            holdTask = Task {
-                try? await Task.sleep(nanoseconds: UInt64(Celebration.hold(reduceMotion: reduceMotion) * 1_000_000_000))
-                if !Task.isCancelled { controller.clearRecapCue() }
-            }
-        }
     }
 }
 
@@ -263,12 +254,23 @@ struct IdleScreen: View {
                 .font(Typo.body)
                 .foregroundStyle(Brand.ink2)
                 .fixedSize(horizontal: false, vertical: true)
-            Button { onOpenURL(links.primary.url) } label: {
-                Label(links.primary.title, systemImage: "calendar")
-            }
-            .buttonStyle(PrimaryButtonStyle())
+            ConnectButton(title: links.primary.title, consentPending: consentPending) { onOpenURL(links.primary.url) }
             Button(links.secondary.title) { onOpenURL(links.secondary.url) }
                 .buttonStyle(QuietButtonStyle())
+        }
+    }
+}
+
+private struct ConnectButton: View {
+    let title: String
+    let consentPending: Bool
+    let action: () -> Void
+
+    var body: some View {
+        if consentPending {
+            Button(action: action) { Label(title, systemImage: "calendar") }.buttonStyle(SecondaryButtonStyle())
+        } else {
+            Button(action: action) { Label(title, systemImage: "calendar") }.buttonStyle(PrimaryButtonStyle())
         }
     }
 }

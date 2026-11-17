@@ -86,7 +86,7 @@ final class PanelFlowTests: XCTestCase {
 
     func test_recording_showsTheLivePanel() {
         let controller = signedIn()
-        controller.recordingSeriesId = weekly.id
+        controller.useRecordingSeries(weekly.id)
         controller.apply(.recordStarted)
         let seen = panel(controller)
         XCTAssertTrue(seen.has("RECORDING"), seen.text)
@@ -121,7 +121,7 @@ final class PanelFlowTests: XCTestCase {
     func test_webStartedRecording_namesTheSeriesItRecordsInto_notThePickerSelection() {
         let controller = signedIn()
         XCTAssertEqual(controller.selectedSeriesId, weekly.id)
-        controller.recordingSeriesId = boardPrep.id
+        controller.useRecordingSeries(boardPrep.id)
         controller.apply(.recordStarted)
         let seen = panel(controller)
         XCTAssertTrue(seen.has("Board prep"), seen.text)
@@ -131,7 +131,7 @@ final class PanelFlowTests: XCTestCase {
     func test_recordingIntoAnUnknownSeries_neverBorrowsThePickersName() {
         for unknown in [nil, UUID()] as [UUID?] {
             let controller = signedIn()
-            controller.recordingSeriesId = unknown
+            controller.useRecordingSeries(unknown)
             controller.apply(.recordStarted)
             let seen = panel(controller)
             XCTAssertFalse(seen.has("Weekly Eng Sync"), seen.text)
@@ -195,6 +195,33 @@ final class PanelFlowTests: XCTestCase {
         controller.apply(.recordStarted)
         XCTAssertNil(controller.recapCue)
         XCTAssertTrue(panel(controller).has("RECORDING"))
+    }
+
+    func test_sentScreen_expiresEvenIfThePanelWasNeverOpened() async {
+        let controller = signedIn()
+        controller.recapHold = { 0.15 }
+        finishCleanly(controller, cue: sentCue())
+        XCTAssertNotNil(controller.recapCue)
+        try? await Task.sleep(nanoseconds: 600_000_000)
+        XCTAssertNil(controller.recapCue)
+        let seen = panel(controller)
+        XCTAssertTrue(seen.has("SERIES"), seen.text)
+        XCTAssertFalse(seen.has("Sent. Your recap"), seen.text)
+    }
+
+    func test_aNewerCue_isNotClearedByTheOlderOnesTimer() async {
+        let controller = signedIn()
+        controller.recapHold = { 0.3 }
+        finishCleanly(controller, cue: sentCue())
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        controller.apply(.recordStarted)
+        controller.apply(.recordStopped)
+        controller.apply(.finalized)
+        controller.presentRecapCue(sentCue())
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertNotNil(controller.recapCue, "the first timer must not clear the second cue")
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertNil(controller.recapCue)
     }
 
     func test_sentScreen_clearsWhenItsHoldEnds() {
