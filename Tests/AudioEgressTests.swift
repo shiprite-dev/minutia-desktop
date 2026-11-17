@@ -24,7 +24,7 @@ final class AudioEgressTests: XCTestCase {
     /// in the unsigned test host, and enough of them starve every later async test.
     private static let client = MinutiaClient(
         instance: URL(string: "http://127.0.0.1:1")!,
-        supabase: SupabaseClient(supabaseURL: URL(string: "http://127.0.0.1:1")!, supabaseKey: "anon-key"),
+        supabase: testSupabase(URL(string: "http://127.0.0.1:1")!),
         tokenProvider: { "token" })
 
     private func unreachableClient() -> MinutiaClient { Self.client }
