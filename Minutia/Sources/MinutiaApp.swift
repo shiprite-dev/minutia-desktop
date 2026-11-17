@@ -790,9 +790,11 @@ final class AppController: NSObject, ObservableObject {
     /// Connect step. Idempotent with SignInView's on-appear auto-connect.
     func restoreSession(firstLaunch: Bool = false) async {
         try? await authManager.ensureConnected()
-        if authManager.client() != nil,
-           FirstRun.opensSignIn(firstLaunch: firstLaunch, signedIn: authManager.sessionIdentity.email != nil) {
-            NSWorkspace.shared.open(authManager.beginBrowserSignIn(device: Host.current().localizedName ?? "Mac"))
+        if authManager.client() != nil {
+            FirstRun.openSignInIfNeeded(
+                firstLaunch: firstLaunch, signedIn: authManager.sessionIdentity.email != nil,
+                signInURL: { authManager.beginBrowserSignIn(device: Host.current().localizedName ?? "Mac") },
+                open: { NSWorkspace.shared.open($0) })
         }
         if authManager.sessionIdentity.email != nil { Task { await modelStore.prepare(language: "en") } }
         // Recover orphaned captures on every launch, not only on a sign-in transition: a warm launch
@@ -941,12 +943,11 @@ final class AppController: NSObject, ObservableObject {
         lastConfidence = confidence
         switch confidence {
         case .high(let app):
-            let live = detector.liveAgendaItem
-            if canBeginRecording {
-                selectedSeriesId = Self.defaultSeries(available: series.map(\.id), live: live, last: selectedSeriesId)
-            }
+            let meeting = Self.detectedMeeting(
+                app: app, live: detector.liveAgendaItem, series: series.map(\.id), current: selectedSeriesId)
+            if canBeginRecording { selectedSeriesId = meeting.seriesId }
             apply(.meetingDetected(Self.detectionLabel(app)))
-            showMeetingPromptIfNeeded(app: app, meeting: live?.title)
+            showMeetingPromptIfNeeded(meeting.prompt)
         case .none:
             // The corroborating signal is gone (mic released): retire a stale banner and reset the
             // prompt session so the next meeting can prompt again.
@@ -966,12 +967,12 @@ final class AppController: NSObject, ObservableObject {
     /// promptable state. Confirming starts capture via the same `startRecording` path the in-menu
     /// banner uses (mic preflight included); dismissing suppresses re-prompt for the rest of the
     /// session.
-    private func showMeetingPromptIfNeeded(app: MeetingApp?, meeting: String?) {
+    private func showMeetingPromptIfNeeded(_ content: MeetingPromptContent) {
         guard MeetingPrompt.shouldShow(
             isHigh: true, phase: phase, suppressedForSession: promptSuppressedForSession) else { return }
         promptSuppressedForSession = true
         meetingPromptPanel.show(
-            content: MeetingPrompt.content(for: app, meeting: meeting),
+            content: content,
             onStart: { [weak self] in
                 self?.dismissMeetingPrompt()
                 self?.startRecording()
@@ -1130,6 +1131,15 @@ final class AppController: NSObject, ObservableObject {
         series = fetched
         let last = UserDefaults.standard.string(forKey: Self.lastSeriesKey).flatMap(UUID.init(uuidString:))
         selectedSeriesId = Self.defaultSeries(available: fetched.map(\.id), live: nil, last: last)
+    }
+
+    /// What a detected meeting shows and where its recording goes: a calendar event happening now
+    /// names the prompt and picks its series.
+    nonisolated static func detectedMeeting(
+        app: MeetingApp?, live: AgendaItem?, series: [UUID], current: UUID?
+    ) -> (prompt: MeetingPromptContent, seriesId: UUID?) {
+        (MeetingPrompt.content(for: app, meeting: live?.title),
+         defaultSeries(available: series, live: live, last: current))
     }
 
     /// The series a recording goes into: the meeting happening now, else the last used, else the first.

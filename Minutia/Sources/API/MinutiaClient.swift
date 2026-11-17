@@ -467,15 +467,6 @@ struct MinutiaClient {
 
     /// The meetings-table lookup id: lowercased to match the canonical DB id (Swift `UUID.uuidString`
     /// is uppercase). The shared seam so a recap-resolution query is never issued with an uppercase id.
-    /// The web app's Google Calendar connect route (src/app/api/auth/google on the server).
-    static func connectCalendarURL(instance: URL) -> URL {
-        instance.appendingPathComponent("api/auth/google")
-    }
-
-    static func createSeriesURL(instance: URL) -> URL {
-        instance.appendingPathComponent("series")
-    }
-
     static func meetingLookupId(_ meetingId: String) -> String { meetingId.lowercased() }
 
     /// The web app's recap route for a meeting (src/app/(app)/series/[id]/meetings/[meetingId] on

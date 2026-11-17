@@ -61,6 +61,17 @@ struct MenuContent: View {
     }
 }
 
+struct MenuLink: Equatable {
+    let title: String
+    let url: URL
+
+    /// An account with no series yet: connect a calendar (its meetings become series), or make one.
+    static func emptySeries(instance: URL) -> (primary: MenuLink, secondary: MenuLink) {
+        (MenuLink(title: "Connect Google Calendar", url: instance.appendingPathComponent("api/auth/google")),
+         MenuLink(title: "Create a series", url: instance.appendingPathComponent("series")))
+    }
+}
+
 private struct ModelStatusRow: View {
     @ObservedObject var store: ModelStore
 
@@ -98,19 +109,17 @@ private struct IdleView: View {
             }
 
             if controller.series.isEmpty {
-                let instance = controller.authManager.instance ?? InstanceConfig.resolvedInstance
+                let links = MenuLink.emptySeries(instance: controller.authManager.instance ?? InstanceConfig.resolvedInstance)
                 VStack(alignment: .leading, spacing: 6) {
                     Button {
-                        NSWorkspace.shared.open(MinutiaClient.connectCalendarURL(instance: instance))
+                        NSWorkspace.shared.open(links.primary.url)
                     } label: {
-                        Label("Connect Google Calendar", systemImage: "calendar")
+                        Label(links.primary.title, systemImage: "calendar")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
-                    Button("Create a series") {
-                        NSWorkspace.shared.open(MinutiaClient.createSeriesURL(instance: instance))
-                    }
-                    .buttonStyle(.link)
+                    Button(links.secondary.title) { NSWorkspace.shared.open(links.secondary.url) }
+                        .buttonStyle(.link)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             } else {

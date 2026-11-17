@@ -22,8 +22,9 @@ enum FirstRun {
     }
 
     /// A fresh install opens browser sign-in by itself once its instance connection is ready.
-    static func opensSignIn(firstLaunch: Bool, signedIn: Bool) -> Bool {
-        firstLaunch && !signedIn
+    static func openSignInIfNeeded(firstLaunch: Bool, signedIn: Bool, signInURL: () -> URL, open: (URL) -> Void) {
+        guard firstLaunch, !signedIn else { return }
+        open(signInURL())
     }
 
     /// Turns Launch at Login on at the first sign-in, once ever, unless the user already chose.
