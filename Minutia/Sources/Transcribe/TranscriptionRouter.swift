@@ -95,7 +95,7 @@ enum TranscriptionRouter {
 
     static let meetingLanguageKey = "app.minutia.meetingLanguage"
     static let deviceRoutingKey = "app.minutia.deviceTranscriptionEnabled"
-    static let deviceRoutingEnabledByDefault = false
+    static let deviceRoutingEnabledByDefault = true
 
     static func isDeviceRoutingEnabled(_ defaults: UserDefaults) -> Bool {
         defaults.object(forKey: deviceRoutingKey) as? Bool ?? deviceRoutingEnabledByDefault

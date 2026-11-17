@@ -151,8 +151,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "Finishing upload"
-        alert.informativeText = "Minutia is still finishing a recording upload. Finish and quit, or keep it running?"
+        let copy = AppController.quitAlert(capturingAudioMayLeaveMac: {
+            switch AppController.shared.phase {
+            case .recording, .finalizing: AppController.shared.captureSession.audioMayLeaveMac
+            default: nil
+            }
+        }())
+        alert.messageText = copy.title
+        alert.informativeText = copy.message
         alert.addButton(withTitle: "Finish & Quit")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else {
@@ -454,7 +460,9 @@ final class AppController: NSObject, ObservableObject {
         }
         if error is LocalTranscriber.Failure { return deviceTranscriptFailure }
         if error is TimeoutError {
-            return "Finishing the recording timed out. Your audio is saved locally; Retry to finish uploading."
+            return audioMayLeaveMac
+                ? "Finishing the recording timed out. Your audio is saved locally; Retry to finish uploading."
+                : "Finishing the recording timed out. Your audio is saved on this Mac; Retry to finish."
         }
         return "Could not finish recording: \(error.localizedDescription)"
     }
@@ -483,10 +491,14 @@ final class AppController: NSObject, ObservableObject {
     /// finalizing its upload), or a startup recovery sweep still rescuing a prior recording. Leaving
     /// without finishing would defer the upload to the next-launch recovery at best.
     nonisolated static func quitAlert(capturingAudioMayLeaveMac: Bool?) -> (title: String, message: String) {
-        ("Finishing upload", "Minutia is still finishing a recording upload. Finish and quit, or keep it running?")
+        switch capturingAudioMayLeaveMac {
+        case true?: ("Finishing upload", "Minutia is still finishing a recording upload. Finish and quit, or keep it running?")
+        case false?: ("Finishing transcription", "Minutia is still transcribing a meeting on this Mac. Finish and quit, or keep it running?")
+        case nil: ("Finishing a recording", "Minutia is still finishing a previous recording. Finish and quit, or keep it running?")
+        }
     }
 
-    nonisolated static let recoveryRowLabel = "Finishing a previous recording upload…"
+    nonisolated static let recoveryRowLabel = "Finishing a previous recording…"
 
     nonisolated static func shouldConfirmQuit(phase: AppPhase, recoveryActive: Bool) -> Bool {
         if recoveryActive { return true }
@@ -1538,6 +1550,7 @@ final class AppController: NSObject, ObservableObject {
         // captureSession.stop() again (it would throw notRunning and flip the UI to error).
         guard case .recording = phase else { return }
         apply(.recordStopped)
+        captureSession.beginFinishing(audioMayLeaveMac: captureSession.audioMayLeaveMac)
         notepad.end()
         report(.stopped, meetingId: recordingMeetingId)
         let meetingId = recordingMeetingId
@@ -1574,7 +1587,7 @@ final class AppController: NSObject, ObservableObject {
                 // The durable directory survives a timed-out finalize, so Retry finishes the upload
                 // rather than starting a new recording.
                 lastFailedStart = meetingId.map { .finalize(meetingId: $0.uuidString) } ?? .series
-                apply(.failed(Self.finalizeFailureMessage(for: error, host: instance?.host)))
+                apply(.failed(Self.finalizeFailureMessage(for: error, host: instance?.host, audioMayLeaveMac: captureSession.audioMayLeaveMac)))
             }
         }
     }
@@ -1598,6 +1611,7 @@ final class AppController: NSObject, ObservableObject {
         switch Self.quitFinishAction(phase: phase) {
         case .stop:
             apply(.recordStopped)
+            captureSession.beginFinishing(audioMayLeaveMac: captureSession.audioMayLeaveMac)
             if let meetingId = recordingMeetingId, let client = authManager.client() {
                 let deviceId = DeviceIdentity.id(in: defaults)
                 try? await withTimeout(seconds: 3) {
@@ -1617,7 +1631,7 @@ final class AppController: NSObject, ObservableObject {
                 apply(.finalized)
             } catch {
                 // stop() threw, so recordingInstance was not cleared: it still names the host.
-                apply(.failed(Self.finalizeFailureMessage(for: error, host: recordingInstance?.host)))
+                apply(.failed(Self.finalizeFailureMessage(for: error, host: recordingInstance?.host, audioMayLeaveMac: captureSession.audioMayLeaveMac)))
             }
         case .awaitFinalizing:
             // A stop is already in flight (the user pressed Stop, then quit). Calling stop() again
@@ -1742,7 +1756,7 @@ final class AppController: NSObject, ObservableObject {
     nonisolated static func refinalizeOutcome(for error: Error?, host: String?, audioMayLeaveMac: Bool = true) -> RefinalizeOutcome {
         guard let error else { return .finalized }
         if error is CancellationError { return .cancelled }
-        return .failed(finalizeFailureMessage(for: error, host: host))
+        return .failed(finalizeFailureMessage(for: error, host: host, audioMayLeaveMac: audioMayLeaveMac))
     }
 
     enum SweepReport: Equatable { case recovered, transcriptionUnavailable, keptOnThisMac, exhausted }
@@ -1870,7 +1884,7 @@ final class AppController: NSObject, ObservableObject {
 
     nonisolated static func recoveryNotificationBody(transcriptionMode: TranscriptionMode) -> String {
         transcriptionMode == .device
-            ? "A meeting transcribed on this Mac has been sent."
+            ? "A meeting that didn't finish has been recovered. The recap is being prepared."
             : "A meeting that didn't finish uploading has been recovered. The recap is being prepared."
     }
 
@@ -1917,12 +1931,11 @@ final class AppController: NSObject, ObservableObject {
         _ = recoverySlot.requestRun()
         occupyRecoverySlot { [self] in
             defer { captureSession.endFinishing() }
+            let dir = try? CaptureStore.capturesRoot()
+                .appendingPathComponent(meetingId.lowercased(), isDirectory: true)
+            let manifest = dir.flatMap { CaptureRecovery.loadManifest(from: $0) }
             do {
-                let dir = try CaptureStore.capturesRoot()
-                    .appendingPathComponent(meetingId.lowercased(), isDirectory: true)
-                guard let manifest = CaptureRecovery.loadManifest(from: dir) else {
-                    throw CaptureSession.CaptureError.notRunning
-                }
+                guard let dir, let manifest else { throw CaptureSession.CaptureError.notRunning }
                 try await CaptureRecovery.recover(
                     directory: dir, manifest: manifest, client: client,
                     makeTranscriber: { [weak self] in try await self?.recoveryTranscriber($0) },
@@ -1942,7 +1955,7 @@ final class AppController: NSObject, ObservableObject {
                         instance: manifest.instanceURL)
                 }
             } catch {
-                switch Self.refinalizeOutcome(for: error, host: authManager.instance?.host) {
+                switch Self.refinalizeOutcome(for: error, host: authManager.instance?.host, audioMayLeaveMac: manifest?.audioMayLeaveMac ?? true) {
                 case .finalized: apply(.finalized)
                 case .cancelled: break
                 case .failed(let message):

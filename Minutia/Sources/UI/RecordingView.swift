@@ -23,7 +23,7 @@ struct RecordingView: View {
     }
 
     static func progressLine(uploaded: Int, total: Int, audioMayLeaveMac: Bool) -> String {
-        "\(uploaded) of \(total) segments uploaded"
+        audioMayLeaveMac ? "\(uploaded) of \(total) segments uploaded" : "Transcribing on this Mac"
     }
 
     var body: some View {
@@ -38,7 +38,7 @@ struct RecordingView: View {
 
             LevelMeter(level: session.level)
 
-            Text("\(session.segmentsUploaded) of \(session.segmentsTotal) segments uploaded")
+            Text(Self.progressLine(uploaded: session.segmentsUploaded, total: session.segmentsTotal, audioMayLeaveMac: session.audioMayLeaveMac))
                 .font(.caption)
                 .foregroundStyle(.secondary)
 

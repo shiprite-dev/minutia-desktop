@@ -187,6 +187,7 @@ final class CaptureSession: ObservableObject {
         guard let pipeline, let queue, let client, let meetingId, let directory else {
             throw CaptureError.notRunning
         }
+        beginFinishing(audioMayLeaveMac: audioMayLeaveMac)
         // Teardown must happen even if uploadRecording/finalize throws below; otherwise `pipeline`
         // stays non-nil and every future `start` silently no-ops. The error still propagates.
         // cancelAll stops any segment retry loop still running after the finalize window (drained
@@ -206,7 +207,8 @@ final class CaptureSession: ObservableObject {
             self.micUnavailable = false
         }
 
-        if !audioMayLeaveMac, let transcriber {
+        if !audioMayLeaveMac {
+            guard let transcriber else { throw CaptureError.transcriptionBlocked(.modelNotReady) }
             guard let finished = pipeline.finishCapture() else { throw CaptureError.recordingUnfinished }
             let tail = finished.tailPieces.isEmpty ? [finished.finalSegment].compactMap { $0 } : finished.tailPieces
             return try await Self.finishOnDevice(
@@ -221,37 +223,13 @@ final class CaptureSession: ObservableObject {
         // Without a finished recording the server has nothing to transcribe; throwing keeps the
         // directory so recovery uploads the readable fragmented file instead of deleting it.
         guard let finished = pipeline.finishCapture() else { throw CaptureError.recordingUnfinished }
-        if !finished.tailPieces.isEmpty {
-            for piece in finished.tailPieces { queue.enqueue(piece) }
-        } else if let finalSegment = finished.finalSegment {
-            queue.enqueue(finalSegment)
-        }
-
-        // Bound the network finalize so a stuck upload/finalize/transcribe (observed: a Kong 504 that
-        // hung 60s+, and indefinite hangs on repeated failures) throws instead of pinning the UI in
-        // .finalizing forever. TimeoutError propagates to the controller, which shows .error (Retry).
-        let outcome = try await withTimeout(seconds: Self.finalizeTimeout) {
-            let recording = finished.recording
-            async let uploadedPath = client.uploadRecording(meetingId: meetingId, fileURL: recording.fileURL)
-            let counts = await queue.drainAndWait()
-            let expected = Self.expectedSegments(
-                enqueued: counts.enqueued, registered: counts.registered,
-                segmentsDropped: finished.segmentsDropped)
-            let path = try await uploadedPath
-            let duration = Double(recording.frames) / MixPlan.sampleRate
-            let attrs = try? FileManager.default.attributesOfItem(atPath: recording.fileURL.path)
-            let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
-            try await client.finalizeMeeting(meetingId: meetingId, audioPath: path, duration: duration, sizeBytes: size)
-
-            // A failed requestTranscription must never read as an accepted transcript: it rethrows so
-            // the controller shows .failed (Retry re-runs refinalize) and the audio directory is kept
-            // below, deleted only when the request truly succeeds (a 2xx, or the terminal-503 the
-            // client treats as not-lost since the transcript assembles from fast-lane segments).
-            _ = try await NotepadFinalize.flushThenTranscribe(
-                flush: flushNotes,
-                requestTranscription: { try await client.requestTranscription(meetingId: meetingId, expectedSegments: expected, deferExtraction: true) })
-            return (counts: counts, expected: expected, transcriptRequested: true)
-        }
+        let outcome = try await Self.finishFastLane(
+            audioMayLeaveMac: audioMayLeaveMac, meetingId: meetingId, recording: finished.recording.fileURL,
+            durationSeconds: Double(finished.recording.frames) / MixPlan.sampleRate,
+            tail: finished.tailPieces.isEmpty ? [finished.finalSegment].compactMap { $0 } : finished.tailPieces,
+            segmentsDropped: finished.segmentsDropped,
+            enqueue: { queue.enqueue($0) }, drain: { await queue.drainAndWait() }, cloud: client,
+            flushNotes: flushNotes)
 
         segmentsUploaded = outcome.counts.uploaded
         segmentsTotal = outcome.counts.enqueued
@@ -259,11 +237,9 @@ final class CaptureSession: ObservableObject {
         if !recapOpened { Task { await client.warmSummary(meetingId: meetingId) } }
         Task { await Self.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId) } }
 
-        if outcome.transcriptRequested {
-            try? FileManager.default.removeItem(at: directory)
-        }
+        try? FileManager.default.removeItem(at: directory)
 
-        return StopResult(expectedSegments: outcome.expected, transcriptRequested: outcome.transcriptRequested)
+        return StopResult(expectedSegments: outcome.expected, transcriptRequested: true)
     }
 
     private func handleTick(peak: Float, closedCount: Int, framesDrained: Int) {
@@ -302,7 +278,7 @@ final class CaptureSession: ObservableObject {
     /// Ends the device stop in flight and clears its step.
     func endFinishing() { finishingGeneration += 1; finishingStep = nil }
 
-    /// What a device-mode stop is doing, shown by the finishing view. nil in cloud mode.
+    /// What a stop is doing, shown by the finishing view. nil until the first step is reported.
     enum FinishingStep: Equatable, Sendable {
         case preparingModel
         case transcribing(completed: Int, total: Int)
@@ -315,16 +291,17 @@ final class CaptureSession: ObservableObject {
             case .preparingModel: "Preparing the speech model"
             case .transcribing(let completed, let total): "Transcribing on this Mac, \(completed) of \(total)"
             case .submitting: "Sending the transcript"
-            case .startingOnDevice, .uploadingRecording: ""
+            case .startingOnDevice: "Transcribing on this Mac"
+            case .uploadingRecording: "Uploading and requesting transcript"
             }
         }
     }
 
     nonisolated static func finishingLabel(step: FinishingStep?, audioMayLeaveMac: Bool) -> String {
-        step?.label ?? "Uploading and requesting transcript"
+        step?.label ?? (audioMayLeaveMac ? FinishingStep.uploadingRecording.label : FinishingStep.startingOnDevice.label)
     }
 
-    func beginFinishing(audioMayLeaveMac: Bool) {}
+    func beginFinishing(audioMayLeaveMac: Bool) { finishingStep = audioMayLeaveMac ? .uploadingRecording : .startingOnDevice }
 
     nonisolated static let notesFlushTimeout: TimeInterval = 10
 
@@ -337,7 +314,21 @@ final class CaptureSession: ObservableObject {
         flushNotes: @escaping @Sendable () async throws -> Void = {},
         timeout: TimeInterval = finalizeTimeout
     ) async throws -> (counts: (uploaded: Int, registered: Int, failed: Int, enqueued: Int), expected: Int?) {
-        throw CaptureError.notRunning
+        guard audioMayLeaveMac else { throw CaptureRecovery.RecoveryError.audioStaysOnThisMac }
+        for piece in tail { enqueue(piece) }
+        return try await withTimeout(seconds: timeout) {
+            async let uploadedPath = cloud.uploadRecording(meetingId: meetingId, fileURL: recording)
+            let counts = await drain()
+            let expected = expectedSegments(enqueued: counts.enqueued, registered: counts.registered, segmentsDropped: segmentsDropped)
+            let path = try await uploadedPath
+            let attrs = try? FileManager.default.attributesOfItem(atPath: recording.path)
+            let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+            try await cloud.finalizeMeeting(meetingId: meetingId, audioPath: path, duration: durationSeconds, sizeBytes: size)
+            _ = try await NotepadFinalize.flushThenTranscribe(
+                flush: flushNotes,
+                requestTranscription: { try await cloud.requestTranscription(meetingId: meetingId, expectedSegments: expected, deferExtraction: true, strict: false) })
+            return (counts: counts, expected: expected)
+        }
     }
 
     /// Waits between transcript submits after a 409, a 401, a 5xx or a network error.
@@ -396,7 +387,7 @@ final class CaptureSession: ObservableObject {
         onLocalOutcome: @escaping @Sendable (Bool) async -> Void = { _ in }
     ) async throws -> StopResult {
         guard durationSeconds > 0 else { throw CaptureError.nothingRecorded }
-        async let notesFlushed: Void = { try? await flushNotes() }()
+        let notes = Task { try? await flushNotes() }
         var transcript: DeviceTranscript
         do {
             transcript = try await transcribeBounded(seconds: transcribeTimeout ?? localTranscriptionTimeout(durationSeconds: durationSeconds)) {
@@ -415,7 +406,8 @@ final class CaptureSession: ObservableObject {
                 throw CaptureError.localTranscriptionTimedOut
             }
             markLocalFailed(directory)
-            await notesFlushed
+            await waitAtMost(seconds: notesFlushTimeout) { await notes.value }
+            await onStep(.uploadingRecording)
             return try await finishInCloud(
                 meetingId: meetingId, directory: directory, durationSeconds: durationSeconds, failure: .transcriptionTimedOut,
                 transport: transport, cloud: cloud, recapOpened: recapOpened, timeout: cloudTimeout)
@@ -429,7 +421,8 @@ final class CaptureSession: ObservableObject {
                 throw failure
             }
             markLocalFailed(directory)
-            await notesFlushed
+            await waitAtMost(seconds: notesFlushTimeout) { await notes.value }
+            await onStep(.uploadingRecording)
             return try await finishInCloud(
                 meetingId: meetingId, directory: directory, durationSeconds: durationSeconds, failure: failure,
                 transport: transport, cloud: cloud, recapOpened: recapOpened, timeout: cloudTimeout)
@@ -444,7 +437,7 @@ final class CaptureSession: ObservableObject {
         }
         guard let fitted = transcript.fitted() else { throw CaptureError.transcriptTooLarge }
         let body = try fitted.encoded()
-        await notesFlushed
+        await waitAtMost(seconds: notesFlushTimeout) { await notes.value }
         try body.write(to: directory.appendingPathComponent(CaptureRecovery.transcriptName), options: .atomic)
         try Task.checkCancellation()
         try? await transport.markAwaitingDeviceTranscript(meetingId: meetingId, durationSeconds: fitted.durationSeconds)
