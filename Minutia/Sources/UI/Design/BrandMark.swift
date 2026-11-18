@@ -61,14 +61,26 @@ enum LevelHistory {
 
 enum CheckReveal {
     static func initialProgress(reduceMotion: Bool) -> CGFloat { reduceMotion ? 1 : 0 }
+    static let delay: TimeInterval = 0.18
     static let drawDuration: TimeInterval = 0.42
     static let popHold: TimeInterval = 0.24
+    static var total: TimeInterval { delay + drawDuration + popHold }
+
+    static func progress(elapsed: TimeInterval) -> CGFloat {
+        let p = min(1, max(0, (elapsed - delay) / drawDuration))
+        return CGFloat(1 - pow(1 - p, 3))
+    }
+
+    static func popped(elapsed: TimeInterval) -> Bool {
+        elapsed >= delay + drawDuration && elapsed < total
+    }
 }
 
 private struct PanelVisibleKey: EnvironmentKey { static let defaultValue = true }
 private struct ConsentPendingKey: EnvironmentKey { static let defaultValue = false }
 
 private struct ReduceMotionOverrideKey: EnvironmentKey { static let defaultValue: Bool? = nil }
+private struct CheckElapsedKey: EnvironmentKey { static let defaultValue: TimeInterval? = nil }
 private struct LoopDateKey: EnvironmentKey { static let defaultValue: Date? = nil }
 private struct ContrastOverrideKey: EnvironmentKey { static let defaultValue: ColorSchemeContrast? = nil }
 
@@ -79,6 +91,11 @@ extension EnvironmentValues {
     }
 
     var motionReduced: Bool { reduceMotionOverride ?? accessibilityReduceMotion }
+
+    var checkElapsed: TimeInterval? {
+        get { self[CheckElapsedKey.self] }
+        set { self[CheckElapsedKey.self] = newValue }
+    }
 
     var loopDate: Date? {
         get { self[LoopDateKey.self] }

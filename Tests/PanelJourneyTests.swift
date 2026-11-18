@@ -118,10 +118,29 @@ final class PanelJourneyTests: XCTestCase {
         XCTAssertTrue(after.has("SERIES"), after.text)
     }
 
-    func test_theSentCheck_isDrawnAtOnceUnderReduceMotion_andStartsEmptyOtherwise() {
-        let drawn = Host.vermilionPixels(DoneContent().environment(\.reduceMotionOverride, true), spin: 0.05)
-        XCTAssertGreaterThan(drawn, 50)
-        XCTAssertEqual(Host.vermilionPixels(DoneContent().environment(\.reduceMotionOverride, false), spin: 0.05), 0)
+    private func done(at elapsed: TimeInterval, reduceMotion: Bool) -> CGImage {
+        Host.render(DoneContent().environment(\.checkElapsed, elapsed).environment(\.reduceMotionOverride, reduceMotion), spin: 0.2)!
+    }
+
+    func test_theSentCheck_isNotDrawnAtFirst_isPartwayMidDraw_andIsTheFinishedCheckAfterwards() {
+        let reference = done(at: 0, reduceMotion: true)
+        let finished = Host.vermilionRuns(reference).pixels
+        XCTAssertGreaterThan(finished, 50)
+
+        XCTAssertEqual(Host.vermilionRuns(done(at: 0, reduceMotion: false)).pixels, 0, "the check is already drawn before the draw starts")
+
+        let partway = Host.vermilionRuns(done(at: CheckReveal.delay + 0.1, reduceMotion: false)).pixels
+        XCTAssertGreaterThan(partway, finished / 5)
+        XCTAssertLessThan(partway, finished * 9 / 10)
+
+        let after = done(at: CheckReveal.total + 0.5, reduceMotion: false)
+        XCTAssertEqual(Host.differingBytes(after, reference), 0, "the settled check is not the finished check")
+    }
+
+    func test_withReduceMotionOn_theSentCheckIsFinishedAtOnce() {
+        let finished = Host.vermilionRuns(done(at: CheckReveal.total + 0.5, reduceMotion: true)).pixels
+        XCTAssertEqual(Host.vermilionRuns(done(at: 0, reduceMotion: true)).pixels, finished)
+        XCTAssertGreaterThan(finished, 50)
     }
 
     // MARK: - Finishing progress
