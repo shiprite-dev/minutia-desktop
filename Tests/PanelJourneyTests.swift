@@ -266,7 +266,7 @@ final class PanelJourneyTests: XCTestCase {
 
     func test_animationsRunWhileThePanelIsOpen_stopOnceItIsClosed_andResumeOnReopen() {
         for (name, controller) in [("finishing", finishingController()), ("recording", recordingController())] {
-            let panel = LivePanel(rig.menu(controller))
+            let panel = LivePanel(rig.menu(controller).environment(\.reduceMotionOverride, false))
             XCTAssertTrue(panel.animates(), "\(name) should be animating while open")
             controller.panelClosed()
             panel.spin(0.3)
