@@ -8,11 +8,7 @@ private func openMicrophoneSettings() {
 
 enum Celebration {
     static func hold(reduceMotion: Bool) -> TimeInterval {
-        (reduceMotion ? 0 : 0.18 + CheckReveal.drawDuration + CheckReveal.popHold) + 1.6
-    }
-
-    static func visible(cue: RecapCue?, phase: AppPhase) -> Bool {
-        cue != nil && phase == .idle
+        (reduceMotion ? 0 : CheckReveal.total) + 1.6
     }
 }
 
@@ -46,7 +42,6 @@ struct MenuContent: View {
     @ObservedObject var controller: AppController
     @ObservedObject var updater: UpdaterController
     @Environment(\.motionReduced) private var reduceMotion
-    @State private var visible = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -68,7 +63,7 @@ struct MenuContent: View {
                 switch controller.phase {
                 case .signedOut:
                     SignInView(authManager: controller.authManager, showsMenuBarHint: controller.showsMenuBarHint)
-                case .idle where Celebration.visible(cue: controller.recapCue, phase: controller.phase):
+                case .idle where controller.recapCue != nil:
                     DoneContent(onOpenRecap: { controller.openRecapFromCue() })
                 case .idle:
                     IdleHost(controller: controller, detectedVia: nil)
@@ -100,13 +95,13 @@ struct MenuContent: View {
             Footer(updater: updater)
         }
         .frame(width: Space.panelWidth)
-        .environment(\.panelVisible, visible)
+        .environment(\.panelVisible, controller.panelOpen)
         .environment(\.consentPending, controller.pendingRecordConsent != nil)
         .animation(Motion.resolved(Motion.settle, reduce: reduceMotion), value: controller.phase)
         .animation(Motion.resolved(Motion.settle, reduce: reduceMotion), value: controller.recapCue)
         .sensoryFeedback(trigger: controller.phase) { old, new in PanelHaptic.feedback(from: old, to: new) }
-        .onAppear { visible = true }
-        .onDisappear { visible = false }
+        .onAppear { controller.panelOpened() }
+        .onDisappear { controller.panelClosed() }
     }
 }
 
@@ -460,12 +455,13 @@ struct FinishingContent: View {
 struct DoneContent: View {
     var onOpenRecap: () -> Void = {}
     @Environment(\.motionReduced) private var reduceMotion
-    @State private var progress: CGFloat = 0
-    @State private var popped = false
+    @Environment(\.checkElapsed) private var injected
+    @State private var appeared = Date()
+    @State private var settled = false
 
     var body: some View {
         HStack(alignment: .top, spacing: Space.x3) {
-            MarkView(barHeight: 20, includesCheck: true, checkProgress: reduceMotion ? 1 : progress, popped: popped)
+            mark
             VStack(alignment: .leading, spacing: Space.x1) {
                 Text("Sent. Your recap is on its way")
                     .font(Typo.title)
@@ -476,16 +472,28 @@ struct DoneContent: View {
         }
         .padding(Space.x4)
         .frame(width: Space.panelWidth, alignment: .leading)
-        .sensoryFeedback(.alignment, trigger: progress == 1)
         .task {
-            guard !reduceMotion else { return }
-            try? await Task.sleep(nanoseconds: 180_000_000)
-            withAnimation(.timingCurve(0.2, 0.8, 0.2, 1, duration: CheckReveal.drawDuration)) { progress = 1 }
-            try? await Task.sleep(nanoseconds: UInt64(CheckReveal.drawDuration * 1_000_000_000))
-            popped = true
-            try? await Task.sleep(nanoseconds: UInt64(CheckReveal.popHold * 1_000_000_000))
-            popped = false
+            guard !reduceMotion, injected == nil else { return }
+            try? await Task.sleep(nanoseconds: UInt64(CheckReveal.total * 1_000_000_000))
+            settled = true
         }
+    }
+
+    @ViewBuilder
+    private var mark: some View {
+        if reduceMotion {
+            check(elapsed: .infinity)
+        } else if let injected {
+            check(elapsed: injected)
+        } else {
+            TimelineView(.animation(paused: settled)) { check(elapsed: $0.date.timeIntervalSince(appeared)) }
+        }
+    }
+
+    private func check(elapsed: TimeInterval) -> some View {
+        let progress = CheckReveal.progress(elapsed: elapsed)
+        return MarkView(barHeight: 20, includesCheck: true, checkProgress: progress, popped: CheckReveal.popped(elapsed: elapsed))
+            .sensoryFeedback(.alignment, trigger: progress == 1)
     }
 }
 

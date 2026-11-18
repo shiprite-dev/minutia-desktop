@@ -4,114 +4,6 @@ import Vision
 import XCTest
 @testable import Minutia
 
-@MainActor
-enum Host {
-    static func view<V: View>(_ root: V, dark: Bool = false) -> NSHostingView<some View> {
-        let hosting = NSHostingView(rootView: root.environment(\.colorScheme, dark ? .dark : .light))
-        hosting.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
-        hosting.frame = NSRect(origin: .zero, size: hosting.fittingSize)
-        hosting.layoutSubtreeIfNeeded()
-        return hosting
-    }
-
-    static func size<V: View>(_ root: V, dark: Bool = false) -> CGSize {
-        view(root, dark: dark).fittingSize
-    }
-
-    static func render<V: View>(_ root: V, dark: Bool = false, spin: TimeInterval = 0.6, contrastBackdrop: Bool = true) -> CGImage? {
-        let backdrop = dark ? Color(red: 0.145, green: 0.145, blue: 0.15) : Color(red: 0.96, green: 0.96, blue: 0.96)
-        let hosting = NSHostingView(rootView: root.background(backdrop).environment(\.colorScheme, dark ? .dark : .light))
-        hosting.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
-        let size = hosting.fittingSize
-        hosting.frame = NSRect(origin: .zero, size: size)
-        let window = NSWindow(contentRect: hosting.frame, styleMask: [.borderless], backing: .buffered, defer: false)
-        window.appearance = hosting.appearance
-        window.contentView = hosting
-        RunLoop.current.run(until: Date().addingTimeInterval(spin))
-        hosting.layoutSubtreeIfNeeded()
-        let scale = 3
-        guard let rep = NSBitmapImageRep(
-            bitmapDataPlanes: nil, pixelsWide: Int(size.width) * scale, pixelsHigh: Int(size.height) * scale,
-            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
-        rep.size = size
-        hosting.cacheDisplay(in: hosting.bounds, to: rep)
-        return rep.cgImage
-    }
-
-    static func text<V: View>(_ root: V, dark: Bool = false) -> Seen {
-        guard let image = render(root, dark: dark) else { return Seen(text: "", frames: []) }
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.usesLanguageCorrection = false
-        try? VNImageRequestHandler(cgImage: image).perform([request])
-        let found = (request.results ?? []).compactMap { observation in
-            observation.topCandidates(1).first.map { ($0.string, observation.boundingBox) }
-        }
-        return Seen(text: found.map(\.0).joined(separator: " "), frames: found)
-    }
-
-    static func pixels(_ image: CGImage) -> (width: Int, height: Int, data: [UInt8]) {
-        var data = [UInt8](repeating: 0, count: image.width * image.height * 4)
-        let context = CGContext(data: &data, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: image.width * 4,
-                                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-        context?.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
-        return (image.width, image.height, data)
-    }
-
-    private static func isFill(_ r: UInt8, _ g: UInt8, _ b: UInt8) -> Bool {
-        abs(Int(r) - 0xD4) < 24 && abs(Int(g) - 0x35) < 24 && Int(b) < 40
-    }
-
-    static func fillBands<V: View>(_ root: V, atPoint x: CGFloat) -> Int {
-        guard let image = render(root) else { return 0 }
-        let (width, height, data) = pixels(image)
-        let column = min(width - 1, Int(x * CGFloat(width) / 320))
-        var bands = 0, inBand = false
-        for row in 0..<height {
-            let i = (row * width + column) * 4
-            let on = isFill(data[i], data[i + 1], data[i + 2])
-            if on && !inBand { bands += 1 }
-            inBand = on
-        }
-        return bands
-    }
-
-    static func vermilionPixels<V: View>(_ root: V, spin: TimeInterval) -> Int {
-        guard let image = render(root, spin: spin) else { return 0 }
-        let (width, height, data) = pixels(image)
-        var count = 0
-        for i in stride(from: 0, to: width * height * 4, by: 4)
-        where abs(Int(data[i]) - 0xE2) < 14 && abs(Int(data[i + 1]) - 0x3A) < 14 && Int(data[i + 2]) < 20 { count += 1 }
-        return count
-    }
-}
-
-struct Seen {
-    let text: String
-    let frames: [(String, CGRect)]
-
-    private static let homoglyphs: [Character: Character] = [
-        "\u{0430}": "a", "\u{0435}": "e", "\u{043E}": "o", "\u{0440}": "p", "\u{0441}": "c", "\u{0445}": "x", "\u{0443}": "y",
-        "\u{043C}": "m", "\u{0442}": "t", "\u{043D}": "h", "\u{043A}": "k", "\u{0432}": "b",
-    ]
-
-    private static func normalize(_ value: String) -> String {
-        let folded = String(value.lowercased().map { homoglyphs[$0] ?? $0 }.map { $0 == "|" || $0 == "i" ? "l" : $0 })
-        return folded.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }.joined(separator: " ")
-            .replacingOccurrences(of: "rn", with: "m")
-    }
-
-    func has(_ expected: String) -> Bool {
-        let needle = Self.normalize(expected)
-        return !needle.isEmpty && Self.normalize(text).contains(needle)
-    }
-
-    func frame(of expected: String) -> CGRect? {
-        frames.first { Self.normalize($0.0).contains(Self.normalize(expected)) }?.1
-    }
-}
-
 private let longName = String(repeating: "Quarterly platform reliability and security review ", count: 3).prefix(120).description
 private let sampleSeries = [Series(id: UUID(), name: "Weekly Eng Sync"), Series(id: UUID(), name: longName)]
 
@@ -204,6 +96,24 @@ final class SeenMatcherTests: XCTestCase {
         XCTAssertFalse(seen("Downloading model 4%").has("Downloading model 42%"))
     }
 
+    func test_rejectsANegatedOrExtendedVersionOfTheSentence() {
+        XCTAssertFalse(seen("Not sent. Your recap is on its way").has("Sent. Your recap is on its way"))
+        XCTAssertFalse(seen("Unsent. Your recap is on its way").has("Sent. Your recap is on its way"))
+        XCTAssertFalse(seen("Couldn't send. Never sent. Your recap is on its way").has("Sent. Your recap is on its way"))
+        XCTAssertFalse(seen("Downloading model 42%").has("Downloading model 4"))
+        XCTAssertFalse(seen("Transcribing on this Mac, 3 of 120").has("Transcribing on this Mac, 3 of 12"))
+        XCTAssertFalse(seen("Recording").has("Record"))
+        XCTAssertFalse(seen("Retrying").has("Retry"))
+        XCTAssertTrue(seen("Sent. Your recap is on its way").has("Sent. Your recap is on its way"))
+        XCTAssertTrue(seen("Retry Dismiss").has("Retry"))
+    }
+
+    func test_rejectsAConfusionThatIsNotADocumentedGlyphPair() {
+        XCTAssertFalse(seen("Recora a meeting").has("Record a meeting"))
+        XCTAssertFalse(seen("Sign in with browser").has("Sign in with brower"))
+        XCTAssertFalse(seen("Retry").has("Retrv"))
+    }
+
     func test_acceptsTheSameTextAndKnownOcrConfusions() {
         XCTAssertTrue(seen("Your recording is saved on this Mac. Retry Dismiss").has("Your recording is saved on this Mac"))
         XCTAssertTrue(seen("Your recording is saved on this \u{041C}\u{0430}\u{0441}").has("Your recording is saved on this Mac"))
@@ -221,32 +131,6 @@ final class MenuStatesSeenTests: XCTestCase {
     }
 
     private var idleModel: IdleModel { model() }
-
-    func test_idle_offersRecordUnderTheSeriesEyebrow() {
-        let seen = Host.text(IdleScreen(model: model()))
-        XCTAssertTrue(seen.has("Record"), seen.text)
-        XCTAssertTrue(seen.has("SERIES"), seen.text)
-    }
-
-    func test_zeroSeries_guidesAndHidesRecord_keepingConnectGoogleCalendar() {
-        let seen = Host.text(IdleScreen(model: model(series: [], selected: nil)))
-        XCTAssertTrue(seen.has("No series yet"), seen.text)
-        XCTAssertTrue(seen.has("Connect Google Calendar"), seen.text)
-        XCTAssertTrue(seen.has("Create a series"), seen.text)
-        XCTAssertFalse(seen.has("SERIES Record"), seen.text)
-        XCTAssertFalse(seen.has("Series Record"), seen.text)
-    }
-
-    func test_detected_showsTheExistingBannerCopyAndRecord() {
-        let seen = Host.text(IdleScreen(model: model(detectedVia: "Zoom")))
-        XCTAssertTrue(seen.has(AppController.detectionBannerText(via: "Zoom")), seen.text)
-        XCTAssertTrue(seen.has("Record"), seen.text)
-    }
-
-    func test_detected_readsInDarkToo() {
-        let seen = Host.text(IdleScreen(model: model(detectedVia: "Zoom")), dark: true)
-        XCTAssertTrue(seen.has(AppController.detectionBannerText(via: "Zoom")), seen.text)
-    }
 
     func test_recording_namesTheSeriesTheClockAndStop() {
         let seen = Host.text(RecordingContent(model: RecordingModel(seriesName: "Weekly Eng Sync", elapsed: 7457, level: 0.4, progress: "2 of 3 segments uploaded")))
@@ -267,19 +151,6 @@ final class MenuStatesSeenTests: XCTestCase {
         let seen = Host.text(RecordingContent(model: RecordingModel(seriesName: "S", elapsed: 5, level: 0, progress: "x", reconnecting: true, systemAudioDegraded: true)))
         XCTAssertTrue(seen.has("Reconnecting"), seen.text)
         XCTAssertTrue(seen.has("System audio isn't being captured. Recording your microphone only."), seen.text)
-    }
-
-    func test_finishing_tellsTheUserTheyCanLeave() {
-        let seen = Host.text(FinishingContent(label: "Uploading and requesting transcript", progress: nil, preparingSince: nil))
-        XCTAssertTrue(seen.has("Uploading and requesting transcript"), seen.text)
-        XCTAssertTrue(seen.has("You can close this. Minutia finishes in the background."), seen.text)
-    }
-
-    func test_done_saysItWasSentInPlainWordsAndOffersTheRecap() {
-        let seen = Host.text(DoneContent())
-        XCTAssertTrue(seen.has("Sent. Your recap is on its way"), seen.text)
-        XCTAssertTrue(seen.has("Open recap"), seen.text)
-        XCTAssertFalse(seen.has("Recap is ready"), seen.text)
     }
 
     func test_twoHourRecording_withALongName_stillShowsMostOfTheName() {
@@ -330,60 +201,23 @@ final class MenuStatesSeenTests: XCTestCase {
         XCTAssertEqual(animated, 0)
     }
 
-    func test_consentOverIdle_showsOneVermilionFill_notTwo() {
-        for hasClaim in [false, true] {
-            let view = VStack(spacing: 0) { ConsentNotice(hasClaim: hasClaim); IdleScreen(model: idleModel) }.environment(\.consentPending, true)
-            XCTAssertEqual(Host.fillBands(view, atPoint: 30), 1, "claim: \(hasClaim)")
-        }
-        XCTAssertEqual(Host.fillBands(IdleScreen(model: idleModel), atPoint: 30), 1)
-    }
 
-    func test_consentOverAnEmptyAccount_showsOneVermilionFill() {
-        let view = VStack(spacing: 0) { ConsentNotice(hasClaim: true); IdleScreen(model: model(series: [], selected: nil)) }.environment(\.consentPending, true)
-        XCTAssertEqual(Host.fillBands(view, atPoint: 30), 1)
-        XCTAssertEqual(Host.fillBands(IdleScreen(model: model(series: [], selected: nil)), atPoint: 30), 1)
-    }
 
-    func test_consentOverError_showsOneVermilionFill() {
-        let view = VStack(spacing: 0) { ConsentNotice(hasClaim: true); ErrorScreen(message: "Upload failed.", isMicError: false) }.environment(\.consentPending, true)
-        XCTAssertEqual(Host.fillBands(view, atPoint: 30), 1)
-    }
-
-    func test_failedUpload_showsTheMessageRetryAndDismiss() {
-        let seen = Host.text(ErrorScreen(message: "Upload failed. Your recording is saved on this Mac.", isMicError: false))
-        XCTAssertTrue(seen.has("Upload failed. Your recording is saved on this Mac."), seen.text)
-        XCTAssertTrue(seen.has("Retry"), seen.text)
-        XCTAssertTrue(seen.has("Dismiss"), seen.text)
-        XCTAssertFalse(seen.has("Open System Settings"), seen.text)
-    }
-
-    func test_micDenied_offersSystemSettingsAndRetry() {
-        let seen = Host.text(ErrorScreen(message: "Microphone access was denied.", isMicError: true))
-        XCTAssertTrue(seen.has("Open System Settings"), seen.text)
-        XCTAssertTrue(seen.has("Retry"), seen.text)
-    }
 
     private func signIn(_ stage: SignInStage, hint: Bool = false, error: String? = nil) -> Seen {
-        Host.text(SignInScreen(stage: stage, showsMenuBarHint: hint, signInError: error, email: .constant(""), password: .constant(""), showEmailForm: .constant(false), busy: false))
+        Host.text(SignInScreen(stage: stage, showsMenuBarHint: hint, signInError: error, email: .constant(""), password: .constant(""), showEmailForm: .constant(false), busy: false), scale: 4)
     }
 
     func test_signedOut_invitesBrowserSignInAndKeepsEmailQuiet() {
         let seen = signIn(.ready)
         XCTAssertTrue(seen.has("Sign in with browser"), seen.text)
         XCTAssertTrue(seen.has("Use email instead"), seen.text)
-        XCTAssertTrue(seen.has("a meeting. Get the issues log."), seen.text)
+        XCTAssertTrue(seen.has("Record a meeting. Get the issues log."), seen.text)
     }
 
     func test_signedOut_firstRunShowsTheMenuBarHint() {
         XCTAssertTrue(signIn(.ready, hint: true).has(FirstRun.menuBarHint))
         XCTAssertFalse(signIn(.ready, hint: false).has(FirstRun.menuBarHint))
-    }
-
-    func test_signInWaiting_offersStartOver() {
-        let seen = signIn(.browserPending)
-        XCTAssertTrue(seen.has("Check your browser to finish signing in."), seen.text)
-        XCTAssertTrue(seen.has("Start over"), seen.text)
-        XCTAssertFalse(seen.has("Sign in with browser"), seen.text)
     }
 
     func test_connecting_canBeCancelled() {

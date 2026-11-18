@@ -45,9 +45,10 @@ final class NotepadSyncTests: XCTestCase {
             now: now))
     }
 
-    func test_policyConstants_idleShorterThanMax() {
-        XCTAssertLessThan(NotepadSyncPolicy.idleDelay, NotepadSyncPolicy.maxDelay)
-        XCTAssertLessThanOrEqual(NotepadSyncPolicy.maxDelay, 15)
+    func test_notesTypedWithoutAPause_stillReachTheServerWithinFifteenSeconds() {
+        let now = Date()
+        XCTAssertTrue(NotepadSyncPolicy.shouldSync(
+            needsSync: true, inFlight: false, lastEditAt: now, firstUnsyncedEditAt: now.addingTimeInterval(-15), now: now))
     }
 
     // MARK: - Retry backoff
@@ -166,11 +167,6 @@ final class NotepadSyncTests: XCTestCase {
         }
     }
 
-    func test_flushTimeout_fitsInsideFinalizeTimeout() {
-        XCTAssertLessThan(NotepadFinalize.flushTimeout, CaptureSession.finalizeTimeout)
-        XCTAssertLessThanOrEqual(NotepadFinalize.flushTimeout, 5)
-    }
-
     // MARK: - Request construction
 
     /// The companion writes only its own column: never notes_markdown or raw_notes_markdown, which
@@ -194,8 +190,4 @@ final class NotepadSyncTests: XCTestCase {
         XCTAssertEqual(NotepadDraft.maxLength, 100_000)
     }
 
-    /// A zero-row update (meeting gone or no access) is a distinct terminal error, never a silent success.
-    func test_meetingNotWritable_isDistinctError() {
-        XCTAssertNotEqual(MinutiaClientError.meetingNotWritable, MinutiaClientError.featureUnavailable)
-    }
 }

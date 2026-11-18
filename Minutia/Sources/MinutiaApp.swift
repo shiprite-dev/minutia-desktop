@@ -296,8 +296,12 @@ final class AppController: NSObject, ObservableObject {
     /// Set when a stop the user can follow up on has been handed to the server, so the panel can say
     /// so and offer the recap. Cleared by the panel after its hold and by any phase change.
     @Published private(set) var recapCue: RecapCue?
+    @Published private(set) var panelOpen = true
+    func panelOpened() { panelOpen = true }
+    func panelClosed() { panelOpen = false }
     var announce: (String) -> Void = { AccessibilityNotification.Announcement($0).post() }
     var recapHold: () -> TimeInterval = { Celebration.hold(reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion) }
+    var sleep: (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }
     private var recapExpiry: Task<Void, Never>?
     @Published private(set) var selectedSeriesId: UUID?
     /// The user chose a series during the current detected meeting; detection then leaves it alone.
@@ -1668,7 +1672,7 @@ final class AppController: NSObject, ObservableObject {
         announce("Sent. Your recap is on its way")
         let hold = recapHold()
         recapExpiry = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(hold * 1_000_000_000))
+            await self?.sleep(hold)
             if !Task.isCancelled { self?.clearRecapCue() }
         }
     }

@@ -68,9 +68,9 @@ final class CaptureWriteFailureTests: XCTestCase {
         return boxes
     }
 
-    func test_appendReadinessBudget_staysBelowRingBufferHeadroom() {
+    func test_aSlowWriterNeverStallsATickLongerThanTheRingKeepsAudio_soNoMeetingAudioIsLost() {
         XCTAssertGreaterThan(SegmentWriter.readyTimeout, 0)
-        XCTAssertLessThan(SegmentWriter.readyTimeout, 5, "one append blocks the tick at most this long; the ring buffers hold 5 s")
+        XCTAssertLessThan(SegmentWriter.readyTimeout, Double(CaptureSession.ringHeadroomSeconds))
     }
 
     func test_segmentCloseStallsAtRotation_recordingContinuesAndNoSegmentIsHandedOut() async throws {

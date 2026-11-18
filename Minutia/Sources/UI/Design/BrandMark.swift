@@ -61,14 +61,28 @@ enum LevelHistory {
 
 enum CheckReveal {
     static func initialProgress(reduceMotion: Bool) -> CGFloat { reduceMotion ? 1 : 0 }
+    static let delay: TimeInterval = 0.18
     static let drawDuration: TimeInterval = 0.42
     static let popHold: TimeInterval = 0.24
+    static var total: TimeInterval { delay + drawDuration + popHold }
+
+    static func progress(elapsed: TimeInterval) -> CGFloat {
+        let p = min(1, max(0, (elapsed - delay) / drawDuration))
+        return CGFloat(1 - pow(1 - p, 3))
+    }
+
+    static func popped(elapsed: TimeInterval) -> Bool {
+        elapsed >= delay + drawDuration && elapsed < total
+    }
 }
 
 private struct PanelVisibleKey: EnvironmentKey { static let defaultValue = true }
 private struct ConsentPendingKey: EnvironmentKey { static let defaultValue = false }
 
 private struct ReduceMotionOverrideKey: EnvironmentKey { static let defaultValue: Bool? = nil }
+private struct CheckElapsedKey: EnvironmentKey { static let defaultValue: TimeInterval? = nil }
+private struct LoopDateKey: EnvironmentKey { static let defaultValue: Date? = nil }
+private struct ContrastOverrideKey: EnvironmentKey { static let defaultValue: ColorSchemeContrast? = nil }
 
 extension EnvironmentValues {
     var reduceMotionOverride: Bool? {
@@ -77,6 +91,23 @@ extension EnvironmentValues {
     }
 
     var motionReduced: Bool { reduceMotionOverride ?? accessibilityReduceMotion }
+
+    var checkElapsed: TimeInterval? {
+        get { self[CheckElapsedKey.self] }
+        set { self[CheckElapsedKey.self] = newValue }
+    }
+
+    var loopDate: Date? {
+        get { self[LoopDateKey.self] }
+        set { self[LoopDateKey.self] = newValue }
+    }
+
+    var contrastOverride: ColorSchemeContrast? {
+        get { self[ContrastOverrideKey.self] }
+        set { self[ContrastOverrideKey.self] = newValue }
+    }
+
+    var contrastResolved: ColorSchemeContrast { contrastOverride ?? colorSchemeContrast }
 
     var panelVisible: Bool {
         get { self[PanelVisibleKey.self] }
@@ -91,6 +122,31 @@ extension EnvironmentValues {
 
 enum Loops {
     static func isRunning(visible: Bool, reduceMotion: Bool) -> Bool { visible && !reduceMotion }
+}
+
+struct Pulse<Content: View>: View {
+    let period: TimeInterval
+    var delay: TimeInterval = 0
+    @ViewBuilder let content: (Double) -> Content
+    @Environment(\.loopDate) private var injected
+
+    static func level(at date: Date, period: TimeInterval, delay: TimeInterval) -> Double {
+        let half = period / 2
+        let t = (date.timeIntervalSinceReferenceDate - delay).truncatingRemainder(dividingBy: period)
+        let phase = (t < 0 ? t + period : t) / half
+        let triangle = phase < 1 ? phase : 2 - phase
+        return triangle * triangle * (3 - 2 * triangle)
+    }
+
+    var body: some View {
+        if let injected {
+            content(Self.level(at: injected, period: period, delay: delay))
+        } else {
+            TimelineView(.animation) { context in
+                content(Self.level(at: context.date, period: period, delay: delay))
+            }
+        }
+    }
 }
 
 struct CheckShape: Shape {
@@ -183,11 +239,7 @@ private struct MarkBar: View {
             .opacity(risen ? 1 : 0)
         Group {
             if breathing {
-                bar.phaseAnimator([1.0, 0.82]) { view, scale in
-                    view.scaleEffect(y: scale)
-                } animation: { _ in
-                    .easeInOut(duration: 0.6).delay(Double(index) * 0.12)
-                }
+                Pulse(period: 1.2, delay: Double(index) * 0.12) { bar.scaleEffect(y: 1 - 0.18 * $0) }
             } else {
                 bar
             }

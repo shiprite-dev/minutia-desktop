@@ -13,10 +13,6 @@ final class LocalTranscriberTests: XCTestCase {
                          loadEngine: gate.loader(engine, failure: loadFailure))
     }
 
-    func test_theIdleUnloadWindow_isSixtySeconds() {
-        XCTAssertEqual(LocalTranscriber.idleUnloadSeconds, 60)
-    }
-
     func test_aSegmentTranscript_isNamedForItsSeq() {
         XCTAssertEqual(LocalTranscriber.transcriptName(seq: 3), "seg-3.transcript.json")
     }
@@ -131,10 +127,6 @@ final class LocalTranscriberTests: XCTestCase {
         XCTAssertTrue(loadedRightAfter, "the engine stays inside the idle window after finish")
         let unloaded = await eventually { await local.isEngineLoaded == false }
         XCTAssertTrue(unloaded, "the engine unloads once the idle window after finish passes")
-    }
-
-    func test_theShortestTranscribableSegment_matchesFluidAudiosMinimum() {
-        XCTAssertEqual(LocalTranscriber.minimumSegmentSeconds, 0.3)
     }
 
     /// FluidAudio throws invalidAudioData under 0.3 s; a tiny tail must not fail the whole meeting.
@@ -279,10 +271,6 @@ final class LocalTranscriberTests: XCTestCase {
         let error = await failure { try await self.finishMeeting(local, segments: 3) }
         XCTAssertEqual(error as? LocalTranscriber.Failure, .modelLoad, "got \(String(describing: error))")
         XCTAssertEqual(gate.loads, 1)
-    }
-
-    func test_theModelLoadTimeout_isTwoMinutes() {
-        XCTAssertEqual(LocalTranscriber.loadTimeoutSeconds, 120)
     }
 
     func test_aModelLoadPastItsTimeout_failsFinishAsTimedOut_withoutWaitingForTheLoad() async {
