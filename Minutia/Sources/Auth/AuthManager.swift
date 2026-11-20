@@ -445,6 +445,42 @@ final class AuthManager: ObservableObject {
         }
     }
 
+    static let signedOutNote = "You were signed out. Sign in again to record."
+
+    /// Loads the session, refreshing it when due. When the server refuses the refresh because the
+    /// session was ended elsewhere (signed out on the web, which ends every session), the session is
+    /// dropped here and sign-in shows why. Losing the network or a server error keeps the user
+    /// signed in. Returns true only when the session was dropped.
+    func dropSessionIfRevoked() async -> Bool {
+        guard let supabase else { return false }
+        do {
+            _ = try await supabase.auth.session
+            return false
+        } catch {
+            guard Self.isRevokedSession(error) else { return false }
+            callbackError = Self.signedOutNote
+            try? await supabase.auth.signOut(scope: .local)
+            setSession(email: nil)
+            return true
+        }
+    }
+
+    /// Older sign-in servers (GoTrue before error codes, as shipped in the self-host stack) refuse a
+    /// revoked refresh with a bare OAuth `invalid_grant`, which supabase-swift does not recognize as
+    /// a sign-out; newer ones send a code it turns into `sessionMissing`.
+    nonisolated static func isRevokedSession(_ error: Error) -> Bool {
+        switch error {
+        case Auth.AuthError.sessionMissing:
+            return true
+        case let Auth.AuthError.api(_, code, data, response):
+            if [.refreshTokenNotFound, .refreshTokenAlreadyUsed, .sessionNotFound, .sessionExpired].contains(code) { return true }
+            let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            return response.statusCode == 400 && body?["error"] as? String == "invalid_grant"
+        default:
+            return false
+        }
+    }
+
     var beforeSignOut: (() async -> Void)?
 
     func signOut() async {
