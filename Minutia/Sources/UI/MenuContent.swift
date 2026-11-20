@@ -57,7 +57,7 @@ struct MenuContent: View {
                 switch controller.phase {
                 case .signedOut:
                     SignInView(authManager: controller.authManager, showsMenuBarHint: controller.showsMenuBarHint)
-                case .idle where controller.review.model != nil:
+                case .idle where controller.review.shown != nil:
                     ReviewView(review: controller.review, onOpenRecap: controller.openRecap)
                 case .idle:
                     IdleHost(controller: controller, detectedVia: nil)
@@ -95,7 +95,7 @@ struct MenuContent: View {
         .environment(\.panelVisible, controller.panelOpen)
         .environment(\.consentPending, controller.pendingRecordConsent != nil)
         .animation(Motion.resolved(Motion.settle, reduce: reduceMotion), value: controller.phase)
-        .animation(Motion.resolved(Motion.settle, reduce: reduceMotion), value: controller.review.model?.meetingId)
+        .animation(Motion.resolved(Motion.settle, reduce: reduceMotion), value: controller.review.shown?.meetingId)
         .sensoryFeedback(trigger: controller.phase) { old, new in PanelHaptic.feedback(from: old, to: new) }
         .onAppear { controller.panelOpened() }
         .onDisappear { controller.panelClosed() }

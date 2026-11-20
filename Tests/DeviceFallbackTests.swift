@@ -70,8 +70,7 @@ final class DeviceFallbackTests: XCTestCase {
                 box.set(.success(try await CaptureSession.finishOnDevice(
                     meetingId: DeviceFixtures.meetingId, directory: directory,
                     tail: [DeviceFixtures.segment(count - 1, in: directory)], durationSeconds: Double(count) * 300,
-                    transcriber: local, transport: transport, recapOpened: true,
-                    deviceOnly: deviceOnly, cloud: cloud, transcribeTimeout: transcribeTimeout, sleep: { _ in },
+                    transcriber: local, transport: transport, deviceOnly: deviceOnly, cloud: cloud, transcribeTimeout: transcribeTimeout, sleep: { _ in },
                     notifyLocalFailure: { failures.record($0) }, onLocalOutcome: { outcomes.record($0) })))
             } catch {
                 box.set(.failure(error))

@@ -26,7 +26,7 @@ struct ReviewNotice: Equatable {
 }
 
 enum ReviewButton: Equatable {
-    case keep(Int), skipRest, openRecap, tryAgain, reviewRest
+    case keep(Int), skipRest, openRecap, tryAgain, reviewRest, finish
 
     var title: String {
         switch self {
@@ -35,6 +35,7 @@ enum ReviewButton: Equatable {
         case .openRecap: ReviewCopy.openRecap
         case .tryAgain: ReviewCopy.tryAgain
         case .reviewRest: "Review the rest"
+        case .finish: "Done"
         }
     }
 }
@@ -81,6 +82,7 @@ final class ReviewController: ObservableObject {
     @Published private(set) var queue: [ReviewMeeting] = []
     @Published private(set) var meeting: ReviewMeeting?
     @Published private(set) var saving = false
+    @Published private(set) var hidden = false
     private(set) var me: UUID?
 
     var announce: (String) -> Void = { _ in }
@@ -89,24 +91,33 @@ final class ReviewController: ObservableObject {
     private let client: @MainActor () -> MinutiaClient?
     private let clock: ReviewClock
     private let notify: (ReviewNotice) -> Void
-    private var panelOpen = false
+    private let defaults: UserDefaults
+    private(set) var panelOpen = false
+    private var retrying = false
     private var generation = 0
     private var pollStarted = Date.distantPast
     private var pollTask: Task<Void, Never>?
     private var closeTask: Task<Void, Never>?
-    private var notified: Set<UUID> = []
+    private static let notifiedKey = "review.notifiedMeetings"
 
-    init(client: @escaping @MainActor () -> MinutiaClient?, clock: ReviewClock = .live, notify: @escaping (ReviewNotice) -> Void) {
+    init(
+        client: @escaping @MainActor () -> MinutiaClient?, clock: ReviewClock = .live, defaults: UserDefaults = .standard,
+        notify: @escaping (ReviewNotice) -> Void
+    ) {
         self.client = client
         self.clock = clock
+        self.defaults = defaults
         self.notify = notify
     }
 
     var hasDot: Bool { !queue.isEmpty }
+    var shown: ReviewModel? { hidden ? nil : model }
 
-    func start(meetingId: UUID) {
+    @discardableResult
+    func start(meetingId: UUID) -> Task<Void, Never> {
         closeTask?.cancel()
         closeTask = nil
+        hidden = false
         pollStarted = clock.now()
         if model?.meetingId != meetingId {
             let queued = queue.first { $0.meetingId == meetingId }
@@ -114,13 +125,23 @@ final class ReviewController: ObservableObject {
             show(queued.map { ReviewModel.from($0, now: clock.now(), previous: nil) }
                 ?? ReviewModel(meetingId: meetingId, screen: .transcribing(elapsed: nil)))
         }
-        Task { await refresh() }
+        return Task { await refresh() }
     }
 
+    /// Closing while the AI still works only hides the review; it keeps checking so the
+    /// "We'll let you know" promise holds.
     func close() {
+        guard let model, Self.working(model.screen) else { return dismiss() }
+        closeTask?.cancel()
+        closeTask = nil
+        hidden = true
+    }
+
+    private func dismiss() {
         pollTask?.cancel()
         closeTask?.cancel()
         closeTask = nil
+        hidden = false
         model = nil
         meeting = nil
     }
@@ -128,16 +149,20 @@ final class ReviewController: ObservableObject {
     func reset() {
         generation += 1
         saving = false
-        close()
+        retrying = false
+        dismiss()
         queue = []
         me = nil
-        notified = []
     }
 
-    func setPanelOpen(_ open: Bool) {
+    @discardableResult
+    func setPanelOpen(_ open: Bool) -> Task<Void, Never>? {
         panelOpen = open
-        guard open else { return schedulePoll() }
-        Task {
+        guard open else {
+            schedulePoll()
+            return nil
+        }
+        return Task {
             await refresh()
             await refreshQueue()
         }
@@ -153,11 +178,11 @@ final class ReviewController: ObservableObject {
             guard let fetched = response.meetings.first(where: { $0.meetingId == id }) else { throw ReviewQueueError.meetingGone }
             meeting = fetched
             merge(fetched)
-            if !saving { show(ReviewModel.from(fetched, now: clock.now(), previous: model)) }
+            if !saving, !retrying { show(ReviewModel.from(fetched, now: clock.now(), previous: model)) }
         } catch ReviewQueueError.meetingGone {
             guard generation == self.generation, !saving else { return }
             queue.removeAll { $0.meetingId == id }
-            if model?.meetingId == id { close() }
+            if model?.meetingId == id { dismiss() }
             return
         } catch ReviewQueueError.signedOut {
             guard generation == self.generation else { return }
@@ -175,6 +200,7 @@ final class ReviewController: ObservableObject {
             guard generation == self.generation else { return }
             me = response.me
             queue = Self.sorted(response.meetings.filter(Self.waits))
+            for meeting in queue { noticeOnce(meeting, post: !panelOpen) }
         } catch ReviewQueueError.signedOut {
             guard generation == self.generation else { return }
             onSignedOut()
@@ -213,17 +239,27 @@ final class ReviewController: ObservableObject {
     }
 
     func tryAgain() async {
-        guard let model, let id = model.meetingId, let client = client() else { return }
+        guard !retrying, let failed = model, let id = failed.meetingId, let client = client() else { return }
+        let transcription = failed.screen == .transcriptionFailed
+        guard transcription || (failed.screen == .findingFailed && meeting?.reviewer == true) else { return }
         let generation = generation
-        switch model.screen {
-        case .transcriptionFailed:
-            try? await client.requestTranscription(meetingId: id.uuidString.lowercased(), expectedSegments: nil)
-        case .findingFailed where meeting?.reviewer == true:
-            do { try await client.regenerateSuggestions(meetingId: id) } catch MinutiaClientError.signedOut { onSignedOut() } catch {}
-        default:
+        retrying = true
+        show(ReviewModel(meetingId: id, screen: transcription ? .transcribing(elapsed: nil) : .finding))
+        do {
+            if transcription {
+                try await client.requestTranscription(meetingId: id.uuidString.lowercased(), expectedSegments: nil)
+            } else {
+                try await client.regenerateSuggestions(meetingId: id)
+            }
+        } catch {
+            guard generation == self.generation else { return }
+            retrying = false
+            if model?.meetingId == id { show(failed) }
+            if case MinutiaClientError.signedOut = error { onSignedOut() }
             return
         }
         guard generation == self.generation else { return }
+        retrying = false
         pollStarted = clock.now()
         await refresh()
     }
@@ -261,15 +297,15 @@ final class ReviewController: ObservableObject {
     }
 
     private func show(_ next: ReviewModel) {
-        let spokenBefore = spoken(model)
+        let before = model
         model = next
-        if let line = spoken(next), line != spokenBefore { announce(line) }
-        if let id = next.meetingId, next.screen == .ready, !next.readOnly, !notified.contains(id) {
-            notified.insert(id)
-            if !panelOpen, let meeting {
-                notify(ReviewNotice(title: ReviewCopy.notificationTitle(count: next.newRows.count + next.updateRows.count, series: meeting.seriesName), meetingId: id))
-            }
+        let line = spoken(next)
+        let sameScreen = before?.meetingId == next.meetingId && before?.readOnly == next.readOnly && spoken(before) == line
+        if !hidden, !sameScreen, let line { announce(line) }
+        if next.screen == .ready, !next.readOnly, let meeting, meeting.meetingId == next.meetingId {
+            noticeOnce(meeting, post: !panelOpen || hidden)
         }
+        if hidden, !Self.working(next.screen) { return dismiss() }
         if case .done = next.screen {
             if closeTask == nil { scheduleClose() }
         } else {
@@ -278,13 +314,20 @@ final class ReviewController: ObservableObject {
         }
     }
 
+    private func noticeOnce(_ meeting: ReviewMeeting, post: Bool) {
+        var notified = Set((defaults.stringArray(forKey: Self.notifiedKey) ?? []).compactMap(UUID.init))
+        guard Self.waits(meeting), notified.insert(meeting.meetingId).inserted else { return }
+        defaults.set(notified.map(\.uuidString), forKey: Self.notifiedKey)
+        if post { notify(ReviewNotice(title: ReviewCopy.notificationTitle(count: meeting.rows.count, series: meeting.seriesName), meetingId: meeting.meetingId)) }
+    }
+
     private func scheduleClose() {
         let generation = generation
         closeTask = Task { [weak self, clock] in
             await clock.sleep(Self.doneHold)
             guard let self, !Task.isCancelled, generation == self.generation else { return }
             closeTask = nil
-            close()
+            dismiss()
         }
     }
 
@@ -300,7 +343,7 @@ final class ReviewController: ObservableObject {
 
     private var pollInterval: TimeInterval? {
         switch model?.screen {
-        case .transcribing, .finding, .slow:
+        case let screen? where Self.working(screen):
             clock.now().timeIntervalSince(pollStarted) < Self.pollLimit ? Self.workingPoll : nil
         case .ready:
             panelOpen && !saving ? Self.readyPoll : nil
@@ -322,7 +365,7 @@ final class ReviewController: ObservableObject {
         case .ready:
             return model.readOnly
                 ? ReviewCopy.readOnly
-                : ReviewCopy.notificationTitle(count: model.newRows.count + model.updateRows.count, series: meeting?.seriesName ?? "")
+                : ReviewCopy.notificationTitle(count: meeting?.rows.count ?? 0, series: meeting?.seriesName ?? "")
         default: return model.screen.message
         }
     }
@@ -331,6 +374,13 @@ final class ReviewController: ObservableObject {
 
     private nonisolated static func sorted(_ meetings: [ReviewMeeting]) -> [ReviewMeeting] {
         meetings.sorted { ($0.endedAt ?? .distantPast) > ($1.endedAt ?? .distantPast) }
+    }
+
+    private nonisolated static func working(_ screen: ReviewScreen) -> Bool {
+        switch screen {
+        case .transcribing, .finding, .slow: true
+        default: false
+        }
     }
 
     private nonisolated static func isOpen(_ state: RowState?) -> Bool { [.idle, .failed].contains(state ?? .idle) }
@@ -379,6 +429,7 @@ extension ReviewController {
     var buttons: [ReviewButtonState] {
         guard let model else { return [] }
         let recap = ReviewButtonState(button: .openRecap, enabled: true)
+        let finish = ReviewButtonState(button: .finish, enabled: true)
         switch model.screen {
         case .ready where model.readOnly:
             return [recap]
@@ -389,15 +440,15 @@ extension ReviewController {
                 recap,
             ]
         case .transcriptionFailed:
-            return [ReviewButtonState(button: .tryAgain, enabled: true), recap]
+            return [ReviewButtonState(button: .tryAgain, enabled: !retrying), finish, recap]
         case .findingFailed where meeting?.reviewer == true:
-            return [ReviewButtonState(button: .tryAgain, enabled: true), recap]
+            return [ReviewButtonState(button: .tryAgain, enabled: !retrying), finish, recap]
         case .partlyDone:
-            return [ReviewButtonState(button: .reviewRest, enabled: true), recap]
+            return [ReviewButtonState(button: .reviewRest, enabled: true), finish, recap]
         case .transcribing, .finding, .slow:
             return []
         default:
-            return [recap]
+            return [finish, recap]
         }
     }
 

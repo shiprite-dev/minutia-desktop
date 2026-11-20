@@ -247,7 +247,11 @@ struct MenuBarIcon: View {
     /// VoiceOver text for the status item, since the glyph alone conveys the phase. Mirrors the glyph
     /// precedence: recording/finalizing/error win over a pending consent.
     static func accessibilityLabel(phase: AppPhase, pendingConsent: Bool, reviewDot: Bool = false) -> String {
-        if reviewDot, !pendingConsent { return "Minutia, items to review" }
+        let base = phaseLabel(phase: phase, pendingConsent: pendingConsent)
+        return reviewDot && !pendingConsent ? "\(base), items to review" : base
+    }
+
+    private static func phaseLabel(phase: AppPhase, pendingConsent: Bool) -> String {
         switch phase {
         case .recording: return "Minutia, recording"
         case .finalizing: return "Minutia, finishing recording"
@@ -323,9 +327,10 @@ final class AppController: NSObject, ObservableObject {
     /// Drives a quiet in-menu row and folds recovery into the quit guard.
     @Published private(set) var recoveryActive: Bool = false
     @Published private(set) var panelOpen = true
-    func panelOpened() {
+    @discardableResult
+    func panelOpened() -> Task<Void, Never>? {
         panelOpen = true
-        review.setPanelOpen(true)
+        return review.setPanelOpen(true)
     }
     func panelClosed() {
         panelOpen = false
@@ -797,7 +802,7 @@ final class AppController: NSObject, ObservableObject {
         self.defaults = defaults
         let authManager = AuthManager(defaults: defaults)
         self.authManager = authManager
-        self.review = ReviewController(client: { reviewClient(authManager) }, clock: reviewClock, notify: postReviewNotice)
+        self.review = ReviewController(client: { reviewClient(authManager) }, clock: reviewClock, defaults: defaults, notify: postReviewNotice)
         self.openURL = openURL
         self.micCheck = micCheck
         super.init()
@@ -1750,13 +1755,23 @@ final class AppController: NSObject, ObservableObject {
             UNNotificationRequest(identifier: "review-\(notice.meetingId.uuidString)", content: content, trigger: nil))
     }
 
+    /// Opens the menu panel; false when the status item could not be found.
+    var openPanel: () -> Bool = AppController.clickStatusItem
+
     func openReview(meetingId: UUID) {
         review.start(meetingId: meetingId)
-        // MenuBarExtra has no API to open its window; clicking our own status item is the only way in.
-        NSApp.windows.lazy
-            .filter { $0.className == "NSStatusBarWindow" && $0.responds(to: NSSelectorFromString("statusItem")) }
-            .compactMap { $0.value(forKey: "statusItem") as? NSStatusItem }
-            .first?.button?.performClick(nil)
+        guard !review.panelOpen, !openPanel() else { return }
+        NSApplication.shared.activate()
+    }
+
+    /// MenuBarExtra has no API to open its window; clicking our own status item is the only way in.
+    private static func clickStatusItem() -> Bool {
+        guard let button = NSApp.windows.lazy
+            .filter({ $0.className == "NSStatusBarWindow" && $0.responds(to: NSSelectorFromString("statusItem")) })
+            .compactMap({ $0.value(forKey: "statusItem") as? NSStatusItem })
+            .first?.button else { return false }
+        button.performClick(nil)
+        return true
     }
 
     private func openRecapInBrowser(_ meetingId: UUID) {
@@ -2140,7 +2155,7 @@ final class AppController: NSObject, ObservableObject {
     }
 
     /// Retry a failed finalize by re-running the durable-directory recovery for that meeting, exactly
-    /// as startup recovery does, instead of starting a fresh recording. On success the recap opens;
+    /// as startup recovery does, instead of starting a fresh recording. On success the review starts;
     /// on failure the app parks back in `.error` with the finalize target still remembered.
     private func refinalize(meetingId: String) {
         guard case .error = phase, let client = authManager.client() else { return }

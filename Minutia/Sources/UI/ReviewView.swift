@@ -9,7 +9,7 @@ struct ReviewView: View {
     @Environment(\.motionReduced) private var reduceMotion
 
     var body: some View {
-        if let model = review.model {
+        if let model = review.shown {
             VStack(alignment: .leading, spacing: 0) {
                 header
                 if model.listUpdated { ReviewNote(text: ReviewCopy.Note.listUpdated.text) }
@@ -68,7 +68,7 @@ struct ReviewView: View {
         case .ready:
             rows
         case .done, .partlyDone, .none, .nobodySpoke, .notAvailable, .transcriptionFailed, .findingFailed:
-            ReviewEnd(screen: model.screen, moreOnWeb: review.moreOnWeb, onMore: openRecap, onClose: review.close)
+            ReviewEnd(screen: model.screen, moreOnWeb: review.moreOnWeb, onMore: openRecap)
         }
     }
 
@@ -131,6 +131,7 @@ struct ReviewView: View {
         case .skipRest: Task { await review.skipRest() }
         case .tryAgain: Task { await review.tryAgain() }
         case .reviewRest: review.reviewRest()
+        case .finish: review.close()
         case .openRecap: openRecap()
         }
     }
@@ -287,31 +288,27 @@ private struct ReviewEnd: View {
     let screen: ReviewScreen
     let moreOnWeb: String?
     let onMore: () -> Void
-    let onClose: () -> Void
 
     var body: some View {
-        Button(action: onClose) {
-            VStack(spacing: Space.x2) {
-                ReviewBadge(kind: kind)
-                if !big.isEmpty {
-                    Text(big).font(.system(size: 14, weight: .semibold)).multilineTextAlignment(.center)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if let small { Text(small).font(.system(size: 12)).foregroundStyle(Brand.ink3) }
+        VStack(spacing: Space.x2) {
+            if let kind { ReviewBadge(kind: kind) }
+            if !big.isEmpty {
+                Text(big).font(.system(size: 14, weight: .semibold)).multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .frame(maxWidth: .infinity)
-            .padding(EdgeInsets(top: 22, leading: 18, bottom: 14, trailing: 18))
-            .contentShape(Rectangle())
+            if let small { Text(small).font(.system(size: 12)).foregroundStyle(Brand.ink3) }
         }
-        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity)
+        .padding(EdgeInsets(top: 22, leading: 18, bottom: 14, trailing: 18))
         .accessibilityElement(children: .combine)
         if case .none = screen, let moreOnWeb {
             Button(moreOnWeb, action: onMore).buttonStyle(ReviewLinkStyle()).frame(maxWidth: .infinity).padding(.bottom, Space.x3)
         }
     }
 
-    private var kind: ReviewBadge.Kind {
+    private var kind: ReviewBadge.Kind? {
         switch screen {
+        case .notAvailable: nil
         case .nobodySpoke: .dash
         case .transcriptionFailed, .findingFailed: .bang
         default: .check

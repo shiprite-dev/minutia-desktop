@@ -298,7 +298,17 @@ final class ReviewModelTests: XCTestCase {
     func test_olderMeetingWithoutStatuses_showsNotAvailable() {
         XCTAssertEqual(screen(meeting(suggestions: nil)), .notAvailable)
         XCTAssertEqual(screen(meeting(transcription: nil, suggestions: "ready")), .notAvailable)
-        XCTAssertEqual(screen(meeting(transcription: "pending", suggestions: nil, endedAgo: 5)), .notAvailable)
+        XCTAssertEqual(screen(meeting(transcription: "completed", suggestions: nil, rows: [row("Ship it")])), .notAvailable)
+    }
+
+    func test_whileTranscribing_theServerLeavesSuggestionsEmpty_andTheReviewStillSaysTranscribing() {
+        for status in ["pending", "processing"] {
+            let model = ReviewModel.from(meeting(transcription: status, suggestions: nil, endedAgo: 5), now: now, previous: nil)
+            XCTAssertEqual(model.screen, .transcribing(elapsed: nil))
+            XCTAssertEqual(model.screen.message, "Transcribing")
+            XCTAssertEqual(screen(meeting(transcription: status, suggestions: nil, endedAgo: 121)), .slow)
+        }
+        XCTAssertEqual(screen(meeting(transcription: "failed", suggestions: nil)), .transcriptionFailed)
     }
 
     func test_olderMeetingWithoutTimestamps_isNeverSlowOrFailed() {

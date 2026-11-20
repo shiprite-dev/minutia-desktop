@@ -79,16 +79,14 @@ struct ReviewModel: Equatable {
         let transcribingFor = meeting.endedAt.map { now.timeIntervalSince($0) } ?? 0
         let findingFor = meeting.statusAt.map { now.timeIntervalSince($0) } ?? 0
         switch (meeting.transcriptionStatus, meeting.suggestionsStatus, meeting.suggestionsReason) {
-        case (nil, _, _) where meeting.rows.isEmpty:
-            return ReviewModel(screen: .notAvailable)
-        case (_, nil, _):
-            return ReviewModel(screen: .notAvailable)
         case ("failed", _, _):
             return ReviewModel(screen: .transcriptionFailed)
         case ("pending", _, _), ("processing", _, _):
             if transcribingFor > slowAfter { return ReviewModel(screen: .slow) }
             let elapsed: Duration? = transcribingFor > elapsedAfter ? .seconds(Int(transcribingFor)) : nil
             return ReviewModel(screen: .transcribing(elapsed: elapsed))
+        case (nil, _, _) where meeting.rows.isEmpty, (_, nil, _):
+            return ReviewModel(screen: .notAvailable)
         case (_, "pending", _):
             if findingFor > failedAfter { return ReviewModel(screen: .findingFailed) }
             return ReviewModel(screen: findingFor > slowAfter ? .slow : .finding)

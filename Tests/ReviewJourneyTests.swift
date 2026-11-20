@@ -1,3 +1,4 @@
+import SwiftUI
 import XCTest
 @testable import Minutia
 
@@ -23,11 +24,13 @@ final class ReviewServer: URLProtocol {
     nonisolated(unsafe) private static var holdFlag = false
     nonisolated(unsafe) private static var loseFlag = false
     nonisolated(unsafe) private static var onRetry: [String: [String: Any]] = [:]
+    nonisolated(unsafe) private static var holdRetryFlag = false
+    nonisolated(unsafe) private static var refuseRetryFlag = false
 
     static func reset() {
         lock.withLock {
             meetings = [:]; order = []; gone = []; refusals = [:]; held = []; seen = []
-            offlineFlag = false; holdFlag = false; loseFlag = false; onRetry = [:]
+            offlineFlag = false; holdFlag = false; loseFlag = false; onRetry = [:]; holdRetryFlag = false; refuseRetryFlag = false
         }
     }
 
@@ -46,6 +49,19 @@ final class ReviewServer: URLProtocol {
         get { lock.withLock { holdFlag } }
         set { lock.withLock { holdFlag = newValue } }
     }
+
+    /// Try again requests wait until `releaseSaves()`.
+    static var holdRetries: Bool {
+        get { lock.withLock { holdRetryFlag } }
+        set { lock.withLock { holdRetryFlag = newValue } }
+    }
+
+    static var refuseRetries: Bool {
+        get { lock.withLock { refuseRetryFlag } }
+        set { lock.withLock { refuseRetryFlag = newValue } }
+    }
+
+    static var retries: [Seen] { requests.filter { $0.method == "POST" } }
 
     static func put(_ meeting: [String: Any]) {
         let id = meeting["meeting_id"] as! String
@@ -98,7 +114,7 @@ final class ReviewServer: URLProtocol {
             if Self.offlineFlag { return (.failure(URLError(.notConnectedToInternet)), false) }
             let answer = Self.answer(method: method, path: url.path, query: url.query, body: body)
             if method == "PATCH" && Self.loseFlag { return (.failure(URLError(.networkConnectionLost)), false) }
-            return (.success(answer), method == "PATCH" && Self.holdFlag)
+            return (.success(answer), (method == "PATCH" && Self.holdFlag) || (method == "POST" && Self.holdRetryFlag))
         }
         let finish = { [self] in
             switch outcome {
@@ -133,6 +149,7 @@ final class ReviewServer: URLProtocol {
             meetings[meeting]?["rows"] = left
             return (200, "{\"suggestion\":{},\"code\":\"saved\"}")
         case ("POST", 4):
+            if refuseRetryFlag { return (500, "{\"error\":\"Server words\"}") }
             if let next = onRetry[parts[2]] { meetings[parts[2]] = next }
             return (202, "{}")
         default:
@@ -196,7 +213,12 @@ final class TestClock {
         all.forEach { $0.resume.resume() }
     }
 
-    var review: ReviewClock { ReviewClock(now: { self.now }, sleep: { await self.sleep($0) }) }
+    /// How often the review asked the time: it does so as it handles each answer.
+    private(set) var nowReads = 0
+
+    var review: ReviewClock {
+        ReviewClock(now: { self.nowReads += 1; return self.now }, sleep: { await self.sleep($0) })
+    }
 }
 
 @MainActor
@@ -279,7 +301,7 @@ final class ReviewJourneyTests: XCTestCase {
 
     private func review() -> ReviewController {
         let review = ReviewController(
-            client: { [instance] in Self.client(instance) }, clock: clock.review,
+            client: { [instance] in Self.client(instance) }, clock: clock.review, defaults: UserDefaults(suiteName: suite)!,
             notify: { [weak self] in self?.notices.append($0) })
         review.announce = { [weak self] in self?.announcements.append($0) }
         reviews.append(review)
@@ -305,8 +327,6 @@ final class ReviewJourneyTests: XCTestCase {
         XCTAssertTrue(condition(), "timed out", file: file, line: line)
     }
 
-    private func settle() async { try? await Task.sleep(nanoseconds: 150_000_000) }
-
     /// Moves time on once something is waiting on it, so a poll scheduled a moment ago is not skipped.
     private func tick(_ seconds: TimeInterval, file: StaticString = #filePath, line: UInt = #line) async {
         await waitUntil({ clock.sleeping > 0 }, file: file, line: line)
@@ -314,8 +334,7 @@ final class ReviewJourneyTests: XCTestCase {
     }
 
     private func openPanel(_ review: ReviewController) async {
-        review.setPanelOpen(true)
-        await settle()
+        await review.setPanelOpen(true)?.value
     }
 
     private func texts(_ review: ReviewController) -> [String] {
@@ -333,7 +352,7 @@ final class ReviewJourneyTests: XCTestCase {
         await app.authManager.adopt(testSupabase(instance), instance: instance)
         app.apply(.signedIn)
         app.panelOpened()
-        ReviewServer.put(try meeting(transcription: "processing", suggestions: "pending", endedAgo: 0))
+        ReviewServer.put(try meeting(transcription: "processing", suggestions: nil, endedAgo: 0))
 
         app.apply(.recordStarted)
         app.apply(.recordStopped)
@@ -342,7 +361,7 @@ final class ReviewJourneyTests: XCTestCase {
         await waitUntil { app.review.title == "Weekly sync" }
         XCTAssertEqual(app.review.model?.screen.message, "Transcribing")
 
-        ReviewServer.update(meetingId) { $0["transcription_status"] = "completed"; $0["status_at"] = self.stamp(self.clock.now) }
+        ReviewServer.update(meetingId) { $0["transcription_status"] = "completed"; $0["suggestions_status"] = "pending"; $0["status_at"] = self.stamp(self.clock.now) }
         await tick(3)
         await waitUntil { app.review.model?.screen == .finding }
         XCTAssertEqual(app.review.model?.screen.message, "Finding action items")
@@ -360,7 +379,7 @@ final class ReviewJourneyTests: XCTestCase {
         XCTAssertEqual(ReviewServer.saves.map(\.path), ids.map { "/api/meetings/3f95ffd6-fd1e-4640-aacc-89e1c051f742/suggestions/\($0.uuidString.lowercased())" })
         XCTAssertEqual(ReviewServer.saves.map { $0.body["action"] as? String }, ["accept", "accept", "accept"])
         XCTAssertEqual(app.review.model?.doneLine, "3 items tracked")
-        XCTAssertEqual(app.review.buttons.map(\.title), ["Open recap"])
+        XCTAssertEqual(app.review.buttons.map(\.title), ["Done", "Open recap"])
         XCTAssertEqual(ReviewServer.pendingRows(meetingId), [])
         XCTAssertEqual(announcements, ["Recording started", "Transcribing", "Finding action items", "3 action items from Weekly sync", "3 items tracked"])
         XCTAssertTrue(notices.isEmpty, "the panel was open, so nothing is posted")
@@ -391,7 +410,7 @@ final class ReviewJourneyTests: XCTestCase {
         await app.authManager.adopt(testSupabase(instance), instance: instance)
         app.apply(.signedIn)
         app.panelOpened()
-        ReviewServer.put(try meeting(transcription: "processing", suggestions: "pending", endedAgo: 0))
+        ReviewServer.put(try meeting(transcription: "processing", suggestions: nil, endedAgo: 0))
         app.apply(.recordStarted)
         app.apply(.recordStopped)
 
@@ -401,10 +420,9 @@ final class ReviewJourneyTests: XCTestCase {
 
         XCTAssertEqual(app.phase, .idle)
         await waitUntil { app.review.model?.screen == .transcribing(elapsed: nil) && app.review.title == "Weekly sync" }
-        ReviewServer.update(meetingId) { $0["transcription_status"] = "completed"; $0["status_at"] = self.stamp(self.clock.now) }
+        ReviewServer.update(meetingId) { $0["transcription_status"] = "completed"; $0["suggestions_status"] = "pending"; $0["status_at"] = self.stamp(self.clock.now) }
         await tick(3)
         await waitUntil { app.review.model?.screen == .finding }
-        await settle()
         XCTAssertEqual(opened, [], "the recap opens only from Open recap")
     }
 
@@ -530,14 +548,10 @@ final class ReviewJourneyTests: XCTestCase {
         XCTAssertEqual(notices, [ReviewNotice(title: "3 action items from Weekly sync", meetingId: meetingId)])
         XCTAssertTrue(app.review.hasDot)
 
-        let reads = ReviewServer.meetingReads
-        clock.advance(30)
-        clock.advance(30)
-        await settle()
-        XCTAssertEqual(ReviewServer.meetingReads, reads, "nothing to watch while Ready sits behind a closed panel")
-        app.panelOpened()
+        XCTAssertEqual(clock.sleeping, 0, "nothing to watch while Ready sits behind a closed panel")
+        let opening = app.panelOpened()
         app.panelClosed()
-        await settle()
+        await opening?.value
         XCTAssertEqual(notices.count, 1)
 
         app.review.close()
@@ -552,7 +566,7 @@ final class ReviewJourneyTests: XCTestCase {
     }
 
     func test_notificationsDenied_dotStillShows() async throws {
-        let review = ReviewController(client: { [instance] in Self.client(instance) }, clock: clock.review, notify: { _ in })
+        let review = ReviewController(client: { [instance] in Self.client(instance) }, clock: clock.review, defaults: UserDefaults(suiteName: suite)!, notify: { _ in })
         reviews.append(review)
         ReviewServer.put(try meeting(suggestions: "pending"))
         review.start(meetingId: meetingId)
@@ -565,7 +579,7 @@ final class ReviewJourneyTests: XCTestCase {
         await waitUntil { review.hasDot }
         let dot = MenuBarIcon.showsDot(phase: .idle, hasDot: review.hasDot)
         XCTAssertTrue(dot)
-        XCTAssertEqual(MenuBarIcon.accessibilityLabel(phase: .idle, pendingConsent: false, reviewDot: dot), "Minutia, items to review")
+        XCTAssertEqual(MenuBarIcon.accessibilityLabel(phase: .idle, pendingConsent: false, reviewDot: dot), "Minutia, idle, items to review")
         XCTAssertFalse(MenuBarIcon.showsDot(phase: .recording, hasDot: true), "the recording glyph wins")
     }
 
@@ -632,9 +646,8 @@ final class ReviewJourneyTests: XCTestCase {
         await waitUntil { ReviewServer.saves.count == 1 }
         let reads = ReviewServer.meetingReads
         review.setPanelOpen(false)
-        review.setPanelOpen(true)
-        await waitUntil { ReviewServer.meetingReads > reads }
-        await settle()
+        await review.setPanelOpen(true)?.value
+        XCTAssertEqual(ReviewServer.meetingReads, reads + 1)
         XCTAssertEqual(review.model?.screen, .ready, "the server already holds the save; the answer is still on its way")
         XCTAssertEqual(note(review, "Send the budget"), "Saving")
 
@@ -644,8 +657,7 @@ final class ReviewJourneyTests: XCTestCase {
         XCTAssertEqual(review.model?.doneLine, "1 item tracked")
         XCTAssertEqual(ReviewServer.pendingRows(meetingId), [])
         review.setPanelOpen(false)
-        review.setPanelOpen(true)
-        await settle()
+        await review.setPanelOpen(true)?.value
         XCTAssertEqual(review.model?.doneLine, "1 item tracked")
     }
 
@@ -667,7 +679,6 @@ final class ReviewJourneyTests: XCTestCase {
 
         ReviewServer.releaseSaves()
         await keeping.value
-        await settle()
         XCTAssertEqual(ReviewServer.saves.map(\.host), ["minutia.example.com"], "the second row never posts anywhere")
         XCTAssertFalse(ReviewServer.requests.contains { $0.host == "other.example.com" && $0.method == "PATCH" })
         XCTAssertNil(app.review.model, "the old answer does not bring the old review back")
@@ -694,7 +705,6 @@ final class ReviewJourneyTests: XCTestCase {
         ReviewServer.holdSaves = false
         ReviewServer.releaseSaves()
         await keeping.value
-        await settle()
         XCTAssertEqual(ReviewServer.saves.count, 1, "the second row waits for the person to press Keep again")
         XCTAssertEqual(texts(app.review), ["New items", "Book the Acme interview"])
         XCTAssertEqual(app.review.buttons.first?.title, "Keep 1")
@@ -707,10 +717,10 @@ final class ReviewJourneyTests: XCTestCase {
         await openPanel(review)
         await review.refreshQueue()
         XCTAssertTrue(review.hasDot)
-        review.start(meetingId: meetingId)
+        let starting = review.start(meetingId: meetingId)
         XCTAssertEqual(review.model?.screen, .ready, "a queued meeting opens straight to its rows")
-        await waitUntil { ReviewServer.meetingReads == 1 }
-        await settle()
+        await starting.value
+        XCTAssertEqual(ReviewServer.meetingReads, 1)
 
         ReviewServer.delete(meetingId)
         await review.keep()
@@ -732,7 +742,7 @@ final class ReviewJourneyTests: XCTestCase {
         review.start(meetingId: meetingId)
         await waitUntil { review.model?.screen == .findingFailed }
         XCTAssertEqual(review.model?.screen.message, "We couldn't find action items this time.")
-        XCTAssertEqual(review.buttons.map(\.title), ["Try again", "Open recap"])
+        XCTAssertEqual(review.buttons.map(\.title), ["Try again", "Done", "Open recap"])
 
         await review.tryAgain()
 
@@ -745,7 +755,7 @@ final class ReviewJourneyTests: XCTestCase {
 
     func test_couldntTranscribe_tryAgainReRunsTranscription() async throws {
         ReviewServer.put(try meeting(transcription: "failed", suggestions: "pending", endedAgo: 0))
-        ReviewServer.afterRetry(meetingId, becomes: try meeting(transcription: "processing", suggestions: "pending", endedAgo: 0))
+        ReviewServer.afterRetry(meetingId, becomes: try meeting(transcription: "processing", suggestions: nil, endedAgo: 0))
         let review = review()
         review.start(meetingId: meetingId)
         await waitUntil { review.model?.screen == .transcriptionFailed }
@@ -762,7 +772,189 @@ final class ReviewJourneyTests: XCTestCase {
         let review = review()
         review.start(meetingId: meetingId)
         await waitUntil { review.model?.screen == .findingFailed }
-        XCTAssertEqual(review.buttons.map(\.title), ["Open recap"])
+        XCTAssertEqual(review.buttons.map(\.title), ["Done", "Open recap"])
+    }
+
+    // MARK: - We'll let you know
+
+    func test_closedWhileFinding_keepsChecking_andPostsOneNotificationWhenReady() async throws {
+        ReviewServer.put(try meeting(suggestions: "pending"))
+        let review = review()
+        await openPanel(review)
+        await review.start(meetingId: meetingId).value
+        XCTAssertEqual(review.shown?.screen.message, "Finding action items")
+
+        review.close()
+        XCTAssertNil(review.shown, "the review is out of the way")
+        XCTAssertEqual(Host.size(panel(review)).height, 0)
+        let rows = try [row(UUID(), "Send the budget"), row(UUID(), "Book the Acme interview"), row(UUID(), "Draft the hiring plan")]
+        ReviewServer.update(meetingId) { $0["suggestions_status"] = "ready"; $0["rows"] = rows }
+        await tick(3)
+        await waitUntil { notices.count == 1 }
+
+        XCTAssertEqual(notices, [ReviewNotice(title: "3 action items from Weekly sync", meetingId: meetingId)])
+        XCTAssertNil(review.shown)
+        XCTAssertEqual(review.queueRows.map(\.title), ["Weekly sync · today · 3 to review"])
+        XCTAssertEqual(clock.sleeping, 0, "nothing left to watch once it is ready")
+        await review.refreshQueue()
+        await review.start(meetingId: meetingId).value
+        XCTAssertEqual(texts(review), ["New items", "Send the budget", "Book the Acme interview", "Draft the hiring plan"])
+        XCTAssertEqual(notices.count, 1)
+        XCTAssertEqual(announcements, ["Transcribing", "Finding action items", "3 action items from Weekly sync"])
+    }
+
+    func test_closedWhileFinding_andItFails_nothingIsPostedAndTheReviewIsGone() async throws {
+        ReviewServer.put(try meeting(suggestions: "pending"))
+        let review = review()
+        await review.start(meetingId: meetingId).value
+        review.close()
+        ReviewServer.update(meetingId) { $0["suggestions_status"] = "failed" }
+        await tick(3)
+        await waitUntil { review.model == nil }
+        XCTAssertNil(review.shown)
+        XCTAssertEqual(clock.sleeping, 0)
+        XCTAssertTrue(notices.isEmpty)
+    }
+
+    func test_aMeetingThatOnlyShowsUpInTheQueue_isPostedOnce_evenAfterARestart() async throws {
+        let review = review()
+        ReviewServer.put(try meeting(rows: [row(UUID(), "Send the budget"), row(UUID(), "Book the Acme interview")], endedAgo: 3600))
+        await review.refreshQueue()
+        XCTAssertEqual(notices, [ReviewNotice(title: "2 action items from Weekly sync", meetingId: meetingId)])
+        await review.refreshQueue()
+
+        let restarted = self.review()
+        await restarted.refreshQueue()
+        XCTAssertTrue(restarted.hasDot)
+        XCTAssertEqual(notices.count, 1, "never twice, not even after the app restarts")
+
+        ReviewServer.put(try meeting(UUID(), rows: [row(UUID(), "Vendor may slip")], reviewer: false))
+        await restarted.refreshQueue()
+        XCTAssertEqual(notices.count, 1, "only the person who reviews is told")
+
+        await openPanel(restarted)
+        ReviewServer.put(try meeting(UUID(), rows: [row(UUID(), "Draft the hiring plan")]))
+        await restarted.refreshQueue()
+        restarted.setPanelOpen(false)
+        await restarted.refreshQueue()
+        XCTAssertEqual(notices.count, 1, "a meeting first seen in the open panel is not posted later")
+        XCTAssertEqual(restarted.queueRows.count, 2)
+    }
+
+    func test_eightItems_theNotificationAndTheQueueLineCountAllEight() async throws {
+        ReviewServer.put(try meeting(suggestions: "pending"))
+        let review = review()
+        await review.start(meetingId: meetingId).value
+        let rows = try (1...8).map { try row(UUID(), "Item \($0)") }
+        ReviewServer.update(meetingId) { $0["suggestions_status"] = "ready"; $0["rows"] = rows }
+        await tick(3)
+        await waitUntil { notices.count == 1 }
+
+        XCTAssertEqual(notices, [ReviewNotice(title: "8 action items from Weekly sync", meetingId: meetingId)])
+        XCTAssertEqual(review.queueRows.map(\.title), ["Weekly sync · today · 8 to review"])
+        XCTAssertEqual(review.moreOnWeb, "3 more on the web")
+        XCTAssertEqual(announcements.last, "8 action items from Weekly sync")
+    }
+
+    func test_aReadyCheckThatOnlyChangesTheCount_isNotAnnouncedAgain() async throws {
+        let rows = try [row(UUID(), "Send the budget"), row(UUID(), "Book the Acme interview"), row(UUID(), "Draft the hiring plan")]
+        ReviewServer.put(try meeting(rows: rows))
+        let review = review()
+        await openPanel(review)
+        await review.start(meetingId: meetingId).value
+        XCTAssertEqual(announcements, ["3 action items from Weekly sync"])
+
+        ReviewServer.update(meetingId) { $0["rows"] = Array(rows.prefix(2)) }
+        await tick(30)
+        await waitUntil { texts(review) == ["New items", "Send the budget", "Book the Acme interview"] }
+        XCTAssertEqual(announcements, ["3 action items from Weekly sync"])
+    }
+
+    // MARK: - Try again
+
+    func test_tryAgain_flipsToTranscribingTheMomentItIsPressed() async throws {
+        ReviewServer.put(try meeting(transcription: "failed", suggestions: nil))
+        ReviewServer.afterRetry(meetingId, becomes: try meeting(transcription: "processing", suggestions: nil, endedAgo: 0))
+        let review = review()
+        await openPanel(review)
+        await review.start(meetingId: meetingId).value
+        XCTAssertEqual(review.shown?.screen.message, "We couldn't transcribe this meeting.")
+
+        ReviewServer.holdRetries = true
+        let pressing = Task { await review.tryAgain() }
+        await waitUntil { ReviewServer.retries.count == 1 }
+        XCTAssertEqual(review.shown?.screen.message, "Transcribing", "the answer is still on its way")
+        XCTAssertEqual(review.buttons, [])
+
+        ReviewServer.releaseSaves()
+        await pressing.value
+        XCTAssertEqual(ReviewServer.retries.map(\.path), ["/api/meetings/3f95ffd6-fd1e-4640-aacc-89e1c051f742/transcribe"])
+        XCTAssertEqual(review.shown?.screen, .transcribing(elapsed: nil))
+    }
+
+    func test_tryAgain_aSecondPressSendsNothing_andARefusalReturnsToTheFailedScreen() async throws {
+        ReviewServer.put(try meeting(suggestions: "failed"))
+        let review = review()
+        await openPanel(review)
+        await review.start(meetingId: meetingId).value
+        XCTAssertEqual(review.shown?.screen.message, "We couldn't find action items this time.")
+
+        ReviewServer.holdRetries = true
+        ReviewServer.refuseRetries = true
+        let pressing = Task { await review.tryAgain() }
+        await waitUntil { ReviewServer.retries.count == 1 }
+        XCTAssertEqual(review.shown?.screen.message, "Finding action items")
+        await review.setPanelOpen(true)?.value
+        XCTAssertEqual(review.shown?.screen.message, "Finding action items", "a check that lands meanwhile does not undo the press")
+        await review.tryAgain()
+        XCTAssertEqual(ReviewServer.retries.count, 1)
+
+        ReviewServer.releaseSaves()
+        await pressing.value
+        XCTAssertEqual(review.shown?.screen.message, "We couldn't find action items this time.")
+        XCTAssertEqual(review.buttons.map(\.title), ["Try again", "Done", "Open recap"])
+        XCTAssertEqual(review.buttons.map(\.enabled), [true, true, true])
+    }
+
+    // MARK: - One review at a time
+
+    func test_meetingAsDoneTimer_neverClosesMeetingBsReview() async throws {
+        let other = UUID()
+        ReviewServer.put(try meeting(rows: [row(UUID(), "Send the budget")]))
+        ReviewServer.put(try meeting(other, rows: [row(UUID(), "Vendor may slip")]))
+        let review = review()
+        await openPanel(review)
+        await review.start(meetingId: meetingId).value
+        await review.keep()
+        XCTAssertEqual(review.shown?.doneLine, "1 item tracked")
+        await waitUntil { clock.sleeping == 1 }
+
+        await review.start(meetingId: other).value
+        let reads = ReviewServer.meetingReads
+        clock.advance(ReviewController.doneHold)
+        await tick(ReviewController.readyPoll - ReviewController.doneHold)
+        await waitUntil { ReviewServer.meetingReads == reads + 1 }
+        XCTAssertEqual(review.shown?.meetingId, other)
+        XCTAssertEqual(texts(review), ["New items", "Vendor may slip"])
+    }
+
+    func test_reviewTap_neverTogglesAnOpenPanel_andWithoutTheStatusItemTheNextClickShowsIt() async throws {
+        let app = app()
+        await app.authManager.adopt(testSupabase(instance), instance: instance)
+        app.apply(.signedIn)
+        ReviewServer.put(try meeting(rows: [row(UUID(), "Send the budget")]))
+        var clicks = 0
+        app.openPanel = { clicks += 1; return false }
+
+        app.openReview(meetingId: meetingId)
+        XCTAssertEqual(clicks, 1)
+        await waitUntil { app.review.shown?.screen == .ready }
+        let seen = Host.text(MenuContent(controller: app, updater: UpdaterController()))
+        XCTAssertTrue(seen.has("Send the budget"), seen.text)
+
+        app.panelOpened()
+        app.openReview(meetingId: meetingId)
+        XCTAssertEqual(clicks, 1, "an open panel is not clicked shut")
     }
 
     // MARK: - Owner and due date
@@ -830,7 +1022,7 @@ final class ReviewJourneyTests: XCTestCase {
         await waitUntil { ReviewServer.meetingReads == 1 && review.model?.screen == .finding }
 
         await tick(2.9)
-        await settle()
+        XCTAssertEqual(clock.sleeping, 1, "the next check is still waiting")
         XCTAssertEqual(ReviewServer.meetingReads, 1)
         clock.advance(0.1)
         await waitUntil { ReviewServer.meetingReads == 2 }
@@ -841,34 +1033,253 @@ final class ReviewJourneyTests: XCTestCase {
         await tick(3)
         await waitUntil { review.model?.screen == .ready }
         await tick(29)
-        await settle()
+        XCTAssertEqual(clock.sleeping, 1, "the next check is still waiting")
         XCTAssertEqual(ReviewServer.meetingReads, 4)
         clock.advance(1)
         await waitUntil { ReviewServer.meetingReads == 5 }
         await tick(30)
-        await waitUntil { ReviewServer.meetingReads == 6 }
+        await waitUntil { ReviewServer.meetingReads == 6 && clock.sleeping == 1 }
 
         review.setPanelOpen(false)
-        clock.advance(30)
-        clock.advance(30)
-        await settle()
+        await waitUntil { clock.sleeping == 0 }
+        clock.advance(60)
+        XCTAssertEqual(clock.sleeping, 0)
         XCTAssertEqual(ReviewServer.meetingReads, 6)
     }
 
     func test_transcribingForever_stopsCheckingAfterFifteenMinutes() async throws {
-        ReviewServer.put(try meeting(transcription: "processing", suggestions: "pending", endedAgo: 0))
+        ReviewServer.put(try meeting(transcription: "processing", suggestions: nil, endedAgo: 0))
         let review = review()
-        review.start(meetingId: meetingId)
-        await waitUntil { ReviewServer.meetingReads == 1 }
-        for n in 2...301 {
+        await review.start(meetingId: meetingId).value
+        for n in 2...300 {
             await tick(3)
-            await waitUntil { ReviewServer.meetingReads == n }
+            await waitUntil { ReviewServer.meetingReads == n && clock.sleeping == 1 }
         }
+        let looked = clock.nowReads
+        await tick(3)
+        await waitUntil { ReviewServer.meetingReads == 301 && clock.nowReads > looked }
+        XCTAssertEqual(clock.sleeping, 0, "no check is scheduled after fifteen minutes")
         XCTAssertEqual(review.model?.screen.message, "Taking longer than usual. We'll let you know when it's ready.")
-        clock.advance(3)
-        clock.advance(3)
-        await settle()
+        clock.advance(6)
         XCTAssertEqual(ReviewServer.meetingReads, 301)
         XCTAssertEqual(announcements, ["Transcribing", "Taking longer than usual. We'll let you know when it's ready."])
+    }
+
+    // MARK: - On screen
+
+    private func readyReview(_ rows: [[String: Any]], webOnly: Int = 0) async throws -> ReviewController {
+        ReviewServer.put(try meeting(rows: rows, webOnly: webOnly))
+        let review = review()
+        await openPanel(review)
+        await review.start(meetingId: meetingId).value
+        XCTAssertEqual(review.shown?.screen, .ready)
+        return review
+    }
+
+    private func panel(_ review: ReviewController) -> ReviewView {
+        ReviewView(review: review, onOpenRecap: { _ in })
+    }
+
+    func test_keyboard_arrowsMove_spaceTicks_returnKeeps_escapeCloses() async throws {
+        let ids = [UUID(), UUID(), UUID()]
+        let review = try await readyReview([row(ids[0], "Send the budget"), row(ids[1], "Book the Acme interview"), row(ids[2], "Draft the hiring plan")])
+        let window = KeyWindow(panel(review))
+        XCTAssertTrue(window.seen().has("Keep 3"))
+
+        window.press(.down)
+        window.press(.space)
+        XCTAssertEqual(review.groups.flatMap(\.rows).map(\.checked), [true, false, true])
+        XCTAssertTrue(window.seen().has("Keep 2"))
+        window.press(.up)
+        window.press(.space)
+        XCTAssertEqual(review.groups.flatMap(\.rows).map(\.checked), [false, false, true])
+        XCTAssertTrue(window.seen().has("Keep 1"))
+
+        window.press(.return)
+        await waitUntil { review.shown?.screen == .partlyDone(kept: 1, left: 2) }
+        XCTAssertEqual(ReviewServer.saves.map(\.path), ["/api/meetings/3f95ffd6-fd1e-4640-aacc-89e1c051f742/suggestions/\(ids[2].uuidString.lowercased())"])
+        XCTAssertTrue(window.seen().has("1 item tracked"))
+
+        window.press(.escape)
+        XCTAssertNil(review.shown)
+        XCTAssertFalse(window.seen().has("tracked"))
+    }
+
+    func test_everyControlInTheReview_hasASpokenName() async throws {
+        let review = try await readyReview([row(UUID(), "Send the budget"), row(UUID(), "Vendor may slip", confidence: 0.6)])
+        let window = KeyWindow(panel(review))
+        XCTAssertEqual(window.controls().map(\.label).sorted(), [
+            "Close review", "Keep 1", "Keep: Send the budget", "Keep: Vendor may slip", "Nov 25. Change", "Nov 25. Change",
+            "Open recap", "Priya Shah. Change", "Priya Shah. Change", "Skip the rest",
+        ])
+
+        await review.keep()
+        await review.skipRest()
+        XCTAssertEqual(review.shown?.doneLine, "1 item tracked")
+        window.spin(0.3)
+        XCTAssertEqual(window.controls().map(\.label).sorted(), ["Close review", "Done", "Open recap"])
+    }
+
+    func test_aLongTitle_showsTwoLines_andTheWholeTitleOnHover() async throws {
+        let title = "Send the revised quarterly budget to finance once the vendor confirms the renewal price and the team has signed off on headcount for the spring"
+        let review = try await readyReview([row(UUID(), title)])
+        let window = KeyWindow(panel(review))
+        let seen = window.seen()
+        XCTAssertTrue(seen.has("Send the revised quarterly"), seen.text)
+        XCTAssertFalse(seen.has("headcount for the spring"), "clamped to two lines: \(seen.text)")
+        XCTAssertTrue(window.helps().contains(title))
+    }
+
+    func test_readyWithFiveNewItemsTwoUpdatesAndTheFooter_fitsThePanel() async throws {
+        var rows = try (1...5).map { try row(UUID(), "Follow up on item \($0) with the team") }
+        for n in 1...2 {
+            var update = try row(UUID(), "Contract renewed \(n)", confidence: 0.85, type: "status_update")
+            update["suggested_status"] = "in_progress"
+            rows.append(update)
+        }
+        let review = try await readyReview(rows, webOnly: 1)
+        for dark in [false, true] {
+            let size = Host.size(panel(review), dark: dark)
+            XCTAssertEqual(size.width, 320, "dark: \(dark)")
+            XCTAssertLessThanOrEqual(size.height, 520, "dark: \(dark)")
+            let seen = Host.text(panel(review), dark: dark)
+            for words in ["Keep 7", "Skip the rest", "Open recap", "1 more on the web", "Follow up on item 5", "In progress"] {
+                XCTAssertTrue(seen.has(words), "dark: \(dark) missing \(words): \(seen.text)")
+            }
+        }
+    }
+
+    func test_doneCheck_drawsAtOnceWithReduceMotion_andAnimatesWithout() async throws {
+        let review = try await readyReview([row(UUID(), "Send the budget")])
+        await review.keep()
+        XCTAssertEqual(review.shown?.doneLine, "1 item tracked")
+        let still = Self.okPixels(panel(review).environment(\.reduceMotionOverride, true))
+        let drawing = Self.okPixels(panel(review).environment(\.reduceMotionOverride, false))
+        XCTAssertGreaterThan(still, 50)
+        XCTAssertEqual(drawing, 0)
+    }
+
+    func test_notAvailable_isAPlainEndWithDoneAndOpenRecap_andNoCheck() async throws {
+        ReviewServer.put(try meeting(suggestions: nil))
+        let review = review()
+        await review.start(meetingId: meetingId).value
+        XCTAssertEqual(review.shown?.screen, .notAvailable)
+        let seen = Host.text(panel(review))
+        XCTAssertTrue(seen.has("Done"), seen.text)
+        XCTAssertTrue(seen.has("Open recap"), seen.text)
+        XCTAssertEqual(Self.okPixels(panel(review).environment(\.reduceMotionOverride, true)), 0)
+    }
+
+    func test_aDetectedMeeting_coversTheReview_andTheReviewComesBackAfter() async throws {
+        let app = app()
+        await app.authManager.adopt(testSupabase(instance), instance: instance)
+        app.apply(.signedIn)
+        ReviewServer.put(try meeting(rows: [row(UUID(), "Send the budget")]))
+        app.presentRecapCue(RecapCue(meetingId: meetingId, seriesId: nil, instance: instance))
+        await waitUntil { app.review.shown?.screen == .ready }
+        let menu = MenuContent(controller: app, updater: UpdaterController())
+        XCTAssertTrue(Host.text(menu).has("Send the budget"))
+
+        app.handleDetection(.high(.zoom))
+        let during = Host.text(menu)
+        XCTAssertFalse(during.has("Send the budget"), during.text)
+        XCTAssertTrue(during.has("Zoom"), during.text)
+
+        app.handleDetection(.none)
+        let after = Host.text(menu)
+        XCTAssertTrue(after.has("Send the budget"), after.text)
+    }
+
+    private static func okPixels<V: View>(_ root: V) -> Int {
+        guard let image = Host.render(root, spin: 0.05) else { return 0 }
+        let (width, height, data) = Host.pixels(image)
+        return (0..<(width * height)).filter { index in
+            abs(Int(data[index * 4]) - 0x2D) < 14 && abs(Int(data[index * 4 + 1]) - 0x7A) < 14 && abs(Int(data[index * 4 + 2]) - 0x4B) < 14
+        }.count
+    }
+}
+
+/// A focused, key window holding a view, so real key presses reach SwiftUI.
+@MainActor
+final class KeyWindow {
+    enum Key { case up, down, space, `return`, escape }
+    private let window: NSWindow
+    private let hosting: NSHostingView<AnyView>
+
+    init<V: View>(_ root: V) {
+        hosting = NSHostingView(rootView: AnyView(root.background(Host.backdrop(dark: false)).environment(\.colorScheme, .light)))
+        hosting.appearance = NSAppearance(named: .aqua)
+        hosting.frame = NSRect(origin: .zero, size: hosting.fittingSize)
+        window = NSWindow(contentRect: hosting.frame, styleMask: [.titled], backing: .buffered, defer: false)
+        window.appearance = hosting.appearance
+        window.contentView = hosting
+        NSApplication.shared.activate()
+        window.makeKeyAndOrderFront(nil)
+        spin(0.5)
+    }
+
+    deinit { MainActor.assumeIsolated { window.orderOut(nil) } }
+
+    func spin(_ seconds: TimeInterval) { RunLoop.current.run(until: Date().addingTimeInterval(seconds)) }
+
+    func press(_ key: Key) {
+        let (code, text): (UInt16, String) = switch key {
+        case .up: (126, String(UnicodeScalar(NSUpArrowFunctionKey)!))
+        case .down: (125, String(UnicodeScalar(NSDownArrowFunctionKey)!))
+        case .space: (49, " ")
+        case .return: (36, "\r")
+        case .escape: (53, "\u{1B}")
+        }
+        let flags: NSEvent.ModifierFlags = [.up, .down].contains(key) ? [.numericPad, .function] : []
+        for type in [NSEvent.EventType.keyDown, .keyUp] {
+            window.sendEvent(NSEvent.keyEvent(
+                with: type, location: .zero, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber, context: nil, characters: text, charactersIgnoringModifiers: text,
+                isARepeat: false, keyCode: code)!)
+        }
+        spin(0.2)
+    }
+
+    func seen() -> Seen {
+        hosting.frame = NSRect(origin: .zero, size: hosting.fittingSize)
+        spin(0.2)
+        hosting.layoutSubtreeIfNeeded()
+        return Host.capture(hosting).map(Host.read) ?? Seen(text: "", frames: [])
+    }
+
+    private func elements() -> [NSObject] {
+        // SwiftUI builds its accessibility tree only once an accessibility client asks for it.
+        var windows: CFTypeRef?
+        AXUIElementCopyAttributeValue(AXUIElementCreateApplication(getpid()), kAXWindowsAttribute as CFString, &windows)
+        spin(0.3)
+        var found: [NSObject] = []
+        func walk(_ node: NSObject) {
+            for case let child as NSObject in Self.ask(node, #selector(NSAccessibilityProtocol.accessibilityChildren)) as? [Any] ?? [] {
+                found.append(child)
+                walk(child)
+            }
+        }
+        walk(hosting)
+        return found
+    }
+
+    /// SwiftUI's accessibility nodes answer the accessibility selectors without declaring the protocol.
+    private static func ask(_ node: NSObject, _ selector: Selector) -> Any? {
+        node.responds(to: selector) ? node.perform(selector)?.takeUnretainedValue() : nil
+    }
+
+    func controls() -> [(role: String, label: String)] {
+        let roles: [NSAccessibility.Role] = [.button, .checkBox, .popUpButton, .menuButton, .link]
+        return elements().compactMap { node in
+            guard let role = Self.ask(node, #selector(NSAccessibilityProtocol.accessibilityRole)) as? String,
+                  roles.map(\.rawValue).contains(role) else { return nil }
+            let label = Self.ask(node, #selector(NSAccessibilityProtocol.accessibilityLabel)) as? String ?? ""
+            let title = Self.ask(node, #selector(NSAccessibilityProtocol.accessibilityTitle))
+            return (role, label.isEmpty ? (title as? NSAttributedString)?.string ?? title as? String ?? "" : label)
+        }
+    }
+
+    func helps() -> [String] {
+        elements().compactMap { Self.ask($0, #selector(NSAccessibilityProtocol.accessibilityHelp)) as? String }
     }
 }
