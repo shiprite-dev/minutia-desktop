@@ -1213,7 +1213,7 @@ final class AppController: NSObject, ObservableObject {
     // MARK: - Series
 
     private func loadSeries() async {
-        guard let client = authManager.client() else { return }
+        guard let client = authManager.client(), await !authManager.dropSessionIfRevoked() else { return }
         guard let fetched = try? await client.recordableSeries() else { return }
         seriesLoaded(fetched)
     }
@@ -1263,6 +1263,7 @@ final class AppController: NSObject, ObservableObject {
         startInFlight = true
         Task {
             defer { startInFlight = false }
+            if await signedOutElsewhere() { return }
             var meetingId: UUID?
             do {
                 let meeting = try await client.startOrJoinMeeting(seriesId: seriesId)
@@ -1314,6 +1315,10 @@ final class AppController: NSObject, ObservableObject {
                 startInFlight = false
                 startingMeetingId = nil
             }
+            if await signedOutElsewhere() {
+                reportStartFailure("signed_out")
+                return
+            }
             do {
                 try await launchCapture(meetingId: meetingId, seriesId: seriesId, announce: claim != nil, client: client, routing: routing)
             } catch CaptureSession.CaptureError.alreadyRunning {
@@ -1328,6 +1333,15 @@ final class AppController: NSObject, ObservableObject {
                 }
             }
         }
+    }
+
+    /// A Record press is often the first use after the person signed out on the web; say so instead
+    /// of failing with a raw error or starting a meeting nobody owns.
+    private func signedOutElsewhere() async -> Bool {
+        guard await authManager.dropSessionIfRevoked() else { return false }
+        recordFeedback = AuthManager.signedOutNote
+        Self.postNotification(title: "Can't record yet", body: AuthManager.signedOutNote)
+        return true
     }
 
     private func launchCapture(meetingId: String, seriesId: UUID?, announce: Bool, client: MinutiaClient, routing: CaptureRouting) async throws {
