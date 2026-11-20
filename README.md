@@ -71,6 +71,10 @@ Minutia Desktop signs in to Minutia Cloud by default, so there is nothing to con
 - Recording starts only from a Record button press, an explicit notification action, or a meeting you started yourself on the web after choosing "Always start automatically" on this Mac. A notification with a Stop action always appears when a web start begins recording; if notifications are denied, web starts always ask first in the menu.
 - While you are signed in, the app checks in with your Minutia instance every few seconds, sending this Mac's name and a random device id so the web can tell it is available.
 
+## Roadmap
+
+Minutia Desktop follows the product roadmap in the [Minutia README](https://github.com/shiprite-dev/minutia#roadmap).
+
 ## License
 
 MIT, see [LICENSE](LICENSE). Third-party models and libraries (Parakeet Ultra, NVIDIA Parakeet, FluidAudio) are listed in [NOTICE](NOTICE).
