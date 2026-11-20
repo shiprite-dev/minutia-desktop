@@ -559,11 +559,11 @@ struct ReviewMeeting: Decodable, Equatable {
     let meetingId: UUID
     let seriesId: UUID
     let seriesName: String
-    let endedAt: Date
-    let transcriptionStatus: String
-    let suggestionsStatus: String
+    let endedAt: Date?
+    let transcriptionStatus: String?
+    let suggestionsStatus: String?
     let suggestionsReason: String?
-    let statusAt: Date
+    let statusAt: Date?
     let reviewer: Bool
     let members: [ReviewMember]
     let rows: [ReviewRow]

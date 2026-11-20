@@ -37,6 +37,9 @@ struct ReviewModel: Equatable {
     static let failedAfter: TimeInterval = 600
     static let elapsedAfter: TimeInterval = 20
 
+    var meetingId: UUID?
+    var statusAt: Date?
+    var aliases: [UUID: UUID] = [:]
     var screen: ReviewScreen
     var newRows: [ReviewRow] = []
     var updateRows: [ReviewRow] = []
@@ -63,9 +66,21 @@ struct ReviewModel: Equatable {
     }
 
     static func from(_ meeting: ReviewMeeting, now: Date, previous: ReviewModel?) -> ReviewModel {
-        let transcribingFor = now.timeIntervalSince(meeting.endedAt)
-        let findingFor = now.timeIntervalSince(meeting.statusAt)
+        let previous = previous.flatMap { $0.meetingId == meeting.meetingId ? $0 : nil }
+        var model = screen(for: meeting, now: now, previous: previous)
+        model.meetingId = meeting.meetingId
+        model.statusAt = meeting.statusAt
+        return model
+    }
+
+    private static func screen(for meeting: ReviewMeeting, now: Date, previous: ReviewModel?) -> ReviewModel {
+        let transcribingFor = meeting.endedAt.map { now.timeIntervalSince($0) } ?? 0
+        let findingFor = meeting.statusAt.map { now.timeIntervalSince($0) } ?? 0
         switch (meeting.transcriptionStatus, meeting.suggestionsStatus, meeting.suggestionsReason) {
+        case (nil, _, _) where meeting.rows.isEmpty:
+            return ReviewModel(screen: .notAvailable)
+        case (_, nil, _):
+            return ReviewModel(screen: .notAvailable)
         case ("failed", _, _):
             return ReviewModel(screen: .transcriptionFailed)
         case ("pending", _, _), ("processing", _, _):
@@ -87,24 +102,38 @@ struct ReviewModel: Equatable {
     }
 
     private static func ready(_ meeting: ReviewMeeting, previous: ReviewModel?) -> ReviewModel {
-        let all = meeting.rows.filter { $0.type == "new_item" }
+        let carried = (previous?.newRows ?? []) + (previous?.updateRows ?? [])
+        let resolved = carried.filter { (previous?.rowState[$0.id] ?? .idle).isResolved }
+        let resolvedIds = Set(resolved.map(\.id))
+        let fresh = meeting.rows.filter { !resolvedIds.contains($0.id) }
+        let all = fresh.filter { $0.type == "new_item" }
         let ordered = all.filter { $0.confidence >= confident } + all.filter { $0.confidence < confident }
         let shownNew = Array(ordered.prefix(shownNewRows))
-        let updates = meeting.rows.filter { $0.type == "status_update" }
+        let updates = fresh.filter { $0.type == "status_update" }
         let more = meeting.webOnlyCount + ordered.count - shownNew.count
-        guard !(shownNew + updates).isEmpty else {
+        let keptNew = resolved.filter { $0.type == "new_item" }, keptUpdates = resolved.filter { $0.type == "status_update" }
+        guard !(shownNew + updates + resolved).isEmpty else {
             return ReviewModel(screen: .none(moreOnWeb: more), moreOnWeb: more, readOnly: !meeting.reviewer)
         }
         var model = ReviewModel(
-            screen: .ready, newRows: shownNew, updateRows: updates, moreOnWeb: more, readOnly: !meeting.reviewer)
+            screen: .ready, newRows: keptNew + shownNew, updateRows: keptUpdates + updates, moreOnWeb: more,
+            readOnly: !meeting.reviewer)
+        for row in resolved {
+            model.rowState[row.id] = previous?.rowState[row.id]
+            if previous?.selection.contains(row.id) == true { model.selection.insert(row.id) }
+            model.edits[row.id] = previous?.edits[row.id]
+        }
+        model.aliases = previous?.aliases ?? [:]
         let earlier = Dictionary(
-            ((previous?.newRows ?? []) + (previous?.updateRows ?? [])).map { (normalizedTitle($0.title), $0) },
+            carried.filter { !resolvedIds.contains($0.id) }.map { (normalizedTitle($0.title), $0) },
             uniquingKeysWith: { first, _ in first })
         for row in shownNew + updates {
             if let old = earlier[normalizedTitle(row.title)], let previous {
                 if previous.selection.contains(old.id) { model.selection.insert(row.id) }
                 model.edits[row.id] = previous.edits[old.id]
-                model.rowState[row.id] = previous.rowState[row.id]
+                model.rowState[row.id] = previous.rowState[old.id]
+                model.aliases[row.id] = nil
+                if old.id != row.id { model.aliases[old.id] = row.id }
             } else if row.confidence >= confident {
                 model.selection.insert(row.id)
             }
@@ -112,15 +141,17 @@ struct ReviewModel: Equatable {
         if model.readOnly { model.selection = [] }
         if let previous {
             let present = Set((shownNew + updates).map { normalizedTitle($0.title) })
-            let vanished = (previous.newRows + previous.updateRows).contains {
-                !(previous.rowState[$0.id] ?? .idle).isResolved && !present.contains(normalizedTitle($0.title))
-            }
-            model.listUpdated = previous.listUpdated || vanished
+            let rerun = previous.statusAt != meeting.statusAt
+            let vanished = earlier.values.contains { !present.contains(normalizedTitle($0.title)) }
+            model.listUpdated = rerun ? vanished : previous.listUpdated
         }
+        model.settle()
         return model
     }
 
-    mutating func apply(_ result: ReviewSaveResult, to id: UUID) {
+    mutating func apply(_ result: ReviewSaveResult, to shownId: UUID) {
+        var id = shownId
+        while let next = aliases[id] { id = next }
         switch result {
         case .saved: rowState[id] = .saved
         case .alreadyReviewed, .cannotKeepDuplicate: rowState[id] = .gone(.alreadyReviewed)
@@ -145,7 +176,7 @@ struct ReviewModel: Equatable {
         guard open.count < shown.count, !open.contains(where: { selection.contains($0.id) }) else { return }
         let kept = newRows.filter { selection.contains($0.id) && rowState[$0.id] == .saved }.count
         let updated = updateRows.filter { selection.contains($0.id) && rowState[$0.id] == .saved }.count
-        screen = open.isEmpty ? .done(kept: kept, updated: updated) : .partlyDone(kept: kept, left: open.count)
+        screen = open.isEmpty ? .done(kept: kept, updated: updated) : .partlyDone(kept: kept + updated, left: open.count)
     }
 
     var doneLine: String { screen.message }

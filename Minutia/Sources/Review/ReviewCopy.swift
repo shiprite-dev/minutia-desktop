@@ -35,7 +35,7 @@ enum ReviewCopy {
     static func keep(_ n: Int) -> String { "Keep \(n)" }
     static func moreOnWeb(_ n: Int) -> String { "\(n) more on the web" }
 
-    static func tracked(_ n: Int) -> String { "\(n) \(n == 1 ? "item" : "items") tracked" }
+    static func tracked(_ n: Int) -> String { "\(n == 0 ? "No" : "\(n)") \(n == 1 ? "item" : "items") tracked" }
 
     static func done(kept: Int, updated: Int) -> String {
         var parts: [String] = []

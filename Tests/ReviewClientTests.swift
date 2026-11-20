@@ -117,6 +117,28 @@ final class ReviewClientTests: XCTestCase {
         XCTAssertEqual(ReviewStub.seen.last?.value(forHTTPHeaderField: "Authorization"), "Bearer test-access-token")
     }
 
+    func test_queueList_anOlderMeetingWithNullStatusFieldsStillDecodesAndShowsNotAvailable() async throws {
+        let url = try XCTUnwrap(Bundle(for: ReviewClientTests.self).url(forResource: "review-queue-list", withExtension: "json"))
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        var older = try XCTUnwrap((json["meetings"] as? [[String: Any]])?.first)
+        for key in ["ended_at", "transcription_status", "suggestions_status", "status_at"] { older[key] = NSNull() }
+        older["meeting_id"] = "11111111-1111-4111-8111-111111111111"
+        older["rows"] = [[String: Any]]()
+        json["meetings"] = (json["meetings"] as! [[String: Any]]) + [older]
+        respond(200, String(decoding: try JSONSerialization.data(withJSONObject: json), as: UTF8.self))
+
+        let queue = try await client().reviewQueue(meetingId: nil)
+
+        XCTAssertEqual(queue.meetings.count, 2)
+        let nullOne = queue.meetings[1]
+        XCTAssertNil(nullOne.endedAt)
+        XCTAssertNil(nullOne.transcriptionStatus)
+        XCTAssertNil(nullOne.suggestionsStatus)
+        XCTAssertNil(nullOne.statusAt)
+        XCTAssertEqual(ReviewModel.from(nullOne, now: Date(), previous: nil).screen, .notAvailable)
+        XCTAssertEqual(ReviewModel.from(queue.meetings[0], now: Date(), previous: nil).screen, .ready)
+    }
+
     func test_queueForOneMeeting_asksForThatMeetingInLowercase() async throws {
         respond(200, try fixture("review-queue-meeting"))
         let queue = try await client().reviewQueue(meetingId: meeting)
