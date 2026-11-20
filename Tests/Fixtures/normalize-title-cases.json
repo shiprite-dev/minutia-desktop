@@ -1,0 +1,30 @@
+[
+  {
+    "input": "  Send  the\tPricing   Draft.  ",
+    "expected": "send the pricing draft"
+  },
+  {
+    "input": "Ship it!?",
+    "expected": "ship it"
+  },
+  {
+    "input": "Book Acme interview",
+    "expected": "book acme interview"
+  },
+  {
+    "input": "Send the draft。",
+    "expected": "send the draft"
+  },
+  {
+    "input": "Send　the　draft",
+    "expected": "send the draft"
+  },
+  {
+    "input": "Send the draft　！",
+    "expected": "send the draft"
+  },
+  {
+    "input": "Send the draft to Acme",
+    "expected": "send the draft to acme"
+  }
+]
