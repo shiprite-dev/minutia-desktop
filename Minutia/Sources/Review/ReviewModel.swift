@@ -123,26 +123,31 @@ struct ReviewModel: Equatable {
             if previous?.selection.contains(row.id) == true { model.selection.insert(row.id) }
             model.edits[row.id] = previous?.edits[row.id]
         }
-        model.aliases = previous?.aliases ?? [:]
-        let earlier = Dictionary(
-            carried.filter { !resolvedIds.contains($0.id) }.map { (normalizedTitle($0.title), $0) },
-            uniquingKeysWith: { first, _ in first })
+        let unresolved = carried.filter { !resolvedIds.contains($0.id) }
+        var earlier = Dictionary(grouping: unresolved, by: { normalizedTitle($0.title) })
+        var aliases = previous?.aliases ?? [:]
         for row in shownNew + updates {
-            if let old = earlier[normalizedTitle(row.title)], let previous {
+            let key = normalizedTitle(row.title)
+            if let previous, let old = earlier[key]?.first {
+                earlier[key]?.removeFirst()
                 if previous.selection.contains(old.id) { model.selection.insert(row.id) }
                 model.edits[row.id] = previous.edits[old.id]
                 model.rowState[row.id] = previous.rowState[old.id]
-                model.aliases[row.id] = nil
-                if old.id != row.id { model.aliases[old.id] = row.id }
-            } else if row.confidence >= confident {
+                aliases[row.id] = nil
+                if old.id != row.id {
+                    aliases = aliases.mapValues { $0 == old.id ? row.id : $0 }
+                    aliases[old.id] = row.id
+                }
+            } else if earlier[key] == nil && row.confidence >= confident {
                 model.selection.insert(row.id)
             }
         }
+        model.aliases = aliases.filter { model.rowState[$0.value] == .saving }
         if model.readOnly { model.selection = [] }
         if let previous {
             let present = Set((shownNew + updates).map { normalizedTitle($0.title) })
             let rerun = previous.statusAt != meeting.statusAt
-            let vanished = earlier.values.contains { !present.contains(normalizedTitle($0.title)) }
+            let vanished = unresolved.contains { !present.contains(normalizedTitle($0.title)) }
             model.listUpdated = rerun ? vanished : previous.listUpdated
         }
         model.settle()
@@ -150,8 +155,7 @@ struct ReviewModel: Equatable {
     }
 
     mutating func apply(_ result: ReviewSaveResult, to shownId: UUID) {
-        var id = shownId
-        while let next = aliases[id] { id = next }
+        let id = aliases[shownId] ?? shownId
         switch result {
         case .saved: rowState[id] = .saved
         case .alreadyReviewed, .cannotKeepDuplicate: rowState[id] = .gone(.alreadyReviewed)

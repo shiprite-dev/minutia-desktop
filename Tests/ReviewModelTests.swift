@@ -374,6 +374,44 @@ final class ReviewModelTests: XCTestCase {
         XCTAssertEqual(m.rowState[m.newRows[0].id], .saved)
     }
 
+    func test_rerun_twoRowsWithTheSameTitle_eachTakesItsOwnOldRowSoNoneIsStuckSaving() {
+        let first = row("Send the budget"), second = row("Send the budget")
+        var before = ReviewModel.from(meeting(rows: [first, second]), now: now, previous: nil)
+        before.rowState[first.id] = .saving
+        before.selection = [first.id]
+        var after = ReviewModel.from(
+            meeting(statusAgo: 300, rows: [row("Send the budget"), row("Send the budget")]), now: now, previous: before)
+        let shown = after.newRows.map(\.id)
+        XCTAssertEqual(shown.map { after.rowState[$0] ?? .idle }, [.saving, .idle])
+        XCTAssertEqual(after.selection, [shown[0]])
+        after.apply(.saved, to: first.id)
+        XCTAssertEqual(after.rowState[shown[0]], .saved)
+        XCTAssertEqual(after.rowState[shown[1]] ?? .idle, .idle)
+    }
+
+    func test_rerun_aThirdSameTitleRowWithNoOldRowStartsIdleAndUnselected() {
+        let before = ReviewModel.from(meeting(rows: [row("Ship it"), row("Ship it")]), now: now, previous: nil)
+        let after = ReviewModel.from(
+            meeting(statusAgo: 300, rows: [row("Ship it"), row("Ship it"), row("Ship it")]), now: now, previous: before)
+        XCTAssertEqual(after.selection.count, 2)
+        XCTAssertFalse(after.selection.contains(after.newRows[2].id))
+    }
+
+    func test_manyRerunsInARow_aliasesAreDroppedOnceNothingIsInFlight() {
+        var m = ReviewModel.from(meeting(rows: [row("Ship it")]), now: now, previous: nil)
+        for n in 1...5 {
+            m = ReviewModel.from(meeting(statusAgo: TimeInterval(600 - n), rows: [row("Ship it")]), now: now, previous: m)
+        }
+        XCTAssertEqual(m.aliases.count, 0)
+        m.rowState[m.newRows[0].id] = .saving
+        let before = m.newRows[0].id
+        m = ReviewModel.from(meeting(statusAgo: 100, rows: [row("Ship it")]), now: now, previous: m)
+        XCTAssertEqual(m.aliases.count, 1)
+        m.apply(.saved, to: before)
+        m = ReviewModel.from(meeting(statusAgo: 50, rows: []), now: now, previous: m)
+        XCTAssertEqual(m.aliases.count, 0)
+    }
+
     func test_plainRefresh_rowsReviewedOnTheWebJustVanishWithoutAListUpdatedNote() {
         let a = row("A"), b = row("B")
         let before = ReviewModel.from(meeting(rows: [a, b]), now: now, previous: nil)
