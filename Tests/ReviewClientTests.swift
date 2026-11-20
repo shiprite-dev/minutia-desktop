@@ -58,11 +58,22 @@ final class ReviewClientTests: XCTestCase {
         super.tearDown()
     }
 
-    private func client() -> MinutiaClient {
+    private final class Refreshes: @unchecked Sendable { var count = 0 }
+
+    private func client(refreshes: Refreshes = Refreshes()) -> MinutiaClient {
         MinutiaClient(
             instance: instance,
             supabase: testSupabase(URL(string: "https://supabase.example.com")!),
-            tokenProvider: { "test-access-token" })
+            tokenProvider: { "test-access-token" },
+            freshTokenProvider: { refreshes.count += 1; return "refreshed-token" })
+    }
+
+    private func authorizations() -> [String?] { ReviewStub.seen.map { $0.value(forHTTPHeaderField: "Authorization") } }
+
+    private let notSignedIn = "{\"error\":\"Not authenticated\",\"code\":\"not_signed_in\",\"request_id\":\"8c1c2f3e-6a52-4f55-9d0b-0d1f7d9f9c11\"}"
+    private let staleToken = "{\"error\":\"Sign in again to open this meeting.\",\"code\":\"stale_token\"}"
+    private func body(_ index: Int = 0) -> [String: Any]? {
+        try? JSONSerialization.jsonObject(with: ReviewStub.seenBodies[index]) as? [String: Any]
     }
 
     private func fixture(_ name: String) throws -> String {
@@ -110,6 +121,7 @@ final class ReviewClientTests: XCTestCase {
         respond(200, try fixture("review-queue-meeting"))
         let queue = try await client().reviewQueue(meetingId: meeting)
 
+        XCTAssertEqual(queue.meetings.map(\.meetingId), [UUID(uuidString: "b72f2ff6-6b82-4621-840a-64616835651b")!])
         XCTAssertEqual(queue.meetings[0].rows.map(\.title), ["Send the budget", "Vendor may slip", "Contract renewed"])
         XCTAssertEqual(ReviewStub.seen.last?.url?.query, "meeting=3f95ffd6-fd1e-4640-aacc-89e1c051f742")
     }
@@ -172,16 +184,15 @@ final class ReviewClientTests: XCTestCase {
     func test_clearingTheDueDate_sendsNullNotAbsent() async {
         respond(200, "{\"code\":\"saved\"}")
         _ = await save(due: .clear)
-        let raw = String(data: ReviewStub.seenBodies[0], encoding: .utf8) ?? ""
-        XCTAssertTrue(raw.contains("\"due_date\":null"), raw)
+        let parsed = body()
+        XCTAssertEqual(parsed?.keys.contains("due_date"), true)
+        XCTAssertTrue(parsed?["due_date"] is NSNull)
     }
 
     func test_leavingTheDueDate_omitsTheField() async {
         respond(200, "{\"code\":\"saved\"}")
         _ = await save(owner: UUID(), due: .leave)
-        let body = try? JSONSerialization.jsonObject(with: ReviewStub.seenBodies[0]) as? [String: Any]
-        XCTAssertNil(body?["due_date"])
-        XCTAssertFalse((String(data: ReviewStub.seenBodies[0], encoding: .utf8) ?? "").contains("due_date"))
+        XCTAssertEqual(body()?.keys.contains("due_date"), false)
     }
 
     func test_everyRefusalMapsToWhatThePersonSees() async {
@@ -194,19 +205,29 @@ final class ReviewClientTests: XCTestCase {
             (400, "not_a_member", .notAMember),
             (400, "cannot_keep_duplicate", .cannotKeepDuplicate),
             (400, "invalid_request", .invalidRequest),
-            (500, "boom", .retryable),
+            (400, "not_linked", .invalidRequest),
+            (400, "no_target_status", .invalidRequest),
+            (500, "save_failed", .retryable),
             (503, "unavailable", .retryable),
-            (418, "something_new", .retryable),
+            (429, "rate_limited", .retryable),
+            (418, "something_new", .invalidRequest),
+            (422, "", .invalidRequest),
         ]
         for (status, code, expected) in cases {
-            respond(status, "{\"code\":\"\(code)\"}")
+            respond(status, "{\"error\":\"Server words\",\"code\":\"\(code)\",\"request_id\":\"r\"}")
             let result = await save()
             XCTAssertEqual(result, expected, "\(status) \(code)")
         }
     }
 
     func test_signedOutSave_isNotRetried() async {
-        respond(401, "{}")
+        respond(401, notSignedIn)
+        let result = await save()
+        XCTAssertEqual(result, .signedOut)
+    }
+
+    func test_signedOutSave_withAnyBody_isStillSignedOut() async {
+        respond(401, "")
         let result = await save()
         XCTAssertEqual(result, .signedOut)
     }
@@ -229,7 +250,19 @@ final class ReviewClientTests: XCTestCase {
         do {
             try await client().regenerateSuggestions(meetingId: meeting)
             XCTFail("expected throw")
-        } catch {}
+        } catch {
+            XCTAssertEqual(error as? MinutiaClientError, .serverError(status: 500))
+        }
+    }
+
+    func test_regenerateWhileSignedOut_saysSignedOut() async {
+        respond(401, notSignedIn)
+        do {
+            try await client().regenerateSuggestions(meetingId: meeting)
+            XCTFail("expected throw")
+        } catch {
+            XCTAssertEqual(error as? MinutiaClientError, .signedOut)
+        }
     }
 
     func test_handoff_sendsOnlyTheDigestAndReturnsTheHandoffId() async throws {
@@ -243,23 +276,69 @@ final class ReviewClientTests: XCTestCase {
         XCTAssertEqual(body, ["nonce_digest": String(repeating: "a", count: 64)])
     }
 
-    func test_handoffRefused_throws() async {
+    func test_handoffRefused_throwsTheStatus() async {
         respond(429, "{}")
         do {
             _ = try await client().webSessionHandoff(nonceDigest: "x")
             XCTFail("expected throw")
-        } catch {}
+        } catch {
+            XCTAssertEqual(error as? MinutiaClientError, .serverError(status: 429))
+        }
+    }
+
+    func test_handoffWithAStaleToken_refreshesOnceAndRetriesOnce() async throws {
+        var calls = 0
+        ReviewStub.handler = { [staleToken] _ in
+            calls += 1
+            return calls == 1 ? .success((401, staleToken)) : .success((200, "{\"handoff_id\":\"h1\"}"))
+        }
+        let refreshes = Refreshes()
+        let id = try await client(refreshes: refreshes).webSessionHandoff(nonceDigest: String(repeating: "b", count: 64))
+
+        XCTAssertEqual(id, "h1")
+        XCTAssertEqual(refreshes.count, 1)
+        XCTAssertEqual(authorizations(), ["Bearer test-access-token", "Bearer refreshed-token"])
+    }
+
+    func test_handoffStaleTwice_saysSignedOut() async {
+        respond(401, staleToken)
+        let refreshes = Refreshes()
+        do {
+            _ = try await client(refreshes: refreshes).webSessionHandoff(nonceDigest: "x")
+            XCTFail("expected throw")
+        } catch {
+            XCTAssertEqual(error as? MinutiaClientError, .signedOut)
+        }
+        XCTAssertEqual(refreshes.count, 1)
+        XCTAssertEqual(ReviewStub.seen.count, 2)
+    }
+
+    func test_handoffNotSignedIn_saysSignedOutWithoutRefreshing() async {
+        respond(401, notSignedIn)
+        let refreshes = Refreshes()
+        do {
+            _ = try await client(refreshes: refreshes).webSessionHandoff(nonceDigest: "x")
+            XCTFail("expected throw")
+        } catch {
+            XCTAssertEqual(error as? MinutiaClientError, .signedOut)
+        }
+        XCTAssertEqual(refreshes.count, 0)
+        XCTAssertEqual(ReviewStub.seen.count, 1)
     }
 
     func test_windowRequest_postsAFormWithLowercaseIdsAndEncodedFields() throws {
         let request = MinutiaClient.companionSessionRequest(
-            instance: instance, handoffId: "id_1-x", nonce: "n+/=&", next: "/series/ABC?meeting=DEF&x=1")
+            instance: instance, handoffId: "id_1-x", nonce: "n+/=&",
+            next: "/series/B6008C45-D6ED-4CD8-BCE4-9646A5994F0B?meeting=3F95FFD6-FD1E-4640-AACC-89E1C051F742&Tab=Notes")
 
         XCTAssertEqual(request.httpMethod, "POST")
         XCTAssertEqual(request.url?.absoluteString, "https://minutia.example.com/auth/companion-session")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/x-www-form-urlencoded")
         let body = String(data: try XCTUnwrap(request.httpBody), encoding: .utf8)
-        XCTAssertEqual(body, "handoff_id=id_1-x&nonce=n%2B%2F%3D%26&next=%2Fseries%2FABC%3Fmeeting%3DDEF%26x%3D1")
+        XCTAssertEqual(
+            body,
+            "handoff_id=id_1-x&nonce=n%2B%2F%3D%26&next=%2Fseries%2Fb6008c45-d6ed-4cd8-bce4-9646a5994f0b"
+                + "%3Fmeeting%3D3f95ffd6-fd1e-4640-aacc-89e1c051f742%26Tab%3DNotes")
     }
 
     func test_nonceDigest_matchesAHandComputedSHA256() {

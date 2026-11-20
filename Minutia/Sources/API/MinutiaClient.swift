@@ -40,6 +40,8 @@ enum MinutiaClientError: Error, Equatable {
     /// The transcribe route answered 503: the server has no working transcription provider, so
     /// nothing was transcribed and the local recording must be kept for a later retry.
     case transcriptionNotConfigured
+    /// The server refused the access token: the person has to sign in again.
+    case signedOut
 }
 
 struct CheckinClaim: Equatable {
@@ -65,6 +67,8 @@ struct MinutiaClient {
     let instance: URL
     let supabase: SupabaseClient
     let tokenProvider: () async throws -> String
+    /// Forces a token refresh; used where the server only accepts a recently issued token.
+    var freshTokenProvider: (() async throws -> String)?
 
     static let audioBucket = "meeting-audio"
 
@@ -611,8 +615,14 @@ extension MinutiaClient {
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
         let encode = { (value: String) in value.addingPercentEncoding(withAllowedCharacters: unreserved) ?? "" }
+        let uuid = try! NSRegularExpression(pattern: "[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
+        var lowered = next
+        for match in uuid.matches(in: next, range: NSRange(next.startIndex..., in: next)).reversed() {
+            let range = Range(match.range, in: lowered)!
+            lowered.replaceSubrange(range, with: lowered[range].lowercased())
+        }
         request.httpBody = Data(
-            [("handoff_id", handoffId), ("nonce", nonce), ("next", next)]
+            [("handoff_id", handoffId), ("nonce", nonce), ("next", lowered)]
                 .map { "\($0.0)=\(encode($0.1))" }.joined(separator: "&").utf8)
         return request
     }
@@ -661,7 +671,8 @@ extension MinutiaClient {
         guard let (data, response) = try? await URLSession.shared.data(for: request) else { return .retryable }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if (200...299).contains(status) { return .saved }
-        if status == 401, Self.errorCode(from: data) == nil { return .signedOut }
+        if status == 401 { return .signedOut }
+        if status == 0 || status == 408 || status == 429 || status >= 500 { return .retryable }
         switch Self.errorCode(from: data) {
         case "already_reviewed": return .alreadyReviewed
         case "already_in_state": return .alreadyInState
@@ -670,8 +681,7 @@ extension MinutiaClient {
         case "not_reviewer": return .notReviewer
         case "not_a_member": return .notAMember
         case "cannot_keep_duplicate": return .cannotKeepDuplicate
-        case "invalid_request": return .invalidRequest
-        default: return .retryable
+        default: return .invalidRequest
         }
     }
 
@@ -681,21 +691,32 @@ extension MinutiaClient {
             method: "POST", token: try await tokenProvider())
         let (_, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if status == 401 { throw MinutiaClientError.signedOut }
         guard (200...299).contains(status) else { throw MinutiaClientError.serverError(status: status) }
     }
 
+    /// The server only accepts a token issued in the last few minutes: on "stale_token" the token is
+    /// refreshed and the request sent once more.
     func webSessionHandoff(nonceDigest: String) async throws -> String {
-        var request = Self.bearerRequest(
-            instance.appendingPathComponent("api/companion/web-session"), method: "POST",
-            token: try await tokenProvider())
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["nonce_digest": nonceDigest])
-        let (data, response) = try await URLSession.shared.data(for: request)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         struct Envelope: Decodable { let handoffId: String }
-        guard (200...299).contains(status),
-              let id = try? Self.reviewDecoder.decode(Envelope.self, from: data).handoffId
-        else { throw MinutiaClientError.serverError(status: status) }
-        return id
+        var token = try await tokenProvider()
+        for attempt in 0..<2 {
+            var request = Self.bearerRequest(
+                instance.appendingPathComponent("api/companion/web-session"), method: "POST", token: token)
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: ["nonce_digest": nonceDigest])
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if status == 401 {
+                guard attempt == 0, Self.errorCode(from: data) == "stale_token" else { throw MinutiaClientError.signedOut }
+                token = try await (freshTokenProvider ?? tokenProvider)()
+                continue
+            }
+            guard (200...299).contains(status),
+                  let id = try? Self.reviewDecoder.decode(Envelope.self, from: data).handoffId
+            else { throw MinutiaClientError.serverError(status: status) }
+            return id
+        }
+        throw MinutiaClientError.signedOut
     }
 }

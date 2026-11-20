@@ -436,13 +436,24 @@ final class AuthManager: ObservableObject {
         return try await supabase.auth.session.accessToken
     }
 
+    func freshAccessToken() async throws -> String {
+        guard let supabase else { throw AuthError.notConnected }
+        return try await supabase.auth.refreshSession().accessToken
+    }
+
     /// The API client for the connected instance, available once signed in.
     func client() -> MinutiaClient? {
         guard let supabase, let instance else { return nil }
-        return MinutiaClient(instance: instance, supabase: supabase) { [weak self] in
-            guard let self else { throw AuthError.notConnected }
-            return try await self.accessToken()
-        }
+        return MinutiaClient(
+            instance: instance, supabase: supabase,
+            tokenProvider: { [weak self] in
+                guard let self else { throw AuthError.notConnected }
+                return try await self.accessToken()
+            },
+            freshTokenProvider: { [weak self] in
+                guard let self else { throw AuthError.notConnected }
+                return try await self.freshAccessToken()
+            })
     }
 
     static let signedOutNote = "You were signed out. Sign in again to record."
