@@ -74,7 +74,7 @@ final class ReviewClientTests: XCTestCase {
         ReviewStub.handler = { _ in .success((status, body)) }
     }
 
-    private func save(action: ReviewAction = .accept, owner: UUID? = nil, due: String? = nil) async -> ReviewSaveResult {
+    private func save(action: ReviewAction = .accept, owner: UUID? = nil, due: DueDateChange = .leave) async -> ReviewSaveResult {
         await client().review(meetingId: meeting, suggestionId: suggestion, action: action, ownerUserId: owner, dueDate: due)
     }
 
@@ -147,7 +147,7 @@ final class ReviewClientTests: XCTestCase {
     func test_saving_sendsTheEditsAndReportsSaved() async {
         respond(200, "{\"suggestion\":{},\"code\":\"saved\"}")
         let owner = UUID(uuidString: "EC4109B3-9E36-4A3D-8701-AC066AF779F1")!
-        let result = await save(owner: owner, due: "2026-11-27")
+        let result = await save(owner: owner, due: .set("2026-11-27"))
 
         XCTAssertEqual(result, .saved)
         let request = ReviewStub.seen[0]
@@ -158,6 +158,7 @@ final class ReviewClientTests: XCTestCase {
         XCTAssertEqual(body?["action"] as? String, "accept")
         XCTAssertEqual(body?["owner_user_id"] as? String, "ec4109b3-9e36-4a3d-8701-ac066af779f1")
         XCTAssertEqual(body?["due_date"] as? String, "2026-11-27")
+        XCTAssertTrue((String(data: ReviewStub.seenBodies[0], encoding: .utf8) ?? "").contains("\"due_date\":\"2026-11-27\""))
     }
 
     func test_skipping_sendsRejectWithoutEdits() async {
@@ -170,9 +171,17 @@ final class ReviewClientTests: XCTestCase {
 
     func test_clearingTheDueDate_sendsNullNotAbsent() async {
         respond(200, "{\"code\":\"saved\"}")
-        _ = await save(due: "")
+        _ = await save(due: .clear)
         let raw = String(data: ReviewStub.seenBodies[0], encoding: .utf8) ?? ""
         XCTAssertTrue(raw.contains("\"due_date\":null"), raw)
+    }
+
+    func test_leavingTheDueDate_omitsTheField() async {
+        respond(200, "{\"code\":\"saved\"}")
+        _ = await save(owner: UUID(), due: .leave)
+        let body = try? JSONSerialization.jsonObject(with: ReviewStub.seenBodies[0]) as? [String: Any]
+        XCTAssertNil(body?["due_date"])
+        XCTAssertFalse((String(data: ReviewStub.seenBodies[0], encoding: .utf8) ?? "").contains("due_date"))
     }
 
     func test_everyRefusalMapsToWhatThePersonSees() async {

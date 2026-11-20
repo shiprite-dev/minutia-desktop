@@ -573,6 +573,8 @@ struct ReviewQueue: Decodable, Equatable {
 
 enum ReviewAction: String { case accept, reject }
 
+enum DueDateChange: Equatable { case leave, clear, set(String) }
+
 enum ReviewSaveResult: Equatable {
     case saved, alreadyReviewed, alreadyInState, suggestionGone, itemGone, notReviewer
     case notAMember, cannotKeepDuplicate, invalidRequest, signedOut, retryable
@@ -639,9 +641,8 @@ extension MinutiaClient {
         return queue
     }
 
-    /// `dueDate` nil leaves the date as suggested; an empty string clears it.
     func review(
-        meetingId: UUID, suggestionId: UUID, action: ReviewAction, ownerUserId: UUID?, dueDate: String?
+        meetingId: UUID, suggestionId: UUID, action: ReviewAction, ownerUserId: UUID?, dueDate: DueDateChange
     ) async -> ReviewSaveResult {
         guard let token = try? await tokenProvider() else { return .retryable }
         var request = Self.bearerRequest(
@@ -651,7 +652,11 @@ extension MinutiaClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         var body: [String: Any] = ["action": action.rawValue]
         if let ownerUserId { body["owner_user_id"] = ownerUserId.uuidString.lowercased() }
-        if let dueDate { body["due_date"] = dueDate.isEmpty ? NSNull() : dueDate }
+        switch dueDate {
+        case .leave: break
+        case .clear: body["due_date"] = NSNull()
+        case .set(let day): body["due_date"] = day
+        }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         guard let (data, response) = try? await URLSession.shared.data(for: request) else { return .retryable }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
