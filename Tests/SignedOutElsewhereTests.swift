@@ -6,12 +6,16 @@ import XCTest
 /// Stands in for the instance's sign-in server and API, and records every path the app calls.
 final class AuthServerStub: URLProtocol {
     nonisolated(unsafe) static var refresh: Result<(Int, String), URLError> = .success((200, "{}"))
+    nonisolated(unsafe) static var user: Result<(Int, String), URLError> = .success((200, userBody))
+    nonisolated(unsafe) static var signInBody = expiredSessionBody
     nonisolated(unsafe) static var calledPaths: [String] = []
     private static let lock = NSLock()
 
     static func reset() {
         lock.withLock {
             refresh = .success((200, "{}"))
+            user = .success((200, userBody))
+            signInBody = expiredSessionBody
             calledPaths = []
         }
     }
@@ -29,8 +33,9 @@ final class AuthServerStub: URLProtocol {
         Self.lock.withLock { Self.calledPaths.append(url.path + (grant.map { "?grant_type=\($0)" } ?? "")) }
         let outcome: Result<(Int, String), URLError>
         switch (url.path, grant) {
-        case ("/auth/v1/token", "password"): outcome = .success((200, Self.expiredSessionBody))
+        case ("/auth/v1/token", "password"): outcome = .success((200, Self.lock.withLock { Self.signInBody }))
         case ("/auth/v1/token", "refresh_token"): outcome = Self.lock.withLock { Self.refresh }
+        case ("/auth/v1/user", _): outcome = Self.lock.withLock { Self.user }
         default: outcome = .success((404, "{}"))
         }
         switch outcome {
@@ -46,16 +51,27 @@ final class AuthServerStub: URLProtocol {
         }
     }
 
+    static let userBody = """
+    {"id":"6f0d2c7a-1f43-4b8e-9d1a-2a6f3b9c4e10","aud":"authenticated","role":"authenticated",
+     "email":"first@example.com","app_metadata":{"provider":"email"},"user_metadata":{},
+     "created_at":"2026-11-20T09:00:00Z","updated_at":"2026-11-20T09:00:00Z"}
+    """
+
+    private static func sessionBody(expiresAt: Int) -> String {
+        "{\"access_token\":\"access\",\"token_type\":\"bearer\",\"expires_in\":3600,\"expires_at\":\(expiresAt),"
+            + "\"refresh_token\":\"old-refresh\",\"user\":\(userBody)}"
+    }
+
     /// A session whose access token has already run out, so the next use must refresh it.
-    static let expiredSessionBody: String = {
-        let expiredAt = Int(Date().timeIntervalSince1970) - 120
-        return """
-        {"access_token":"expired-access","token_type":"bearer","expires_in":3600,"expires_at":\(expiredAt),
-         "refresh_token":"old-refresh","user":{"id":"6f0d2c7a-1f43-4b8e-9d1a-2a6f3b9c4e10","aud":"authenticated",
-         "role":"authenticated","email":"first@example.com","app_metadata":{"provider":"email"},"user_metadata":{},
-         "created_at":"2026-11-20T09:00:00Z","updated_at":"2026-11-20T09:00:00Z"}}
-        """
-    }()
+    static var expiredSessionBody: String { sessionBody(expiresAt: Int(Date().timeIntervalSince1970) - 120) }
+
+    /// A session whose access token is still good for most of an hour: signing out on the web does
+    /// not touch it, only the server knows the session is gone.
+    static var validSessionBody: String { sessionBody(expiresAt: Int(Date().timeIntervalSince1970) + 3000) }
+
+    /// What the instance's sign-in server answers for a still-valid token whose session was ended
+    /// (GoTrue v2.158.1, API version 2024-01-01).
+    static let sessionEnded = "{\"code\":\"session_not_found\",\"message\":\"Session from session_id claim in JWT does not exist\"}"
 
     /// Exactly what the instance's sign-in server returns once the session was signed out on the
     /// web (captured from the self-host stack's GoTrue v2.158.1).
@@ -127,6 +143,31 @@ final class SignedOutElsewhereTests: XCTestCase {
         XCTAssertEqual(auth.callbackError, signedOutNote)
     }
 
+    func test_minutesAfterSigningOutOnTheWeb_whileTheMacsPassIsStillValid_itStillAsksToSignInAgain() async throws {
+        AuthServerStub.signInBody = AuthServerStub.validSessionBody
+        let auth = try await signedInAuthManager()
+        AuthServerStub.user = .success((403, AuthServerStub.sessionEnded))
+
+        let revoked = await auth.dropSessionIfRevoked()
+
+        XCTAssertTrue(revoked)
+        XCTAssertNil(auth.userEmail)
+        XCTAssertEqual(auth.callbackError, signedOutNote)
+        XCTAssertNil(auth.supabase?.auth.currentSession)
+    }
+
+    func test_stillSignedIn_offline_whileThePassIsValid_staysSignedIn() async throws {
+        AuthServerStub.signInBody = AuthServerStub.validSessionBody
+        let auth = try await signedInAuthManager()
+        AuthServerStub.user = .failure(URLError(.notConnectedToInternet))
+
+        let revoked = await auth.dropSessionIfRevoked()
+
+        XCTAssertFalse(revoked)
+        XCTAssertEqual(auth.userEmail, "first@example.com")
+        XCTAssertNil(auth.callbackError)
+    }
+
     func test_offline_theMacStaysSignedIn_andShowsNoSignedOutNote() async throws {
         let auth = try await signedInAuthManager()
         AuthServerStub.refresh = .failure(URLError(.notConnectedToInternet))
@@ -155,6 +196,7 @@ final class SignedOutElsewhereTests: XCTestCase {
     private func signedInController() async throws -> AppController {
         let controller = AppController(defaults: defaults, openURL: { _ in }, micCheck: { (.authorized, true) })
         controllers.append(controller)
+        AuthServerStub.signInBody = AuthServerStub.validSessionBody
         let client = testSupabase(supabaseURL)
         await controller.authManager.adopt(client, instance: instance)
         _ = try await client.auth.signIn(email: "first@example.com", password: "pw")
@@ -163,9 +205,9 @@ final class SignedOutElsewhereTests: XCTestCase {
         return controller
     }
 
-    func test_pressingRecord_afterSigningOutOnTheWeb_startsNoMeeting_andSaysToSignInAgain() async throws {
+    func test_pressingRecord_minutesAfterSigningOutOnTheWeb_startsNoMeeting_andSaysToSignInAgain() async throws {
         let controller = try await signedInController()
-        AuthServerStub.refresh = .success((400, AuthServerStub.signedOutOnTheWeb))
+        AuthServerStub.user = .success((403, AuthServerStub.sessionEnded))
 
         controller.startRecording()
         await waitUntil { controller.recordFeedback != nil }
@@ -177,9 +219,9 @@ final class SignedOutElsewhereTests: XCTestCase {
         XCTAssertNotEqual(controller.phase, .recording)
     }
 
-    func test_openingTheMenu_afterSigningOutOnTheWeb_saysToSignInAgain_beforeAnyClick() async throws {
+    func test_openingTheMenu_minutesAfterSigningOutOnTheWeb_saysToSignInAgain_beforeAnyClick() async throws {
         let controller = try await signedInController()
-        AuthServerStub.refresh = .success((400, AuthServerStub.signedOutOnTheWeb))
+        AuthServerStub.user = .success((403, AuthServerStub.sessionEnded))
 
         controller.reloadSeries()
         await waitUntil { controller.authManager.callbackError != nil }

@@ -447,14 +447,14 @@ final class AuthManager: ObservableObject {
 
     static let signedOutNote = "You were signed out. Sign in again to record."
 
-    /// Loads the session, refreshing it when due. When the server refuses the refresh because the
-    /// session was ended elsewhere (signed out on the web, which ends every session), the session is
-    /// dropped here and sign-in shows why. Losing the network or a server error keeps the user
-    /// signed in. Returns true only when the session was dropped.
+    /// Asks the server whether the session still exists (refreshing it first when due). Signing out
+    /// on the web ends every session, but the Mac's access token stays valid until it runs out, so
+    /// only the server can tell. An ended session is dropped here and sign-in shows why. Losing the
+    /// network or a server error keeps the user signed in. Returns true only when it was dropped.
     func dropSessionIfRevoked() async -> Bool {
         guard let supabase else { return false }
         do {
-            _ = try await supabase.auth.session
+            _ = try await supabase.auth.user()
             return false
         } catch {
             guard Self.isRevokedSession(error) else { return false }
