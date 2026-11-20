@@ -816,29 +816,74 @@ final class ReviewJourneyTests: XCTestCase {
         XCTAssertTrue(notices.isEmpty)
     }
 
-    func test_aMeetingThatOnlyShowsUpInTheQueue_isPostedOnce_evenAfterARestart() async throws {
-        let review = review()
-        ReviewServer.put(try meeting(rows: [row(UUID(), "Send the budget"), row(UUID(), "Book the Acme interview")], endedAgo: 3600))
-        await review.refreshQueue()
-        XCTAssertEqual(notices, [ReviewNotice(title: "2 action items from Weekly sync", meetingId: meetingId)])
-        await review.refreshQueue()
+    private func pending(_ title: String, _ id: UUID = UUID()) throws -> [String: Any] {
+        try meeting(id, rows: [row(UUID(), title)], endedAgo: 3600)
+    }
 
+    func test_firstQueueLoad_postsNothingForMeetingsAlreadyWaiting_andALaterOnePostsOnce() async throws {
+        let review = review()
+        for title in ["Send the budget", "Book the Acme interview", "Draft the hiring plan"] { ReviewServer.put(try pending(title)) }
+        await review.refreshQueue()
+        XCTAssertEqual(review.queueRows.count, 3)
+        XCTAssertTrue(notices.isEmpty, "meetings already waiting at the first load are not news")
+
+        let fourth = UUID()
+        ReviewServer.put(try pending("Vendor may slip", fourth))
+        await review.refreshQueue()
+        XCTAssertEqual(notices, [ReviewNotice(title: "1 action item from Weekly sync", meetingId: fourth)])
+        await review.refreshQueue()
+        XCTAssertEqual(notices.count, 1)
+
+        let fifth = UUID()
+        ReviewServer.put(try pending("Renew the contract", fifth))
         let restarted = self.review()
         await restarted.refreshQueue()
-        XCTAssertTrue(restarted.hasDot)
-        XCTAssertEqual(notices.count, 1, "never twice, not even after the app restarts")
+        XCTAssertEqual(notices.map(\.meetingId), [fourth, fifth], "a restart posts only what is new, never twice")
 
         ReviewServer.put(try meeting(UUID(), rows: [row(UUID(), "Vendor may slip")], reviewer: false))
         await restarted.refreshQueue()
-        XCTAssertEqual(notices.count, 1, "only the person who reviews is told")
+        XCTAssertEqual(notices.count, 2, "only the person who reviews is told")
 
         await openPanel(restarted)
-        ReviewServer.put(try meeting(UUID(), rows: [row(UUID(), "Draft the hiring plan")]))
+        ReviewServer.put(try pending("Draft the hiring plan"))
         await restarted.refreshQueue()
         restarted.setPanelOpen(false)
         await restarted.refreshQueue()
-        XCTAssertEqual(notices.count, 1, "a meeting first seen in the open panel is not posted later")
-        XCTAssertEqual(restarted.queueRows.count, 2)
+        XCTAssertEqual(notices.count, 2, "a meeting first seen in the open panel is not posted later")
+    }
+
+    func test_firstQueueLoadWithNothingWaiting_theFirstMeetingThatAppearsIsPosted() async throws {
+        let review = review()
+        await review.refreshQueue()
+        let first = UUID()
+        ReviewServer.put(try pending("Send the budget", first))
+        await review.refreshQueue()
+        XCTAssertEqual(notices, [ReviewNotice(title: "1 action item from Weekly sync", meetingId: first)])
+    }
+
+    func test_anotherAccount_startsFresh_soWhatItAlreadyHasWaitingIsNotPosted() async throws {
+        let review = review()
+        review.reset(account: "pat@example.com https://minutia.example.com")
+        ReviewServer.put(try pending("Send the budget"))
+        await review.refreshQueue()
+        XCTAssertTrue(notices.isEmpty)
+
+        review.reset(account: "pat@example.com https://minutia.example.com")
+        let whileAway = UUID()
+        ReviewServer.put(try pending("Book the Acme interview", whileAway))
+        await review.refreshQueue()
+        XCTAssertEqual(notices.map(\.meetingId), [whileAway], "the same account coming back keeps its list")
+
+        review.reset(account: "sam@example.com https://other.example.com")
+        ReviewServer.put(try pending("Draft the hiring plan"))
+        await review.refreshQueue()
+        XCTAssertEqual(notices.count, 1, "a different account's first load is quiet")
+
+        review.reset(account: nil)
+        ReviewServer.put(try pending("Vendor may slip"))
+        review.reset(account: "sam@example.com https://other.example.com")
+        await review.refreshQueue()
+        XCTAssertEqual(notices.count, 1, "signing out and back in starts fresh too")
     }
 
     func test_eightItems_theNotificationAndTheQueueLineCountAllEight() async throws {

@@ -844,7 +844,7 @@ final class AppController: NSObject, ObservableObject {
 
         authManager.$sessionIdentity
             .removeDuplicates()
-            .sink { [weak self] identity in self?.handleAuthChange(signedIn: identity.email != nil) }
+            .sink { [weak self] identity in self?.handleAuthChange(identity) }
             .store(in: &cancellables)
 
         modelStore.$status
@@ -971,9 +971,9 @@ final class AppController: NSObject, ObservableObject {
         showsMenuBarHint = true
     }
 
-    private func handleAuthChange(signedIn: Bool) {
-        review.reset()
-        if signedIn {
+    private func handleAuthChange(_ identity: AuthManager.SessionIdentity) {
+        review.reset(account: identity.email.map { "\($0) \(identity.instance?.absoluteString ?? "")" })
+        if identity.email != nil {
             signingOut = false
             apply(.signedIn)
             FirstRun.defaultLaunchAtLogin(defaults, status: SMAppService.mainApp.status) { try SMAppService.mainApp.register() }

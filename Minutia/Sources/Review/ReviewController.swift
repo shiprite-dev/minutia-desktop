@@ -99,6 +99,7 @@ final class ReviewController: ObservableObject {
     private var pollTask: Task<Void, Never>?
     private var closeTask: Task<Void, Never>?
     private static let notifiedKey = "review.notifiedMeetings"
+    private static let accountKey = "review.notifiedAccount"
 
     init(
         client: @escaping @MainActor () -> MinutiaClient?, clock: ReviewClock = .live, defaults: UserDefaults = .standard,
@@ -146,7 +147,12 @@ final class ReviewController: ObservableObject {
         meeting = nil
     }
 
-    func reset() {
+    /// A different account (or none) starts with no posted meetings, so its first queue load is quiet.
+    func reset(account: String? = nil) {
+        if defaults.string(forKey: Self.accountKey) != account {
+            defaults.removeObject(forKey: Self.notifiedKey)
+            defaults.set(account, forKey: Self.accountKey)
+        }
         generation += 1
         saving = false
         retrying = false
@@ -200,7 +206,9 @@ final class ReviewController: ObservableObject {
             guard generation == self.generation else { return }
             me = response.me
             queue = Self.sorted(response.meetings.filter(Self.waits))
-            for meeting in queue { noticeOnce(meeting, post: !panelOpen) }
+            let firstLoad = defaults.stringArray(forKey: Self.notifiedKey) == nil
+            if firstLoad { defaults.set([String](), forKey: Self.notifiedKey) }
+            for meeting in queue { noticeOnce(meeting, post: !panelOpen && !firstLoad) }
         } catch ReviewQueueError.signedOut {
             guard generation == self.generation else { return }
             onSignedOut()
