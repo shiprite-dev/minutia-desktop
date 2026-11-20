@@ -21,18 +21,25 @@ final class ReviewServer: URLProtocol {
     nonisolated(unsafe) private static var seen: [Seen] = []
     nonisolated(unsafe) private static var offlineFlag = false
     nonisolated(unsafe) private static var holdFlag = false
+    nonisolated(unsafe) private static var loseFlag = false
     nonisolated(unsafe) private static var onRetry: [String: [String: Any]] = [:]
 
     static func reset() {
         lock.withLock {
             meetings = [:]; order = []; gone = []; refusals = [:]; held = []; seen = []
-            offlineFlag = false; holdFlag = false; onRetry = [:]
+            offlineFlag = false; holdFlag = false; loseFlag = false; onRetry = [:]
         }
     }
 
     static var offline: Bool {
         get { lock.withLock { offlineFlag } }
         set { lock.withLock { offlineFlag = newValue } }
+    }
+
+    /// The server saves, then the connection drops before its answer reaches the Mac.
+    static var loseAnswers: Bool {
+        get { lock.withLock { loseFlag } }
+        set { lock.withLock { loseFlag = newValue } }
     }
 
     static var holdSaves: Bool {
@@ -89,7 +96,9 @@ final class ReviewServer: URLProtocol {
         let (outcome, hold) = Self.lock.withLock { () -> (Result<(Int, String), URLError>, Bool) in
             Self.seen.append(Seen(method: method, host: url.host ?? "", path: url.path, query: url.query, body: body))
             if Self.offlineFlag { return (.failure(URLError(.notConnectedToInternet)), false) }
-            return (.success(Self.answer(method: method, path: url.path, query: url.query, body: body)), method == "PATCH" && Self.holdFlag)
+            let answer = Self.answer(method: method, path: url.path, query: url.query, body: body)
+            if method == "PATCH" && Self.loseFlag { return (.failure(URLError(.networkConnectionLost)), false) }
+            return (.success(answer), method == "PATCH" && Self.holdFlag)
         }
         let finish = { [self] in
             switch outcome {
@@ -375,6 +384,43 @@ final class ReviewJourneyTests: XCTestCase {
         XCTAssertEqual(opened.map(\.absoluteString), [
             "https://minutia.example.com/series/b6008c45-d6ed-4cd8-bce4-9646a5994f0b/meetings/3f95ffd6-fd1e-4640-aacc-89e1c051f742",
         ])
+    }
+
+    func test_afterStop_noPageOpens_andTheReviewShowsTranscribingThenFinding() async throws {
+        let app = app()
+        await app.authManager.adopt(testSupabase(instance), instance: instance)
+        app.apply(.signedIn)
+        app.panelOpened()
+        ReviewServer.put(try meeting(transcription: "processing", suggestions: "pending", endedAgo: 0))
+        app.apply(.recordStarted)
+        app.apply(.recordStopped)
+
+        app.finishStop(
+            CaptureSession.StopResult(expectedSegments: 3, transcriptRequested: true), reason: .manual,
+            meetingId: meetingId, seriesId: UUID(), instance: instance)
+
+        XCTAssertEqual(app.phase, .idle)
+        await waitUntil { app.review.model?.screen == .transcribing(elapsed: nil) && app.review.title == "Weekly sync" }
+        ReviewServer.update(meetingId) { $0["transcription_status"] = "completed"; $0["status_at"] = self.stamp(self.clock.now) }
+        await tick(3)
+        await waitUntil { app.review.model?.screen == .finding }
+        await settle()
+        XCTAssertEqual(opened, [], "the recap opens only from Open recap")
+    }
+
+    func test_keepWhoseAnswerIsLost_endsAsTracked_neverAsNoActionItems() async throws {
+        ReviewServer.put(try meeting(rows: [row(UUID(), "Send the budget")]))
+        let review = review()
+        await openPanel(review)
+        review.start(meetingId: meetingId)
+        await waitUntil { review.model?.screen == .ready }
+
+        ReviewServer.loseAnswers = true
+        await review.keep()
+
+        XCTAssertEqual(ReviewServer.pendingRows(meetingId), [], "the server kept it")
+        XCTAssertEqual(review.model?.doneLine, "1 item tracked")
+        XCTAssertEqual(ReviewServer.saves.count, 1)
     }
 
     func test_offlineAtKeep_eachRowSaysCouldntSave_andRetryKeepsItOnce() async throws {

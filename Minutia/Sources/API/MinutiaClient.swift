@@ -477,12 +477,9 @@ struct MinutiaClient {
     /// The web app's recap route for a meeting (src/app/(app)/series/[id]/meetings/[meetingId] on
     /// the server). The single builder for every place that opens a recap, so the shape and the
     /// lowercase-id rule cannot drift between call sites.
-    static func recapURL(instance: URL, seriesId: UUID, meetingId: UUID, autoRecap: Bool = false) -> URL {
-        let url = instance.appendingPathComponent(
+    static func recapURL(instance: URL, seriesId: UUID, meetingId: UUID) -> URL {
+        instance.appendingPathComponent(
             "series/\(seriesId.uuidString.lowercased())/meetings/\(meetingId.uuidString.lowercased())")
-        guard autoRecap, var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
-        components.queryItems = [URLQueryItem(name: "recap", value: "auto")]
-        return components.url ?? url
     }
 
     func checkin(deviceId: String, deviceName: String, canClaim: Bool) async -> CheckinClaim? {

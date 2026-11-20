@@ -49,6 +49,8 @@ struct ReviewModel: Equatable {
     var selection: Set<UUID> = []
     var edits: [UUID: RowEdit] = [:]
     var rowState: [UUID: RowState] = [:]
+    /// Saves that failed in transit: the server may have done them and the answer got lost.
+    var lostAnswers: Set<UUID> = []
     var listUpdated = false
 
     var lessSureIndex: Int? { newRows.firstIndex { $0.confidence < Self.confident } }
@@ -102,6 +104,7 @@ struct ReviewModel: Equatable {
     }
 
     private static func ready(_ meeting: ReviewMeeting, previous: ReviewModel?) -> ReviewModel {
+        let previous = previous.map { settlingLostAnswers($0, pending: meeting.rows) }
         let carried = (previous?.newRows ?? []) + (previous?.updateRows ?? [])
         let resolved = carried.filter { (previous?.rowState[$0.id] ?? .idle).isResolved }
         let resolvedIds = Set(resolved.map(\.id))
@@ -143,6 +146,7 @@ struct ReviewModel: Equatable {
             }
         }
         model.aliases = aliases.filter { model.rowState[$0.value] == .saving }
+        model.lostAnswers = (previous?.lostAnswers ?? []).filter { model.rowState[$0] == .failed }
         if model.readOnly { model.selection = [] }
         if let previous {
             let present = Set((shownNew + updates).map { normalizedTitle($0.title) })
@@ -154,8 +158,23 @@ struct ReviewModel: Equatable {
         return model
     }
 
+    /// A save lost in transit whose row has since left the pending list was most likely done, so it
+    /// settles as saved: ticked rows count as kept, unticked ones as skipped.
+    private static func settlingLostAnswers(_ previous: ReviewModel, pending: [ReviewRow]) -> ReviewModel {
+        var settled = previous
+        let ids = Set(pending.map(\.id)), titles = Set(pending.map { normalizedTitle($0.title) })
+        for row in previous.newRows + previous.updateRows
+        where previous.lostAnswers.contains(row.id) && previous.rowState[row.id] == .failed
+            && !ids.contains(row.id) && !titles.contains(normalizedTitle(row.title)) {
+            settled.rowState[row.id] = .saved
+            settled.lostAnswers.remove(row.id)
+        }
+        return settled
+    }
+
     mutating func apply(_ result: ReviewSaveResult, to shownId: UUID) {
         let id = aliases[shownId] ?? shownId
+        if result == .retryable { lostAnswers.insert(id) } else { lostAnswers.remove(id) }
         switch result {
         case .saved: rowState[id] = .saved
         case .alreadyReviewed, .cannotKeepDuplicate: rowState[id] = .gone(.alreadyReviewed)

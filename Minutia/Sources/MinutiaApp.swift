@@ -717,7 +717,6 @@ final class AppController: NSObject, ObservableObject {
     /// switch made while the meeting was recording.
     private var recordingInstance: URL?
     private var recordingLanguage: String?
-    private var earlyRecapMeetingId: UUID?
     private var lastFailedStart: FailedStart?
     /// The instance the detector's agenda provider is currently bound to. When it changes (an
     /// instance switch), the detector must be torn down and restarted so it stops polling the old
@@ -1780,36 +1779,13 @@ final class AppController: NSObject, ObservableObject {
         let meetingId = recordingMeetingId
         let seriesId = recordingSeriesId
         let instance = recordingInstance
-        let early = Self.opensRecap(for: reason) && captureSession.audioMayLeaveMac && meetingId != nil && instance != nil
-        earlyRecapMeetingId = early ? meetingId : nil
-        if early, let meetingId, let instance {
-            Task {
-                try? await withTimeout(seconds: 3) { [notepad] in try await notepad.flushNow() }
-                if let client = authManager.client() {
-                    try? await withTimeout(seconds: 3) {
-                        await CaptureSession.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId.uuidString) }
-                    }
-                }
-                await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance, autoRecap: true)
-            }
-        }
         let local = localOutcomeHandlers()
         Task {
             do {
                 let result = try await captureSession.stop(
-                    flushNotes: { [notepad] in try await notepad.flushNow() }, recapOpened: early,
+                    flushNotes: { [notepad] in try await notepad.flushNow() },
                     notifyLocalFailure: local.notify, onLocalOutcome: local.outcome)
-                recordingMeetingId = nil
-                recordingSeriesId = nil
-                recordingInstance = nil
-                apply(.finalized)
-                presentRecapCue(Self.recapCue(
-                    reason: reason, transcriptRequested: result.transcriptRequested,
-                    meetingId: meetingId, seriesId: seriesId, instance: instance))
-                runRecovery()
-                if !early, result.transcriptRequested, let meetingId, let instance, Self.opensRecap(for: reason) {
-                    await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance)
-                }
+                finishStop(result, reason: reason, meetingId: meetingId, seriesId: seriesId, instance: instance)
             } catch {
                 captureSession.endFinishing()
                 // The durable directory survives a timed-out finalize, so Retry finishes the upload
@@ -1818,6 +1794,19 @@ final class AppController: NSObject, ObservableObject {
                 apply(.failed(Self.finalizeFailureMessage(for: error, host: instance?.host, audioMayLeaveMac: captureSession.audioMayLeaveMac)))
             }
         }
+    }
+
+    /// After a stop the server has the recording: the panel follows it into the review. The recap
+    /// opens only when the person asks for it.
+    func finishStop(_ result: CaptureSession.StopResult, reason: StopReason, meetingId: UUID?, seriesId: UUID?, instance: URL?) {
+        recordingMeetingId = nil
+        recordingSeriesId = nil
+        recordingInstance = nil
+        apply(.finalized)
+        presentRecapCue(Self.recapCue(
+            reason: reason, transcriptRequested: result.transcriptRequested,
+            meetingId: meetingId, seriesId: seriesId, instance: instance))
+        runRecovery()
     }
 
     private func localOutcomeHandlers() -> (notify: @Sendable (LocalTranscriber.Failure) async -> Void, outcome: @Sendable (Bool) async -> Void) {
@@ -2175,13 +2164,10 @@ final class AppController: NSObject, ObservableObject {
                     NotepadStore.removeIfSynced(meetingId: meetingId, in: notesRoot)
                 }
                 apply(.finalized)
-                let openedEarly = earlyRecapMeetingId.map { $0.uuidString.lowercased() == manifest.meetingId.lowercased() } ?? false
-                earlyRecapMeetingId = nil
-                if !openedEarly, let meetingUUID = UUID(uuidString: manifest.meetingId) {
-                    await openRecap(
-                        meetingId: meetingUUID,
-                        seriesId: manifest.seriesId.flatMap { UUID(uuidString: $0) },
-                        instance: manifest.instanceURL)
+                if let meetingUUID = UUID(uuidString: manifest.meetingId) {
+                    presentRecapCue(RecapCue(
+                        meetingId: meetingUUID, seriesId: manifest.seriesId.flatMap { UUID(uuidString: $0) },
+                        instance: manifest.instanceURL))
                 }
             } catch {
                 switch Self.refinalizeOutcome(for: error, host: authManager.instance?.host, audioMayLeaveMac: manifest?.audioMayLeaveMac ?? true) {
@@ -2203,7 +2189,7 @@ final class AppController: NSObject, ObservableObject {
     /// id when unknown (a web-triggered record carries none) via the meetings table; if it still
     /// cannot be resolved, falls back to a notification rather than doing nothing. The URL is built
     /// from the instance capture started against, not the currently-connected one.
-    private func openRecap(meetingId: UUID, seriesId: UUID?, instance: URL, autoRecap: Bool = false) async {
+    private func openRecap(meetingId: UUID, seriesId: UUID?, instance: URL) async {
         var resolvedSeries = seriesId
         if resolvedSeries == nil, let client = authManager.client() {
             resolvedSeries = try? await client.meetingSeriesId(meetingId: meetingId.uuidString)
@@ -2214,7 +2200,7 @@ final class AppController: NSObject, ObservableObject {
                 body: "Open Minutia on the web to see the recap.")
             return
         }
-        openURL(MinutiaClient.recapURL(instance: instance, seriesId: resolvedSeries, meetingId: meetingId, autoRecap: autoRecap))
+        openURL(MinutiaClient.recapURL(instance: instance, seriesId: resolvedSeries, meetingId: meetingId))
     }
 
     // MARK: - URL callback

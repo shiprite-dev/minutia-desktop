@@ -341,6 +341,42 @@ final class ReviewModelTests: XCTestCase {
         XCTAssertEqual(model.doneLine, "2 items tracked")
     }
 
+    func test_aKeepWhoseAnswerWasLost_andThatLeftThePendingList_countsAsTracked() {
+        let a = row("A")
+        var model = ReviewModel.from(meeting(rows: [a]), now: now, previous: nil)
+        model.apply(.retryable, to: a.id)
+        XCTAssertEqual(model.screen, .ready)
+        model = ReviewModel.from(meeting(rows: []), now: now, previous: model)
+        XCTAssertEqual(model.screen, .done(kept: 1, updated: 0))
+        XCTAssertEqual(model.doneLine, "1 item tracked")
+    }
+
+    func test_aSkipWhoseAnswerWasLost_andThatLeftThePendingList_countsAsSkipped() {
+        let b = row("B", confidence: 0.5)
+        var model = ReviewModel.from(meeting(rows: [b]), now: now, previous: nil)
+        model.apply(.retryable, to: b.id)
+        model = ReviewModel.from(meeting(rows: []), now: now, previous: model)
+        XCTAssertEqual(model.screen, .done(kept: 0, updated: 0))
+        XCTAssertEqual(model.doneLine, "No items tracked")
+    }
+
+    func test_aLostKeepThatIsStillPending_staysCouldntSave() {
+        let a = row("A")
+        var model = ReviewModel.from(meeting(rows: [a]), now: now, previous: nil)
+        model.apply(.retryable, to: a.id)
+        model = ReviewModel.from(meeting(rows: [a]), now: now, previous: model)
+        XCTAssertEqual(model.rowState[a.id], .failed)
+        XCTAssertEqual(model.keepCount, 1)
+    }
+
+    func test_aRefusedKeepThatLeftThePendingList_isNotCountedAsTracked() {
+        let a = row("A")
+        var model = ReviewModel.from(meeting(rows: [a]), now: now, previous: nil)
+        model.apply(.invalidRequest, to: a.id)
+        model = ReviewModel.from(meeting(rows: []), now: now, previous: model)
+        XCTAssertEqual(model.screen, .none(moreOnWeb: 0))
+    }
+
     func test_refreshAfterEverythingWasKept_staysOnTheDoneScreen() {
         let a = row("A"), u = row("Contract renewed", type: "status_update")
         var model = ReviewModel.from(meeting(rows: [a, u]), now: now, previous: nil)
