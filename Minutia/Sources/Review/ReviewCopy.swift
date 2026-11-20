@@ -46,6 +46,8 @@ enum ReviewCopy {
 
     static func partly(kept: Int, left: Int) -> String { "\(tracked(kept)). \(left) still to review." }
 
+    static func queueRow(series: String, day: String, count: Int) -> String { "\(series) · \(day) · \(count) to review" }
+
     static func notificationTitle(count: Int, series: String) -> String {
         "\(count) action \(count == 1 ? "item" : "items") from \(series)"
     }

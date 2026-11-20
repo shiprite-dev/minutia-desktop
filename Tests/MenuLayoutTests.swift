@@ -31,7 +31,6 @@ final class MenuLayoutTests: XCTestCase {
         assertFits("recording", RecordingContent(model: RecordingModel(seriesName: "Weekly Eng Sync", elapsed: 754, level: 0.5, progress: "2 of 3 segments uploaded")))
         assertFits("finishing", FinishingContent(label: "Uploading and requesting transcript", progress: nil, preparingSince: nil))
         assertFits("transcribing", FinishingContent(label: "Transcribing on this Mac, 3 of 12", progress: 0.25, preparingSince: nil))
-        assertFits("done", DoneContent())
         assertFits("consent", ConsentNotice(hasClaim: false))
         assertFits("consent with claim", ConsentNotice(hasClaim: true))
         assertFits("feedback", FeedbackNotice(message: "That recording could not be started. Try again in a moment."))
@@ -192,13 +191,6 @@ final class MenuStatesSeenTests: XCTestCase {
             XCTAssertTrue(seen.has("Meeting detected"), "dark: \(dark) \(seen.text)")
             XCTAssertTrue(seen.has("Start taking notes"), "dark: \(dark) \(seen.text)")
         }
-    }
-
-    func test_doneWithReduceMotion_showsTheFinishedCheckAtOnce_andWithoutItDrawsFirst() {
-        let still = Host.vermilionPixels(DoneContent().environment(\.reduceMotionOverride, true), spin: 0.05)
-        let animated = Host.vermilionPixels(DoneContent().environment(\.reduceMotionOverride, false), spin: 0.05)
-        XCTAssertGreaterThan(still, 50)
-        XCTAssertEqual(animated, 0)
     }
 
 

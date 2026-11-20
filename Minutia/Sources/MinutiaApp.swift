@@ -22,7 +22,8 @@ struct MinutiaApp: App {
             MenuBarIcon(
                 phase: controller.phase,
                 softHint: controller.softHint,
-                pendingConsent: controller.pendingRecordConsent != nil)
+                pendingConsent: controller.pendingRecordConsent != nil,
+                reviewDot: controller.review.hasDot)
         }
         .menuBarExtraStyle(.window)
 
@@ -182,13 +183,17 @@ struct MenuBarIcon: View {
     let phase: AppPhase
     let softHint: Bool
     let pendingConsent: Bool
+    var reviewDot = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hollow = false
     @State private var timer: Timer?
 
     var body: some View {
-        Image(systemName: currentSymbol)
-            .accessibilityLabel(Self.accessibilityLabel(phase: phase, pendingConsent: pendingConsent))
+        let dot = Self.showsDot(phase: phase, hasDot: reviewDot)
+        Group {
+            if dot { Image(nsImage: Self.dotted(currentSymbol)) } else { Image(systemName: currentSymbol) }
+        }
+            .accessibilityLabel(Self.accessibilityLabel(phase: phase, pendingConsent: pendingConsent, reviewDot: dot))
             .onAppear { syncPulse() }
             .onChange(of: phase) { _, _ in syncPulse() }
             .onDisappear { stopPulse() }
@@ -216,9 +221,33 @@ struct MenuBarIcon: View {
         }
     }
 
+    /// Items waiting for review light a dot on the resting glyph; recording and errors keep their own.
+    static func showsDot(phase: AppPhase, hasDot: Bool) -> Bool {
+        switch phase {
+        case .idle, .detected: hasDot
+        default: false
+        }
+    }
+
+    /// Status items render their label as a template image, so the dot is drawn into the glyph itself.
+    static func dotted(_ symbol: String) -> NSImage {
+        let base = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 14, weight: .regular)) ?? NSImage()
+        let size = NSSize(width: base.size.width + 3, height: base.size.height)
+        let image = NSImage(size: size, flipped: false) { _ in
+            base.draw(in: NSRect(origin: .zero, size: base.size))
+            NSColor.black.setFill()
+            NSBezierPath(ovalIn: NSRect(x: size.width - 6, y: size.height - 6, width: 6, height: 6)).fill()
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
+
     /// VoiceOver text for the status item, since the glyph alone conveys the phase. Mirrors the glyph
     /// precedence: recording/finalizing/error win over a pending consent.
-    static func accessibilityLabel(phase: AppPhase, pendingConsent: Bool) -> String {
+    static func accessibilityLabel(phase: AppPhase, pendingConsent: Bool, reviewDot: Bool = false) -> String {
+        if reviewDot, !pendingConsent { return "Minutia, items to review" }
         switch phase {
         case .recording: return "Minutia, recording"
         case .finalizing: return "Minutia, finishing recording"
@@ -293,16 +322,19 @@ final class AppController: NSObject, ObservableObject {
     /// True while the startup recovery sweep is finalizing a prior recording's orphaned upload.
     /// Drives a quiet in-menu row and folds recovery into the quit guard.
     @Published private(set) var recoveryActive: Bool = false
-    /// Set when a stop the user can follow up on has been handed to the server, so the panel can say
-    /// so and offer the recap. Cleared by the panel after its hold and by any phase change.
-    @Published private(set) var recapCue: RecapCue?
     @Published private(set) var panelOpen = true
-    func panelOpened() { panelOpen = true }
-    func panelClosed() { panelOpen = false }
+    func panelOpened() {
+        panelOpen = true
+        review.setPanelOpen(true)
+    }
+    func panelClosed() {
+        panelOpen = false
+        review.setPanelOpen(false)
+    }
     var announce: (String) -> Void = { AccessibilityNotification.Announcement($0).post() }
-    var recapHold: () -> TimeInterval = { Celebration.hold(reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion) }
-    var sleep: (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }
-    private var recapExpiry: Task<Void, Never>?
+    /// Opens a meeting's recap from the review panel.
+    var openRecap: (UUID) -> Void = { _ in }
+    let review: ReviewController
     @Published private(set) var selectedSeriesId: UUID?
     /// The user chose a series during the current detected meeting; detection then leaves it alone.
     private var seriesPickedThisMeeting = false
@@ -758,10 +790,15 @@ final class AppController: NSObject, ObservableObject {
         openURL: @escaping (URL) -> Void = { NSWorkspace.shared.open($0) },
         micCheck: @escaping () -> (status: AVAuthorizationStatus, hasInputDevice: Bool) = {
             (AVCaptureDevice.authorizationStatus(for: .audio), AVCaptureDevice.default(for: .audio) != nil)
-        }
+        },
+        reviewClock: ReviewClock = .live,
+        postReviewNotice: @escaping @MainActor (ReviewNotice) -> Void = AppController.postReviewNotice,
+        reviewClient: @escaping @MainActor (AuthManager) -> MinutiaClient? = { $0.client() }
     ) {
         self.defaults = defaults
-        self.authManager = AuthManager(defaults: defaults)
+        let authManager = AuthManager(defaults: defaults)
+        self.authManager = authManager
+        self.review = ReviewController(client: { reviewClient(authManager) }, clock: reviewClock, notify: postReviewNotice)
         self.openURL = openURL
         self.micCheck = micCheck
         super.init()
@@ -795,6 +832,11 @@ final class AppController: NSObject, ObservableObject {
         }
 
         authManager.beforeSignOut = { [weak self] in await self?.reportBeforeSignOut() }
+
+        review.announce = { [weak self] in self?.announce($0) }
+        review.onSignedOut = { [weak self] in Task { _ = await self?.authManager.dropSessionIfRevoked() } }
+        review.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
+        openRecap = { [weak self] in self?.openRecapInBrowser($0) }
 
         authManager.$sessionIdentity
             .removeDuplicates()
@@ -841,7 +883,6 @@ final class AppController: NSObject, ObservableObject {
         guard next != phase else { return }
         let previous = phase
         phase = next
-        clearRecapCue()
         if next == .recording, previous != .recording { announce("Recording started") }
         restoreLastUsedAfterDetectedMeeting()
         switch Self.modelStoreCue(from: previous, to: next, signedIn: authManager.sessionIdentity.email != nil) {
@@ -927,6 +968,7 @@ final class AppController: NSObject, ObservableObject {
     }
 
     private func handleAuthChange(signedIn: Bool) {
+        review.reset()
         if signedIn {
             signingOut = false
             apply(.signedIn)
@@ -942,6 +984,7 @@ final class AppController: NSObject, ObservableObject {
                 if granted == true, pointsAtMenuBar { Self.postNotification(title: "Minutia", body: FirstRun.menuBarHint) }
             }
             Task { await loadSeries() }
+            Task { await review.refreshQueue() }
             Task { await modelStore.prepare(language: "en") }
             runRecovery()
             checkInNow()
@@ -1483,6 +1526,7 @@ final class AppController: NSObject, ObservableObject {
         Task {
             let claim = await client.checkin(deviceId: deviceId, deviceName: DeviceIdentity.name, canClaim: canClaim)
             if let claim { await handleClaim(claim) }
+            await review.refreshQueue()
             checkinInFlight = false
             scheduleNextCheckin()
         }
@@ -1661,7 +1705,11 @@ final class AppController: NSObject, ObservableObject {
             identifier: recordingStartedCategoryId,
             actions: [UNNotificationAction(identifier: stopRecordingActionId, title: "Stop recording", options: [])],
             intentIdentifiers: [], options: [])
-        UNUserNotificationCenter.current().setNotificationCategories([webRecord, webStart, recordingStarted])
+        let review = UNNotificationCategory(
+            identifier: reviewCategoryId,
+            actions: [UNNotificationAction(identifier: reviewActionId, title: "Review", options: [.foreground])],
+            intentIdentifiers: [], options: [])
+        UNUserNotificationCenter.current().setNotificationCategories([webRecord, webStart, recordingStarted, review])
     }
 
     private static func postNotification(title: String, body: String) {
@@ -1682,24 +1730,40 @@ final class AppController: NSObject, ObservableObject {
 
     func presentRecapCue(_ cue: RecapCue?) {
         guard let cue, phase == .idle else { return }
-        recapCue = cue
-        announce("Sent. Your recap is on its way")
-        let hold = recapHold()
-        recapExpiry = Task { [weak self] in
-            await self?.sleep(hold)
-            if !Task.isCancelled { self?.clearRecapCue() }
-        }
+        review.start(meetingId: cue.meetingId)
     }
 
-    func clearRecapCue() {
-        recapExpiry?.cancel()
-        recapExpiry = nil
-        recapCue = nil
+    static let reviewCategoryId = "app.minutia.review"
+    static let reviewActionId = "app.minutia.review.open"
+    static let reviewMeetingIdUserInfoKey = "app.minutia.reviewMeetingId"
+
+    nonisolated static func reviewMeetingId(actionId: String, userInfo: [AnyHashable: Any]) -> UUID? {
+        guard actionId == reviewActionId || actionId == UNNotificationDefaultActionIdentifier else { return nil }
+        return (userInfo[reviewMeetingIdUserInfoKey] as? String).flatMap(UUID.init(uuidString:))
     }
 
-    func openRecapFromCue() {
-        guard let cue = recapCue else { return }
-        Task { await openRecap(meetingId: cue.meetingId, seriesId: cue.seriesId, instance: cue.instance) }
+    static func postReviewNotice(_ notice: ReviewNotice) {
+        let content = UNMutableNotificationContent()
+        content.title = notice.title
+        content.categoryIdentifier = reviewCategoryId
+        content.userInfo = [reviewMeetingIdUserInfoKey: notice.meetingId.uuidString]
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: "review-\(notice.meetingId.uuidString)", content: content, trigger: nil))
+    }
+
+    func openReview(meetingId: UUID) {
+        review.start(meetingId: meetingId)
+        // MenuBarExtra has no API to open its window; clicking our own status item is the only way in.
+        NSApp.windows.lazy
+            .filter { $0.className == "NSStatusBarWindow" && $0.responds(to: NSSelectorFromString("statusItem")) }
+            .compactMap { $0.value(forKey: "statusItem") as? NSStatusItem }
+            .first?.button?.performClick(nil)
+    }
+
+    private func openRecapInBrowser(_ meetingId: UUID) {
+        guard let instance = authManager.instance else { return }
+        let known = review.meeting?.meetingId == meetingId ? review.meeting : review.queue.first { $0.meetingId == meetingId }
+        Task { await openRecap(meetingId: meetingId, seriesId: known?.seriesId, instance: instance) }
     }
 
     /// Stop and finalize the recording. `reason` decides whether the recap opens: a manual or
@@ -2208,7 +2272,13 @@ extension AppController: UNUserNotificationCenterDelegate {
         let actionId = response.actionIdentifier
         let userInfo = response.notification.request.content.userInfo
         let claimId = userInfo[Self.claimMeetingIdUserInfoKey] as? String
+        let reviewMeetingId = Self.reviewMeetingId(actionId: actionId, userInfo: userInfo)
         Task { @MainActor in
+            if let reviewMeetingId {
+                self.openReview(meetingId: reviewMeetingId)
+                completionHandler()
+                return
+            }
             switch actionId {
             case Self.confirmWebRecordActionId:
                 self.confirmPendingRecord()

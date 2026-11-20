@@ -37,6 +37,8 @@ enum Brand {
     static let ink3 = Token(light: 0x706B66, dark: 0x98938E)
     static let warn = Token(light: 0x8D6000, dark: 0xD4A62A)
     static let warnSoft = Token(light: 0xFFF1CC, dark: 0x3F3420)
+    static let ok = Token(light: 0x2D7A4B, dark: 0x5CC48A)
+    static let okSoft = Token(light: 0xDDF3E5, dark: 0x1F3A2A)
 }
 
 enum Typo {
