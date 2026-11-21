@@ -30,6 +30,10 @@ enum ReviewCopy {
     static let groupUpdates = "Updates to existing items"
     static let saving = "Saving"
     static let couldntSave = "Couldn't save. Try again."
+    static let windowSlow = "Taking longer than usual"
+    static let windowOffline = "You're offline"
+    static let windowCert = "Can't open this server securely"
+    static let openInBrowser = "Open in browser"
     static let signedOut = "You were signed out. Sign in again to record."
 
     static func keep(_ n: Int) -> String { "Keep \(n)" }

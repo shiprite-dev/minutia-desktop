@@ -340,6 +340,8 @@ final class AppController: NSObject, ObservableObject {
     /// Opens a meeting's recap from the review panel.
     var openRecap: (UUID) -> Void = { _ in }
     let review: ReviewController
+    let recapWindow: RecapWindowController
+    private var webSessionIdentity: AuthManager.SessionIdentity?
     @Published private(set) var selectedSeriesId: UUID?
     /// The user chose a series during the current detected meeting; detection then leaves it alone.
     private var seriesPickedThisMeeting = false
@@ -797,12 +799,20 @@ final class AppController: NSObject, ObservableObject {
         },
         reviewClock: ReviewClock = .live,
         postReviewNotice: @escaping @MainActor (ReviewNotice) -> Void = AppController.postReviewNotice,
-        reviewClient: @escaping @MainActor (AuthManager) -> MinutiaClient? = { $0.client() }
+        reviewClient: @escaping @MainActor (AuthManager) -> MinutiaClient? = { $0.client() },
+        windowPresence: WindowPresence = .shared
     ) {
         self.defaults = defaults
         let authManager = AuthManager(defaults: defaults)
         self.authManager = authManager
         self.review = ReviewController(client: { reviewClient(authManager) }, clock: reviewClock, defaults: defaults, notify: postReviewNotice)
+        self.recapWindow = RecapWindowController(
+            account: {
+                guard let client = authManager.client() else { return nil }
+                return (client, try? await client.supabase.auth.session.user.id.uuidString.lowercased())
+            },
+            openURL: openURL, clock: reviewClock, presence: windowPresence,
+            onSignedOut: { Task { _ = await authManager.dropSessionIfRevoked() } })
         self.openURL = openURL
         self.micCheck = micCheck
         super.init()
@@ -843,7 +853,7 @@ final class AppController: NSObject, ObservableObject {
         review.announce = { [weak self] in self?.announce($0) }
         review.onSignedOut = { [weak self] in Task { _ = await self?.authManager.dropSessionIfRevoked() } }
         review.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
-        openRecap = { [weak self] in self?.openRecapInBrowser($0) }
+        openRecap = { [weak self] in self?.openRecapWindow($0) }
 
         authManager.$sessionIdentity
             .removeDuplicates()
@@ -975,6 +985,8 @@ final class AppController: NSObject, ObservableObject {
     }
 
     private func handleAuthChange(_ identity: AuthManager.SessionIdentity) {
+        if let shown = webSessionIdentity, shown != identity { Task { await recapWindow.forgetWebSessions() } }
+        webSessionIdentity = identity.email == nil ? nil : identity
         review.reset(account: identity.email.map { "\($0) \(identity.instance?.absoluteString ?? "")" })
         if identity.email != nil {
             signingOut = false
@@ -1778,10 +1790,9 @@ final class AppController: NSObject, ObservableObject {
         return true
     }
 
-    private func openRecapInBrowser(_ meetingId: UUID) {
-        guard let instance = authManager.instance else { return }
+    private func openRecapWindow(_ meetingId: UUID) {
         let known = review.meeting?.meetingId == meetingId ? review.meeting : review.queue.first { $0.meetingId == meetingId }
-        Task { await openRecap(meetingId: meetingId, seriesId: known?.seriesId, instance: instance) }
+        Task { await openRecap(meetingId: meetingId, seriesId: known?.seriesId, title: known?.seriesName ?? "") }
     }
 
     /// Stop and finalize the recording. `reason` decides whether the recap opens: a manual or
@@ -2204,11 +2215,10 @@ final class AppController: NSObject, ObservableObject {
         apply(.dismissedDetection)
     }
 
-    /// Land the flowing recap in front of the user the moment finalize completes. Resolves the series
-    /// id when unknown (a web-triggered record carries none) via the meetings table; if it still
-    /// cannot be resolved, falls back to a notification rather than doing nothing. The URL is built
-    /// from the instance capture started against, not the currently-connected one.
-    private func openRecap(meetingId: UUID, seriesId: UUID?, instance: URL) async {
+    /// Opens the recap window on a meeting. Resolves the series id when unknown (a web-triggered
+    /// record carries none) via the meetings table; if it still cannot be resolved, falls back to a
+    /// notification rather than doing nothing.
+    private func openRecap(meetingId: UUID, seriesId: UUID?, title: String) async {
         var resolvedSeries = seriesId
         if resolvedSeries == nil, let client = authManager.client() {
             resolvedSeries = try? await client.meetingSeriesId(meetingId: meetingId.uuidString)
@@ -2219,7 +2229,7 @@ final class AppController: NSObject, ObservableObject {
                 body: "Open Minutia on the web to see the recap.")
             return
         }
-        openURL(MinutiaClient.recapURL(instance: instance, seriesId: resolvedSeries, meetingId: meetingId))
+        await recapWindow.show(meetingId: meetingId, seriesId: resolvedSeries, title: title).value
     }
 
     // MARK: - URL callback

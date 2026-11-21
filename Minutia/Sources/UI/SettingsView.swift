@@ -123,11 +123,11 @@ struct SettingsView: View {
         .frame(width: 420)
         .fixedSize(horizontal: false, vertical: true)
         .onAppear {
-            activateForEditing()
+            WindowPresence.shared.opened("settings")
             refreshLoginItemState()
             controller.refreshPermissionState()
         }
-        .onDisappear { NSApp.setActivationPolicy(.accessory) }
+        .onDisappear { WindowPresence.shared.closed("settings") }
         // Login-item and permission state can change out from under an open Settings window (the user
         // toggles the item or grants a permission in System Settings, then returns). Re-read both when
         // the window regains key, so the toggle and nudges reflect reality instead of a stale snapshot.
@@ -181,14 +181,6 @@ struct SettingsView: View {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
         return "\(version) (\(build))"
-    }
-
-    /// A menu-bar (LSUIElement) app opens Settings without becoming active, so the window never
-    /// takes key and text fields cannot focus. Promote to a regular app while Settings is open
-    /// (restored to accessory on close) so the window is key and editable, with a Dock presence.
-    private func activateForEditing() {
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
     }
 
     private func reconnect() {
