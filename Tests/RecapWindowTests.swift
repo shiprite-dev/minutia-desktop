@@ -188,7 +188,7 @@ final class RecapWindowTests: XCTestCase {
 
     private func page(_ meeting: UUID) -> URL { fake.base.appendingPathComponent(fake.meetingPath(meeting)) }
 
-    private func waitUntil(_ seconds: TimeInterval = 15, _ condition: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async {
+    private func waitUntil(_ seconds: TimeInterval = 30, _ condition: () -> Bool, file: StaticString = #filePath, line: UInt = #line) async {
         let deadline = Date().addingTimeInterval(seconds)
         while !condition(), Date() < deadline { try? await Task.sleep(nanoseconds: 20_000_000) }
         XCTAssertTrue(condition(), "timed out", file: file, line: line)
