@@ -205,6 +205,13 @@ struct Seen {
 
     func has(_ expected: String) -> Bool { Self.contains(Self.tokens(text), Self.tokens(expected)) }
 
+    /// True only when one recognised line reads exactly `expected`, token for token: nothing before
+    /// it (no "not"), nothing after it, no longer word or extra digit.
+    func hasLine(_ expected: String) -> Bool {
+        let needle = Self.tokens(expected)
+        return !needle.isEmpty && frames.contains { Self.tokens($0.0) == needle }
+    }
+
     func frame(of expected: String) -> CGRect? { frames(of: expected).first }
 
     func frames(of expected: String) -> [CGRect] {

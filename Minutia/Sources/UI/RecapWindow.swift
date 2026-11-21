@@ -48,7 +48,7 @@ struct RecapStores {
 @MainActor
 final class RecapWindowController: NSObject, ObservableObject {
     typealias Account = (client: MinutiaClient, userId: String?)
-    private struct Handoff { let id: String, nonce: String, minted: Date }
+    private struct Handoff { let id: String, nonce: String, minted: Date, store: UUID }
 
     @Published private(set) var screen = RecapScreen.loading
     @Published private(set) var title = ""
@@ -65,17 +65,19 @@ final class RecapWindowController: NSObject, ObservableObject {
     private let stores: RecapStores
     private let announce: (String) -> Void
     private let onSignedOut: () -> Void
-    private var current: (meetingId: UUID, page: URL, next: String, client: MinutiaClient)?
+    private var current: (meetingId: UUID, page: URL, next: String, client: MinutiaClient, store: UUID)?
+    private var windowStore: UUID?
     private var signedIn = false
     private var generation = 0
     private var epoch = 0
-    private var minting: Task<Result<Handoff, Error>, Never>?
+    private var minting: (store: UUID, task: Task<Result<Handoff, Error>, Never>)?
     private var unused: Handoff?
     private var slow: Task<Void, Never>?
 
     private static let presenceId = "recap"
     private static let frameName = "MinutiaRecap"
     private static let removalKey = "recap.storesToRemove"
+    private static let createdKey = "recap.createdStores"
     private static let handoffReuse: TimeInterval = 9 * 60
     private static let offline: Set<URLError.Code> = [
         .notConnectedToInternet, .networkConnectionLost, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
@@ -121,11 +123,12 @@ final class RecapWindowController: NSObject, ObservableObject {
             guard let account = await account() else { return }
             let page = MinutiaClient.recapURL(instance: account.client.instance, seriesId: seriesId, meetingId: meetingId)
             guard let userId = account.userId else { return openURL(page) }
-            if let window, current?.meetingId == meetingId { return focus(window) }
-            current = (meetingId, page, "/series/\(seriesId.uuidString.lowercased())/meetings/\(meetingId.uuidString.lowercased())", account.client)
+            let store = Self.storeIdentifier(instance: account.client.instance, userId: userId)
+            if let window, windowStore == store, current?.meetingId == meetingId { return focus(window) }
+            if windowStore != store { window?.close() }
+            current = (meetingId, page, "/series/\(seriesId.uuidString.lowercased())/meetings/\(meetingId.uuidString.lowercased())", account.client, store)
             self.title = title.isEmpty ? "Minutia" : title
-            let window = window ?? makeWindow(store: WKWebsiteDataStore(
-                forIdentifier: Self.storeIdentifier(instance: account.client.instance, userId: userId)))
+            let window = window ?? makeWindow(store: store)
             window.title = self.title
             focus(window)
             await load()
@@ -137,14 +140,14 @@ final class RecapWindowController: NSObject, ObservableObject {
     func forgetWebSessions() async {
         window?.close()
         epoch += 1
-        minting?.cancel()
+        minting?.task.cancel()
         minting = nil
         unused = nil
         await remove(await stores.all())
     }
 
-    /// At launch: erase every recap web data store except the signed-in account's, plus any whose
-    /// removal failed before.
+    /// At launch: erase every recap web data store this app made except the signed-in account's, plus
+    /// any whose removal failed before. Data stores the app did not make are never touched.
     func pruneStores(keeping current: UUID?) async {
         await remove(await stores.all().filter { $0 != current })
     }
@@ -170,19 +173,24 @@ final class RecapWindowController: NSObject, ObservableObject {
     }
 
     private func remove(_ ids: [UUID]) async {
-        var pending = Set((defaults.stringArray(forKey: Self.removalKey) ?? []).compactMap(UUID.init(uuidString:)) + ids)
-        defaults.set(pending.map(\.uuidString), forKey: Self.removalKey)
+        var pending = saved(Self.removalKey).union(saved(Self.createdKey).intersection(ids))
+        save(pending, Self.removalKey)
         for id in pending {
             for attempt in 0..<10 {
                 if (try? await stores.remove(id)) != nil {
                     pending.remove(id)
+                    save(saved(Self.createdKey).subtracting([id]), Self.createdKey)
                     break
                 }
                 if attempt < 9 { try? await Task.sleep(nanoseconds: 100_000_000) }
             }
         }
-        defaults.set(pending.map(\.uuidString), forKey: Self.removalKey)
+        save(pending, Self.removalKey)
     }
+
+    private func saved(_ key: String) -> Set<UUID> { Set((defaults.stringArray(forKey: key) ?? []).compactMap(UUID.init(uuidString:))) }
+
+    private func save(_ ids: Set<UUID>, _ key: String) { defaults.set(ids.map(\.uuidString).sorted(), forKey: key) }
 
     private func focus(_ window: NSWindow) {
         presence.opened(Self.presenceId)
@@ -211,7 +219,7 @@ final class RecapWindowController: NSObject, ObservableObject {
             webView.load(URLRequest(url: current.page))
             return
         }
-        let minted = await handoff(current.client)
+        let minted = await handoff(current.client, store: current.store)
         guard mine == generation, self.webView === webView else { return }
         switch minted {
         case .success(let handoff):
@@ -225,27 +233,32 @@ final class RecapWindowController: NSObject, ObservableObject {
         case .failure(let error):
             if error as? MinutiaClientError == .signedOut { onSignedOut() }
             signedIn = true
+            await webView.configuration.websiteDataStore.removeData(ofTypes: [WKWebsiteDataTypeCookies], modifiedSince: .distantPast)
+            guard mine == generation else { return }
             webView.load(URLRequest(url: current.page))
         }
     }
 
-    /// One mint at a time: every attempt while one is pending waits for it, and a handoff minted but
-    /// not yet used (its window closed, or a newer attempt took over) is reused while still valid.
-    private func handoff(_ client: MinutiaClient) async -> Result<Handoff, Error> {
-        if let unused, clock.now().timeIntervalSince(unused.minted) < Self.handoffReuse { return .success(unused) }
+    /// One mint at a time per account: every attempt while one is pending waits for it, and a handoff
+    /// minted but not yet used (its window closed, or a newer attempt took over) is reused while still
+    /// valid, only by the account it was minted for.
+    private func handoff(_ client: MinutiaClient, store: UUID) async -> Result<Handoff, Error> {
+        if let unused, unused.store == store, clock.now().timeIntervalSince(unused.minted) < Self.handoffReuse { return .success(unused) }
+        unused = nil
         let epoch = epoch
-        let task = minting ?? Task { [clock] in
+        let task = minting.flatMap { $0.store == store ? $0.task : nil } ?? Task { [clock] in
             let (nonce, digest) = MinutiaClient.makeHandoffNonce()
             do {
-                return .success(Handoff(id: try await client.webSessionHandoff(nonceDigest: digest), nonce: nonce, minted: clock.now()))
+                let id = try await client.webSessionHandoff(nonceDigest: digest)
+                return .success(Handoff(id: id, nonce: nonce, minted: clock.now(), store: store))
             } catch {
                 return .failure(error)
             }
         }
-        minting = task
+        minting = (store, task)
         let result = await task.value
         guard epoch == self.epoch else { return .failure(CancellationError()) }
-        if minting == task { minting = nil }
+        if minting?.task == task { minting = nil }
         if case .success(let handoff) = result { unused = handoff }
         return result
     }
@@ -266,9 +279,10 @@ final class RecapWindowController: NSObject, ObservableObject {
         return true
     }
 
-    private func makeWindow(store: WKWebsiteDataStore) -> NSWindow {
+    private func makeWindow(store: UUID) -> NSWindow {
+        save(saved(Self.createdKey).union([store]), Self.createdKey)
         let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = store
+        configuration.websiteDataStore = WKWebsiteDataStore(forIdentifier: store)
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -302,6 +316,7 @@ final class RecapWindowController: NSObject, ObservableObject {
         self.window = window
         self.webView = webView
         self.overlay = overlay
+        windowStore = store
         signedIn = false
         return window
     }
@@ -328,6 +343,7 @@ extension RecapWindowController: NSWindowDelegate {
         webView = nil
         overlay = nil
         current = nil
+        windowStore = nil
         presence.closed(Self.presenceId)
     }
 }

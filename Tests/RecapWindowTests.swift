@@ -158,11 +158,12 @@ final class RecapWindowTests: XCTestCase {
 
     private func recap(
         userId: String? = UUID().uuidString.lowercased(), stores: RecapStores = .webKit,
-        token: @escaping () async throws -> String = { "token" }
+        token: @escaping () async throws -> String = { "token" }, user: (() -> String?)? = nil
     ) -> RecapWindowController {
         let base = fake.base
+        let user = user ?? { userId }
         let controller = RecapWindowController(
-            account: { (MinutiaClient(instance: base, supabase: testSupabase(base), tokenProvider: token), userId) },
+            account: { (MinutiaClient(instance: base, supabase: testSupabase(base), tokenProvider: token), user()) },
             openURL: { [weak self] in self?.opened.append($0) }, copy: { [weak self] in self?.copied.append($0) },
             clock: clock.review, presence: presence, defaults: defaults, stores: stores,
             announce: { [weak self] in self?.announced.append($0) }, onSignedOut: { [weak self] in self?.signOutChecks += 1 })
@@ -212,6 +213,23 @@ final class RecapWindowTests: XCTestCase {
     private func openedRecap(_ controller: RecapWindowController, _ meeting: UUID? = nil) async {
         await controller.show(meetingId: meeting ?? meetingId, seriesId: fake.seriesId, title: "Weekly sync").value
         await waitUntil { controller.screen == .page }
+    }
+
+    /// An earlier visit leaves this account's window signed in on the web, then the next handoff is refused.
+    private func signedInEarlier(_ userId: String, thenRefuse status: Int) async {
+        _ = await madeStore(userId)
+        fake.refuseMints(status)
+    }
+
+    private func store(_ userId: String) -> UUID { RecapWindowController.storeIdentifier(instance: fake.base, userId: userId) }
+
+    /// Opens and closes a window for `userId`, so the app has made that account's store.
+    private func madeStore(_ userId: String) async -> UUID {
+        let controller = recap(userId: userId)
+        await openedRecap(controller)
+        controller.window?.performClose(nil)
+        await waitUntil { controller.window == nil }
+        return store(userId)
     }
 
     private func paths(after count: Int = 0) -> [String] {
@@ -304,19 +322,23 @@ final class RecapWindowTests: XCTestCase {
     }
 
     func test_aRefusedHandoff_loadsTheMeeting_soTheWebSignInPageShows_andAsksOnlyOnce() async {
-        fake.refuseMints(429)
-        let controller = recap()
+        let user = UUID().uuidString.lowercased()
+        await signedInEarlier(user, thenRefuse: 429)
+        let before = fake.server.requests.count
+        let controller = recap(userId: user)
         await openedRecap(controller)
 
         let text = await pageText(controller)
         XCTAssertEqual(text, "Sign in to Minutia")
-        XCTAssertEqual(paths(), ["POST /api/companion/web-session", "GET \(fake.meetingPath(meetingId))", "GET /login"])
+        XCTAssertEqual(paths(after: before), ["POST /api/companion/web-session", "GET \(fake.meetingPath(meetingId))", "GET /login"])
         XCTAssertEqual(opened, [])
     }
 
     func test_theServerSayingSignedOut_runsTheMacsSignOutCheck_andShowsTheWebSignIn() async {
-        fake.refuseMints(401)
-        let controller = recap()
+        let user = UUID().uuidString.lowercased()
+        await signedInEarlier(user, thenRefuse: 401)
+        let before = fake.server.requests.count
+        let controller = recap(userId: user)
         await openedRecap(controller)
 
         XCTAssertEqual(signOutChecks, 1)
@@ -365,6 +387,22 @@ final class RecapWindowTests: XCTestCase {
         XCTAssertEqual(fake.server.requests("/auth/companion-session").map { $0.form["handoff_id"] }, ["handoff-1"])
     }
 
+    func test_aHandoffMintedForOneAccount_isNeverPostedForTheNextAccount() async {
+        fake.slowMints(0.6)
+        var account = UUID().uuidString.lowercased()
+        let controller = recap(user: { account })
+        controller.show(meetingId: meetingId, seriesId: fake.seriesId, title: "Weekly sync")
+        await waitUntil { fake.server.requests("/api/companion/web-session").count == 1 }
+        controller.window?.performClose(nil)
+        try? await Task.sleep(nanoseconds: 900_000_000)
+        account = UUID().uuidString.lowercased()
+
+        await openedRecap(controller)
+
+        XCTAssertEqual(fake.mintedDigests.count, 2)
+        XCTAssertEqual(fake.server.requests("/auth/companion-session").map { $0.form["handoff_id"] }, ["handoff-2"])
+    }
+
     // MARK: - What the window shows
 
     func test_offlineWhileSigningIn_saysYoureOffline_withTryAgain() async {
@@ -375,8 +413,8 @@ final class RecapWindowTests: XCTestCase {
         XCTAssertEqual(announced, ["You're offline"])
         XCTAssertEqual(opened, [])
         let seen = onScreen(controller)
-        XCTAssertTrue(seen.has("You're offline"), seen.text)
-        XCTAssertTrue(seen.has("Try again"), seen.text)
+        XCTAssertTrue(seen.hasLine("You're offline"), seen.text)
+        XCTAssertTrue(seen.hasLine("Try again"), seen.text)
         XCTAssertFalse(seen.has("Taking longer than usual"), seen.text)
         XCTAssertEqual(controller.webView?.isHidden, true)
     }
@@ -388,7 +426,7 @@ final class RecapWindowTests: XCTestCase {
         await waitUntil { controller.screen == .offline }
         XCTAssertEqual(announced, ["You're offline"])
         let seen = onScreen(controller)
-        XCTAssertTrue(seen.has("You're offline"), seen.text)
+        XCTAssertTrue(seen.hasLine("You're offline"), seen.text)
         XCTAssertFalse(seen.has("Recap for Weekly sync"), seen.text)
 
         fake.answerMeetings(nil)
@@ -409,7 +447,7 @@ final class RecapWindowTests: XCTestCase {
         try? await Task.sleep(nanoseconds: 100_000_000)
         XCTAssertEqual(announced, [])
         let early = onScreen(controller)
-        XCTAssertTrue(early.has("Weekly sync"), early.text)
+        XCTAssertTrue(early.hasLine("Weekly sync"), early.text)
         XCTAssertFalse(early.has("Taking longer than usual"), early.text)
         XCTAssertEqual(controller.webView?.isHidden, true)
 
@@ -417,9 +455,9 @@ final class RecapWindowTests: XCTestCase {
         await waitUntil { controller.screen == .slow }
         XCTAssertEqual(announced, ["Taking longer than usual"])
         let late = onScreen(controller)
-        XCTAssertTrue(late.has("Taking longer than usual"), late.text)
-        XCTAssertTrue(late.has("Try again"), late.text)
-        XCTAssertTrue(late.has("Open in browser"), late.text)
+        XCTAssertTrue(late.hasLine("Taking longer than usual"), late.text)
+        XCTAssertTrue(late.hasLine("Try again"), late.text)
+        XCTAssertTrue(late.hasLine("Open in browser"), late.text)
 
         controller.openInBrowser()
         XCTAssertEqual(opened.map(\.absoluteString), [page(meetingId).absoluteString])
@@ -450,8 +488,8 @@ final class RecapWindowTests: XCTestCase {
 
         XCTAssertEqual(announced, ["Can't open this server securely"])
         let seen = onScreen(controller)
-        XCTAssertTrue(seen.has("Can't open this server securely"), seen.text)
-        XCTAssertTrue(seen.has("Open in browser"), seen.text)
+        XCTAssertTrue(seen.hasLine("Can't open this server securely"), seen.text)
+        XCTAssertTrue(seen.hasLine("Open in browser"), seen.text)
         XCTAssertFalse(seen.has("You're offline"), seen.text)
         XCTAssertFalse(seen.has("Try again"), seen.text)
     }
@@ -612,8 +650,27 @@ final class RecapWindowTests: XCTestCase {
 
     // MARK: - Web data removal
 
+    func test_theExactLineMatcher_rejectsNegationsExtraWordsAndDigits() {
+        let seen = Seen(text: "", frames: [("You're not offline", .zero), ("You're offline now", .zero), ("Keep 12", .zero), ("Taking longer than usual", .zero)])
+        XCTAssertFalse(seen.hasLine("You're offline"))
+        XCTAssertFalse(seen.hasLine("Keep 1"))
+        XCTAssertFalse(seen.hasLine("Taking longer"))
+        XCTAssertTrue(seen.hasLine("Taking longer than usual"))
+    }
+
+    func test_launchPruning_leavesDataStoresTheAppDidNotMake() async {
+        let made = await madeStore(UUID().uuidString.lowercased())
+        let foreign = UUID()
+        let stores = StoreDouble([made, foreign])
+
+        await recap(stores: stores.stores).pruneStores(keeping: nil)
+
+        XCTAssertEqual(stores.removed, [made])
+        XCTAssertEqual(stores.ids, [foreign])
+    }
+
     func test_aRemovalThatFails_isRetriedAtTheNextLaunch() async {
-        let stuck = UUID()
+        let stuck = await madeStore(UUID().uuidString.lowercased())
         let first = StoreDouble([stuck])
         first.failing = [stuck]
         await recap(stores: first.stores).forgetWebSessions()
@@ -686,7 +743,7 @@ final class RecapWindowTests: XCTestCase {
         await waitUntil { app.recapWindow.screen == .offline }
         XCTAssertEqual(opened, [])
         let seen = onScreen(app.recapWindow)
-        XCTAssertTrue(seen.has("You're offline"), seen.text)
+        XCTAssertTrue(seen.hasLine("You're offline"), seen.text)
     }
 
     func test_signingOutOnTheMac_closesTheWindow_andErasesItsWebData() async throws {
@@ -715,19 +772,21 @@ final class RecapWindowTests: XCTestCase {
         XCTAssertTrue(gone)
     }
 
-    func test_launchingSignedOut_erasesEveryRecapWebStore() async {
-        let leftovers = StoreDouble([UUID(), UUID()])
-        let all = leftovers.ids
+    func test_launchingSignedOut_erasesEveryRecapWebStore_andNothingElse() async {
+        let made = [await madeStore(UUID().uuidString.lowercased()), await madeStore(UUID().uuidString.lowercased())]
+        let foreign = UUID()
+        let leftovers = StoreDouble(made + [foreign])
         let app = app(stores: leftovers.stores)
         await app.authManager.adopt(testSupabase(fake.base), instance: fake.base)
 
         await app.restoreSession()
 
-        XCTAssertEqual(Set(leftovers.removed), Set(all))
+        XCTAssertEqual(Set(leftovers.removed), Set(made))
+        XCTAssertEqual(leftovers.ids, [foreign])
     }
 
     func test_launchingSignedIn_keepsThisAccountsWebStore_andErasesTheRest() async throws {
-        let stale = UUID()
+        let stale = await madeStore(UUID().uuidString.lowercased())
         let stores = StoreDouble([signedInStore, stale])
         let app = try await signedInApp(stores: stores.stores)
 
