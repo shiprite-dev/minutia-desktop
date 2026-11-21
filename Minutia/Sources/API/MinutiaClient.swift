@@ -683,9 +683,11 @@ extension MinutiaClient {
     }
 
     func regenerateSuggestions(meetingId: UUID) async throws {
-        let request = Self.bearerRequest(
+        var request = Self.bearerRequest(
             instance.appendingPathComponent("api/meetings/\(meetingId.uuidString.lowercased())/suggestions"),
             method: "POST", token: try await tokenProvider())
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data("{\"mode\":\"generate\"}".utf8)
         let (_, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if status == 401 { throw MinutiaClientError.signedOut }

@@ -260,11 +260,13 @@ final class ReviewClientTests: XCTestCase {
         XCTAssertEqual(result, .retryable)
     }
 
-    func test_regenerate_postsToTheMeetingsSuggestionsRoute() async throws {
-        respond(202, "{}")
+    func test_regenerate_postsTheBodyTheServersSchemaParses() async throws {
+        respond(200, "{\"suggestions\":[],\"request_id\":\"5b0d7a52-0c8e-4a43-9b8e-2f1d3c4b5a69\"}")
         try await client().regenerateSuggestions(meetingId: meeting)
         XCTAssertEqual(ReviewStub.seen[0].httpMethod, "POST")
         XCTAssertEqual(ReviewStub.seen[0].url?.path, "/api/meetings/3f95ffd6-fd1e-4640-aacc-89e1c051f742/suggestions")
+        XCTAssertEqual(ReviewStub.seen[0].value(forHTTPHeaderField: "Content-Type"), "application/json")
+        XCTAssertEqual(String(decoding: ReviewStub.seenBodies[0], as: UTF8.self), "{\"mode\":\"generate\"}")
     }
 
     func test_regenerate_throwsWhenTheServerRefuses() async {

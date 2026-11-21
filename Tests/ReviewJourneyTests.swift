@@ -148,6 +148,35 @@ final class ReviewServer: URLProtocol {
             let left = (meetings[meeting]?["rows"] as? [[String: Any]])?.filter { $0["id"] as? String != suggestion }
             meetings[meeting]?["rows"] = left
             return (200, "{\"suggestion\":{},\"code\":\"saved\"}")
+        case ("POST", 4) where parts[3] == "suggestions": return (401, "{\"error\":\"Not authenticated\",\"request_id\":\"8c1c2f3e-6a52-4f55-9d0b-0d1f7d9f9c11\"}")
+            default: return (401, "{\"error\":\"Not authenticated\"}")
+            }
+        }
+        switch (method, parts.count) {
+        case ("GET", _) where path == "/api/companion/review-queue":
+            if queueFailsFlag { return (500, "{\"error\":\"Couldn't load meetings.\",\"code\":\"load_failed\"}") }
+            let me = "00000000-0000-0000-0000-000000000001"
+            if let query, query.hasPrefix("meeting=") {
+                let id = String(query.dropFirst("meeting=".count))
+                guard let meeting = meetings[id], !gone.contains(id) else { return (404, "{\"code\":\"meeting_gone\"}") }
+                return (200, json(["me": me, "meetings": [meeting]]))
+            }
+            return (200, json(["me": me, "meetings": order.filter { !gone.contains($0) }.compactMap { meetings[$0] }]))
+        case ("PATCH", 5):
+            let (meeting, suggestion) = (parts[2], parts[4])
+            if gone.contains(meeting) { return (404, "{\"code\":\"suggestion_gone\"}") }
+            if let refusal = refusals[suggestion] { return refusal }
+            let left = (meetings[meeting]?["rows"] as? [[String: Any]])?.filter { $0["id"] as? String != suggestion }
+            meetings[meeting]?["rows"] = left
+            return (200, "{\"suggestion\":{},\"code\":\"saved\"}")
+        case ("POST", 4) where parts[3] == "suggestions":
+            guard (body as NSDictionary) == ["mode": "generate"] else {
+                return (400, "{\"error\":\"Invalid request body\",\"request_id\":\"5b0d7a52-0c8e-4a43-9b8e-2f1d3c4b5a69\"}")
+            }
+            if refuseRetryFlag { return (500, "{\"error\":\"Server words\",\"request_id\":\"5b0d7a52-0c8e-4a43-9b8e-2f1d3c4b5a69\"}") }
+            if let next = onRetry[parts[2]] { meetings[parts[2]] = next }
+            let rows = (meetings[parts[2]]?["rows"] as? [[String: Any]]) ?? []
+            return (200, json(["suggestions": rows.map { ["id": $0["id"]!, "title": $0["title"]!, "status": "pending"] }, "request_id": "5b0d7a52-0c8e-4a43-9b8e-2f1d3c4b5a69"]))
         case ("POST", 4):
             if refuseRetryFlag { return (500, "{\"error\":\"Server words\"}") }
             if let next = onRetry[parts[2]] { meetings[parts[2]] = next }
@@ -1216,6 +1245,29 @@ final class ReviewJourneyTests: XCTestCase {
         clock.advance(6)
         XCTAssertEqual(ReviewServer.meetingReads, 301)
         XCTAssertEqual(announcements, ["Transcribing", "Taking longer than usual. We'll let you know when it's ready."])
+    }
+
+    // MARK: - When the server cannot help
+
+    func test_tryAgain_afterFindingFailed_theRealServerAcceptsTheRequest() async throws {
+        ReviewServer.put(try meeting(suggestions: "failed"))
+        ReviewServer.afterRetry(meetingId, becomes: try meeting(rows: [row(UUID(), "Send the budget")]))
+        let review = review()
+        await openPanel(review)
+        await review.start(meetingId: meetingId).value
+        XCTAssertEqual(review.shown?.screen.message, "We couldn't find action items this time.")
+        announcements = []
+
+        ReviewServer.holdRetries = true
+        let pressing = Task { await review.tryAgain() }
+        await waitUntil { ReviewServer.retries.count == 1 }
+        XCTAssertEqual(review.shown?.screen.message, "Finding action items")
+        ReviewServer.releaseSaves()
+        await pressing.value
+
+        XCTAssertEqual(texts(review), ["New items", "Send the budget"])
+        XCTAssertEqual(review.buttons.map(\.title), ["Keep 1", "Skip the rest", "Open recap"])
+        XCTAssertEqual(announcements, ["Finding action items", "1 action item from Weekly sync"], "the failed line never comes back for this press")
     }
 
     // MARK: - On screen
