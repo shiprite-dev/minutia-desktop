@@ -30,12 +30,14 @@ final class ReviewServer: URLProtocol {
     nonisolated(unsafe) private static var olderFlag = false
     nonisolated(unsafe) private static var queueFailsFlag = false
     nonisolated(unsafe) private static var signedOutFlag = false
+    nonisolated(unsafe) private static var boardItems: [String] = []
+    nonisolated(unsafe) private static var holdQueueFlag = false
 
     static func reset() {
         lock.withLock {
             meetings = [:]; order = []; gone = []; refusals = [:]; held = []; seen = []
             offlineFlag = false; holdFlag = false; loseFlag = false; onRetry = [:]; holdRetryFlag = false; refuseRetryFlag = false
-            olderFlag = false; queueFailsFlag = false; signedOutFlag = false
+            olderFlag = false; queueFailsFlag = false; signedOutFlag = false; boardItems = []; holdQueueFlag = false
         }
     }
 
@@ -118,6 +120,22 @@ final class ReviewServer: URLProtocol {
     static var requests: [Seen] { lock.withLock { seen } }
     static var saves: [Seen] { requests.filter { $0.method == "PATCH" } }
     static var meetingReads: Int { requests.filter { $0.method == "GET" && $0.query?.hasPrefix("meeting=") == true }.count }
+    /// The queue list never answers.
+    static var holdQueue: Bool {
+        get { lock.withLock { holdQueueFlag } }
+        set { lock.withLock { holdQueueFlag = newValue } }
+    }
+
+    static func queueLoads(on host: String? = nil) -> Int {
+        requests.filter { $0.method == "GET" && $0.path == "/api/companion/review-queue" && $0.query == nil && (host == nil || $0.host == host) }.count
+    }
+
+    static func checkins(on host: String) -> Int {
+        requests.filter { $0.method == "POST" && $0.path == "/api/companion/checkin" && $0.host == host }.count
+    }
+
+    /// Titles the server put on the board, in the order they were kept.
+    static var board: [String] { lock.withLock { boardItems } }
     static func pendingRows(_ id: UUID) -> [String] {
         lock.withLock { (meetings[id.uuidString.lowercased()]?["rows"] as? [[String: Any]])?.map { $0["title"] as! String } ?? [] }
     }
@@ -136,7 +154,8 @@ final class ReviewServer: URLProtocol {
             if Self.offlineFlag { return (.failure(URLError(.notConnectedToInternet)), false) }
             let answer = Self.answer(method: method, path: url.path, query: url.query, body: body)
             if method == "PATCH" && Self.loseFlag { return (.failure(URLError(.networkConnectionLost)), Self.holdFlag) }
-            return (.success(answer), (method == "PATCH" && Self.holdFlag) || (method == "POST" && Self.holdRetryFlag))
+            let queueList = method == "GET" && url.path == "/api/companion/review-queue" && url.query == nil
+            return (.success(answer), (method == "PATCH" && Self.holdFlag) || (method == "POST" && Self.holdRetryFlag) || (queueList && Self.holdQueueFlag))
         }
         let finish = { [self] in
             switch outcome {
@@ -179,8 +198,11 @@ final class ReviewServer: URLProtocol {
             let (meeting, suggestion) = (parts[2], parts[4])
             if gone.contains(meeting) { return (404, "{\"code\":\"suggestion_gone\"}") }
             if let refusal = refusals[suggestion] { return refusal }
-            let left = (meetings[meeting]?["rows"] as? [[String: Any]])?.filter { $0["id"] as? String != suggestion }
-            meetings[meeting]?["rows"] = left
+            let rows = (meetings[meeting]?["rows"] as? [[String: Any]]) ?? []
+            if body["action"] as? String == "accept", let kept = rows.first(where: { $0["id"] as? String == suggestion }) {
+                boardItems.append(kept["title"] as! String)
+            }
+            meetings[meeting]?["rows"] = rows.filter { $0["id"] as? String != suggestion }
             return (200, "{\"suggestion\":{},\"code\":\"saved\"}")
         case ("POST", 4) where parts[3] == "suggestions":
             guard (body as NSDictionary) == ["mode": "generate"] else {
@@ -487,6 +509,108 @@ final class ReviewJourneyTests: XCTestCase {
         XCTAssertEqual(ReviewServer.pendingRows(meetingId), [], "the server kept it")
         XCTAssertEqual(review.model?.screen.message, "1 item tracked")
         XCTAssertEqual(ReviewServer.saves.count, 1)
+    }
+
+    func test_aHangingQueueRequest_neverHoldsUpTheNextCheckIn() async throws {
+        AuthServerStub.reset()
+        AuthServerStub.signInBody = AuthServerStub.validSessionBody
+        URLProtocol.unregisterClass(ReviewServer.self)
+        URLProtocol.registerClass(AuthServerStub.self)
+        URLProtocol.registerClass(ReviewServer.self)
+        defer { URLProtocol.unregisterClass(AuthServerStub.self) }
+        ReviewServer.holdQueue = true
+        let server = URL(string: "https://hanging.example.com")!
+        let app = app()
+        await app.authManager.adopt(testSupabase(server), instance: server)
+        try await app.authManager.signIn(email: "first@example.com", password: "pw")
+        app.checkInNow()
+        await waitUntil { ReviewServer.checkins(on: server.host!) >= 1 && ReviewServer.queueLoads(on: server.host!) == 1 }
+        let checkins = ReviewServer.checkins(on: server.host!)
+
+        app.checkInNow()
+        await waitUntil { ReviewServer.checkins(on: server.host!) == checkins + 1 }
+        XCTAssertEqual(ReviewServer.queueLoads(on: server.host!), 1, "never two queue loads at once")
+    }
+
+    func test_anUnchangedQueue_isNotPublishedAgain() async throws {
+        ReviewServer.put(try meeting(rows: [row(UUID(), "Send the budget")]))
+        let review = review()
+        await review.refreshQueue()
+        XCTAssertEqual(review.queueRows.map(\.title), ["Weekly sync · today · 1 to review"])
+
+        var changes = 0
+        let watch = review.objectWillChange.sink { changes += 1 }
+        await review.refreshQueue()
+        watch.cancel()
+        XCTAssertEqual(ReviewServer.queueLoads(), 2)
+        XCTAssertEqual(changes, 0, "the menu is not redrawn for the same queue")
+    }
+
+    func test_anOlderServer_isNotAskedForTheQueueAgain_untilTheServerChanges() async throws {
+        ReviewServer.olderServer = true
+        var server = URL(string: "https://older.example.com")!
+        let review = ReviewController(
+            client: { Self.client(server) }, clock: clock.review, defaults: UserDefaults(suiteName: suite)!, notify: { _ in })
+        reviews.append(review)
+        await review.refreshQueue()
+        await review.refreshQueue()
+        XCTAssertEqual(ReviewServer.queueLoads(on: "older.example.com"), 1)
+
+        server = URL(string: "https://other.example.com")!
+        await review.refreshQueue()
+        XCTAssertEqual(ReviewServer.queueLoads(on: "other.example.com"), 1, "a different server is asked")
+    }
+
+    func test_closingTheReviewMidSave_stillKeepsEveryTickedItem() async throws {
+        ReviewServer.put(try meeting(rows: [row(UUID(), "Send the budget"), row(UUID(), "Book the Acme interview"), row(UUID(), "Draft the hiring plan")]))
+        let review = review()
+        await openPanel(review)
+        await review.start(meetingId: meetingId).value
+
+        ReviewServer.holdSaves = true
+        let keeping = Task { await review.keep() }
+        await waitUntil { ReviewServer.saves.count == 1 }
+        review.close()
+        review.setPanelOpen(false)
+        ReviewServer.holdSaves = false
+        ReviewServer.releaseSaves()
+        await keeping.value
+
+        XCTAssertEqual(ReviewServer.board, ["Send the budget", "Book the Acme interview", "Draft the hiring plan"])
+        XCTAssertEqual(ReviewServer.pendingRows(meetingId), [])
+        await review.setPanelOpen(true)?.value
+        XCTAssertEqual(review.shown?.screen.message, "3 items tracked")
+    }
+
+    func test_offlineAtSkip_retrySkipsIt_neverKeeps() async throws {
+        let (keep, first, second) = (UUID(), UUID(), UUID())
+        ReviewServer.put(try meeting(rows: [row(keep, "Send the budget"), row(first, "Book the Acme interview"), row(second, "Draft the launch post")]))
+        let review = review()
+        await openPanel(review)
+        await review.start(meetingId: meetingId).value
+        review.toggle(first)
+        review.toggle(second)
+
+        ReviewServer.offline = true
+        await review.skipRest()
+        XCTAssertEqual(note(review, "Book the Acme interview"), "Couldn't save. Try again.")
+        XCTAssertEqual(note(review, "Draft the launch post"), "Couldn't save. Try again.")
+
+        ReviewServer.offline = false
+        await review.retry(first)
+        XCTAssertEqual(ReviewServer.saves.last?.body["action"] as? String, "reject")
+        XCTAssertFalse(texts(review).contains("Book the Acme interview"), "the retried skip leaves the list as skipped")
+        XCTAssertEqual(review.buttons.map(\.title), ["Keep 1", "Skip the rest", "Open recap"])
+
+        await review.skipRest()
+        XCTAssertEqual(ReviewServer.saves.last?.body["action"] as? String, "reject")
+        XCTAssertFalse(texts(review).contains("Draft the launch post"), "Skip the rest also skips a row whose skip failed")
+        XCTAssertEqual(ReviewServer.board, [], "a skipped item never lands on the board")
+
+        await review.keep()
+        XCTAssertEqual(review.model?.screen.message, "1 item tracked")
+        XCTAssertEqual(ReviewServer.board, ["Send the budget"])
+        XCTAssertEqual(ReviewServer.pendingRows(meetingId), [])
     }
 
     func test_offlineAtKeep_eachRowSaysCouldntSave_andRetryKeepsItOnce() async throws {
@@ -796,7 +920,7 @@ final class ReviewJourneyTests: XCTestCase {
         let starting = review.start(meetingId: meetingId)
         XCTAssertEqual(review.model?.screen, .ready, "a queued meeting opens straight to its rows")
         await starting.value
-        XCTAssertEqual(ReviewServer.meetingReads, 1)
+        XCTAssertEqual(texts(review), ["New items", "Send the budget", "Book the Acme interview"])
 
         ReviewServer.delete(meetingId)
         await review.keep()
@@ -1308,7 +1432,7 @@ final class ReviewJourneyTests: XCTestCase {
 
     // MARK: - When the server cannot help
 
-    func test_tryAgain_afterFindingFailed_theRealServerAcceptsTheRequest() async throws {
+    func test_tryAgain_afterFindingFailed_theStubMirroringTheRealRouteAcceptsTheRequest() async throws {
         ReviewServer.put(try meeting(suggestions: "failed"))
         ReviewServer.afterRetry(meetingId, becomes: try meeting(rows: [row(UUID(), "Send the budget")]))
         let review = review()
@@ -1354,7 +1478,34 @@ final class ReviewJourneyTests: XCTestCase {
         ])
     }
 
-    func test_afterStop_whenTheReviewKeepsFailing_endsWithOpenRecap() async throws {
+    func test_afterStop_offlineForNineSecondsThenBack_theReviewCarriesOnToTheRows() async throws {
+        ReviewServer.put(try meeting(transcription: "processing", suggestions: nil, endedAgo: 0))
+        ReviewServer.queueFails = true
+        let app = app()
+        await app.authManager.adopt(testSupabase(instance), instance: instance)
+        app.apply(.signedIn)
+        await app.panelOpened()?.value
+
+        app.presentRecapCue(RecapCue(meetingId: meetingId))
+        await waitUntil { ReviewServer.meetingReads == 1 && clock.sleeping == 1 }
+        for reads in 2...4 {
+            await tick(3)
+            await waitUntil { ReviewServer.meetingReads == reads && clock.sleeping == 1 }
+        }
+        XCTAssertEqual(app.review.shown?.screen.message, "Transcribing", "a few misses in a row are not the end")
+
+        ReviewServer.queueFails = false
+        ReviewServer.update(meetingId) {
+            $0["transcription_status"] = "completed"; $0["suggestions_status"] = "ready"; $0["status_at"] = self.stamp(self.clock.now)
+            $0["rows"] = [try! self.row(UUID(), "Send the budget")]
+        }
+        await tick(3)
+        await waitUntil { app.review.shown?.screen == .ready }
+        XCTAssertEqual(texts(app.review), ["New items", "Send the budget"])
+        XCTAssertEqual(app.review.buttons.map(\.title), ["Keep 1", "Skip the rest", "Open recap"])
+    }
+
+    func test_afterStop_whenTheReviewFailsUntilTheFifteenMinuteCap_endsWithOpenRecap() async throws {
         ReviewServer.queueFails = true
         let app = app()
         await app.authManager.adopt(testSupabase(instance), instance: instance)
@@ -1365,9 +1516,11 @@ final class ReviewJourneyTests: XCTestCase {
         await waitUntil { ReviewServer.meetingReads == 1 && clock.sleeping == 1 }
         await tick(3)
         await waitUntil { ReviewServer.meetingReads == 2 && clock.sleeping == 1 }
-        XCTAssertEqual(app.review.shown?.screen.message, "Transcribing", "two misses are not yet the end")
+        await tick(893)
+        await waitUntil { ReviewServer.meetingReads == 3 && clock.sleeping == 1 }
+        XCTAssertEqual(app.review.shown?.screen.message, "Transcribing", "still asking at 14 min 56 s")
 
-        await tick(3)
+        await tick(4)
         await waitUntil { app.review.shown?.screen == .notAvailable }
         XCTAssertEqual(app.review.buttons.map(\.title), ["Done", "Open recap"])
         let seen = Host.text(menu(app))
@@ -1718,6 +1871,26 @@ final class ReviewJourneyTests: XCTestCase {
         XCTAssertTrue(KeyWindow(panel(review)).helps().contains(owner), "the whole name shows on hover")
     }
 
+    func test_tenMeetingsToReview_showThreeAndAMoreOnTheWebLine_thatOpensTheWeb() async throws {
+        let app = app()
+        await app.authManager.adopt(testSupabase(instance), instance: instance)
+        app.apply(.signedIn)
+        for minutes in 1...10 {
+            ReviewServer.put(try meeting(UUID(), rows: [row(UUID(), "Send the budget")], endedAgo: Double(minutes) * 60))
+        }
+        await app.review.refreshQueue()
+        XCTAssertEqual(app.review.queueRows.count, 10)
+        let menu = MenuContent(controller: app, updater: UpdaterController())
+
+        XCTAssertLessThanOrEqual(Host.size(menu).height, 520, "ten meetings still fit the menu")
+        let window = KeyWindow(menu)
+        let labels = window.controls().map(\.label)
+        XCTAssertEqual(labels.filter { $0 == "Weekly sync · today · 1 to review" }.count, 3)
+        XCTAssertTrue(labels.contains("7 more on the web"), "\(labels)")
+        window.press("7 more on the web")
+        XCTAssertEqual(opened, [instance])
+    }
+
     func test_fiveNewItemsAndSixUpdates_scrollTheRows_andTheHeaderAndKeepStayOnScreen() async throws {
         var rows = try (1...5).map { try row(UUID(), "Follow up on item \($0) with the team") }
         for n in 1...6 {
@@ -1859,9 +2032,14 @@ final class ReviewJourneyTests: XCTestCase {
 
     private static func okPixels(_ image: CGImage) -> Int {
         let (width, height, data) = Host.pixels(image)
-        return (0..<(width * height)).filter { index in
-            abs(Int(data[index * 4]) - 0x2D) < 14 && abs(Int(data[index * 4 + 1]) - 0x7A) < 14 && abs(Int(data[index * 4 + 2]) - 0x4B) < 14
-        }.count
+        var count = 0
+        for index in 0..<(width * height) {
+            let red: Int = Int(data[index * 4]) - 0x2D
+            let green: Int = Int(data[index * 4 + 1]) - 0x7A
+            let blue: Int = Int(data[index * 4 + 2]) - 0x4B
+            if abs(red) < 14, abs(green) < 14, abs(blue) < 14 { count += 1 }
+        }
+        return count
     }
 }
 
@@ -1943,6 +2121,12 @@ final class KeyWindow {
             let title = Self.ask(node, #selector(NSAccessibilityProtocol.accessibilityTitle))
             return (role, label.isEmpty ? (title as? NSAttributedString)?.string ?? title as? String ?? "" : label)
         }
+    }
+
+    func press(_ label: String) {
+        let node = elements().first { Self.ask($0, #selector(NSAccessibilityProtocol.accessibilityLabel)) as? String == label }
+        _ = node?.perform(#selector(NSAccessibilityProtocol.accessibilityPerformPress))
+        spin(0.2)
     }
 
     func labels() -> [String] {

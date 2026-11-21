@@ -631,7 +631,8 @@ extension MinutiaClient {
             components.queryItems = [URLQueryItem(name: "meeting", value: meetingId.uuidString.lowercased())]
             url = components.url!
         }
-        let request = Self.bearerRequest(url, method: "GET", token: try await tokenProvider())
+        var request = Self.bearerRequest(url, method: "GET", token: try await tokenProvider())
+        request.timeoutInterval = 10
         let data: Data
         let status: Int
         do {

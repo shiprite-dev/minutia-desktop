@@ -77,7 +77,6 @@ final class ReviewController: ObservableObject {
     static let readyPoll: TimeInterval = 30
     static let pollLimit: TimeInterval = 15 * 60
     static let doneHold: TimeInterval = 4
-    static let loadAttempts = 3
 
     @Published private(set) var model: ReviewModel?
     @Published private(set) var queue: [ReviewMeeting] = []
@@ -97,7 +96,8 @@ final class ReviewController: ObservableObject {
     private var retrying: UUID?
     private var postedHere: Set<UUID> = []
     private var generation = 0
-    private var loadFailures = 0
+    private var queueTask: Task<Void, Never>?
+    private var queueMissingOn: URL?
     private var transcribingSince: (meetingId: UUID, at: Date)?
     private var pollStarted = Date.distantPast
     private var pollTask: Task<Void, Never>?
@@ -126,7 +126,6 @@ final class ReviewController: ObservableObject {
         hidden = false
         pollStarted = clock.now()
         if model?.meetingId != meetingId {
-            loadFailures = 0
             let queued = queue.first { $0.meetingId == meetingId }
             meeting = queued
             show(queued.map { reviewModel($0, previous: nil) }
@@ -140,7 +139,7 @@ final class ReviewController: ObservableObject {
     /// Closing while the AI still works only hides the review; it keeps checking so the
     /// "We'll let you know" promise holds.
     func close() {
-        guard let model, Self.working(model.screen) else { return dismiss() }
+        guard let model, Self.working(model.screen) || saving else { return dismiss() }
         closeTask?.cancel()
         closeTask = nil
         hidden = true
@@ -203,7 +202,6 @@ final class ReviewController: ObservableObject {
             guard generation == self.generation, model?.meetingId == id else { return }
             me = response.me
             guard let fetched = response.meetings.first(where: { $0.meetingId == id }) else { throw ReviewQueueError.meetingGone }
-            loadFailures = 0
             meeting = fetched
             merge(fetched)
             if !saving, retrying != id { show(reviewModel(fetched, previous: model)) }
@@ -217,33 +215,44 @@ final class ReviewController: ObservableObject {
             onSignedOut()
         } catch {
             guard generation == self.generation, let shown = model, shown.meetingId == id else { return }
-            loadFailures += 1
-            let unreachable = error as? ReviewQueueError == .olderServer || loadFailures >= Self.loadAttempts
+            let unreachable = error as? ReviewQueueError == .olderServer || clock.now().timeIntervalSince(pollStarted) >= Self.pollLimit
             if unreachable, Self.working(shown.screen), !saving, retrying != id { show(ReviewModel(meetingId: id, screen: .notAvailable)) }
         }
         schedulePoll()
     }
 
+    /// Joins the queue load already running instead of starting a second one.
     func refreshQueue() async {
-        guard let client = client() else { return }
+        if let queueTask { return await queueTask.value }
+        let task = Task { await loadQueue() }
+        queueTask = task
+        await task.value
+        queueTask = nil
+    }
+
+    private func loadQueue() async {
+        guard let client = client(), client.instance != queueMissingOn else { return }
         let generation = generation
         do {
             let response = try await client.reviewQueue(meetingId: nil)
             guard generation == self.generation else { return }
             me = response.me
-            queue = Self.sorted(response.meetings.filter(Self.waits))
+            let waiting = Self.sorted(response.meetings.filter(Self.waits))
+            if waiting != queue { queue = waiting }
             let stored = defaults.dictionary(forKey: Self.notifiedKey) as? [String: Date]
             let now = clock.now()
-            let waiting = Set(queue.map { $0.meetingId.uuidString })
-            var posted = (stored ?? [:]).filter { now.timeIntervalSince($0.value) < Self.postedKeep || waiting.contains($0.key) }
+            let ids = Set(queue.map { $0.meetingId.uuidString })
+            var posted = (stored ?? [:]).filter { now.timeIntervalSince($0.value) < Self.postedKeep || ids.contains($0.key) }
             for meeting in queue where posted[meeting.meetingId.uuidString] == nil {
                 posted[meeting.meetingId.uuidString] = now
                 if stored != nil, !panelOpen, !postedHere.contains(meeting.meetingId) { post(meeting) }
             }
-            defaults.set(posted, forKey: Self.notifiedKey)
+            if posted != stored { defaults.set(posted, forKey: Self.notifiedKey) }
         } catch ReviewQueueError.signedOut {
             guard generation == self.generation else { return }
             onSignedOut()
+        } catch ReviewQueueError.olderServer {
+            queueMissingOn = client.instance
         } catch {}
     }
 
@@ -269,8 +278,8 @@ final class ReviewController: ObservableObject {
     }
 
     func retry(_ id: UUID) async {
-        guard model?.rowState[id] == .failed else { return }
-        await save(.accept, [id])
+        guard let model, model.rowState[id] == .failed else { return }
+        await save(model.selection.contains(id) ? .accept : .reject, [id])
     }
 
     func skipRest() async {
@@ -361,7 +370,7 @@ final class ReviewController: ObservableObject {
             noticeOnce(meeting, post: !panelOpen || hidden)
         }
         if hidden, !Self.working(next.screen) {
-            if next.screen == .ready { dismiss() }
+            if next.screen == .ready, !saving { dismiss() }
             return
         }
         if case .done = next.screen {
@@ -476,7 +485,7 @@ extension ReviewController {
     private var shownRows: [ReviewRow] { (model?.newRows ?? []) + (model?.updateRows ?? []) }
 
     private func skippable(_ model: ReviewModel) -> [ReviewRow] {
-        shownRows.filter { !model.selection.contains($0.id) && (model.rowState[$0.id] ?? .idle) == .idle }
+        shownRows.filter { !model.selection.contains($0.id) && [.idle, .failed].contains(model.rowState[$0.id] ?? .idle) }
     }
 
     private func skipped(_ id: UUID) -> Bool { model?.rowState[id] == .saved && model?.selection.contains(id) == false }

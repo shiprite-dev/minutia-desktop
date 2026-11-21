@@ -170,7 +170,7 @@ private struct IdleHost: View {
             onSelect: controller.pickSeries,
             onRecord: { controller.startRecording() },
             onDismissDetection: { controller.dismissDetection() },
-            onOpenURL: { NSWorkspace.shared.open($0) },
+            onOpenURL: controller.openURL,
             onOpenMicSettings: openMicrophoneSettings,
             onOpenReview: { controller.review.start(meetingId: $0) })
             .onAppear {
@@ -191,6 +191,8 @@ struct IdleScreen: View {
     var onOpenReview: (UUID) -> Void = { _ in }
     @Environment(\.motionReduced) private var reduceMotion
     @Environment(\.consentPending) private var consentPending
+
+    static let queueShown = 3
 
     private var selectedName: String? { model.series.first { $0.id == model.selected }?.name }
 
@@ -220,7 +222,16 @@ struct IdleScreen: View {
             if !model.queue.isEmpty {
                 Eyebrow(text: "To review")
                 VStack(spacing: 0) {
-                    ForEach(model.queue) { row in ReviewQueueLine(row: row) { onOpenReview(row.id) } }
+                    ForEach(model.queue.prefix(Self.queueShown)) { row in ReviewQueueLine(row: row) { onOpenReview(row.id) } }
+                    if model.queue.count > Self.queueShown {
+                        Button(ReviewCopy.moreOnWeb(model.queue.count - Self.queueShown)) { onOpenURL(model.instance) }
+                            .buttonStyle(.plain)
+                            .font(Typo.body)
+                            .foregroundStyle(Brand.ink3)
+                            .padding(.horizontal, Space.x2)
+                            .padding(.vertical, 7)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
                 .padding(.horizontal, -Space.x2)
             }

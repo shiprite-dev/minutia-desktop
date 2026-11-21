@@ -750,7 +750,7 @@ final class AppController: NSObject, ObservableObject {
     private var recoveryTask: Task<Void, Never>?
     private var recoverySlot = RecoverySlot()
     private let defaults: UserDefaults
-    private let openURL: (URL) -> Void
+    let openURL: (URL) -> Void
     private let micCheck: () -> (status: AVAuthorizationStatus, hasInputDevice: Bool)
     private var screenLocked = false
     private var asleep = false
@@ -1570,7 +1570,7 @@ final class AppController: NSObject, ObservableObject {
         Task {
             let claim = await client.checkin(deviceId: deviceId, deviceName: DeviceIdentity.name, canClaim: canClaim)
             if let claim { await handleClaim(claim) }
-            await review.refreshQueue()
+            Task { await review.refreshQueue() }
             checkinInFlight = false
             scheduleNextCheckin()
         }
