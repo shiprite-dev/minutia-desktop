@@ -182,7 +182,7 @@ final class CaptureSession: ObservableObject {
 
     /// Stops capture, drains fast-lane uploads, uploads the full recording, and requests the final
     /// transcription. Local files are deleted only once transcription has been accepted.
-    func stop(flushNotes: @escaping @Sendable () async throws -> Void = {}, recapOpened: Bool = false,
+    func stop(flushNotes: @escaping @Sendable () async throws -> Void = {},
               notifyLocalFailure: @escaping @Sendable (LocalTranscriber.Failure) async -> Void = { _ in },
               onLocalOutcome: @escaping @Sendable (Bool) async -> Void = { _ in }) async throws -> StopResult {
         guard let pipeline, let queue, let client, let meetingId, let directory else {
@@ -215,7 +215,7 @@ final class CaptureSession: ObservableObject {
             return try await Self.finishOnDevice(
                 meetingId: meetingId, directory: directory, tail: tail,
                 durationSeconds: Double(finished.recording.frames) / MixPlan.sampleRate,
-                transcriber: transcriber, transport: client, recapOpened: recapOpened,
+                transcriber: transcriber, transport: client,
                 deviceOnly: deviceOnly, cloud: client,
                 flushNotes: flushNotes, onStep: finishingStepReporter(),
                 notifyLocalFailure: notifyLocalFailure, onLocalOutcome: onLocalOutcome)
@@ -235,7 +235,7 @@ final class CaptureSession: ObservableObject {
         segmentsUploaded = outcome.counts.uploaded
         segmentsTotal = outcome.counts.enqueued
 
-        if !recapOpened { Task { await client.warmSummary(meetingId: meetingId) } }
+        Task { await client.warmSummary(meetingId: meetingId) }
         Task { await Self.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId) } }
 
         try? FileManager.default.removeItem(at: directory)
@@ -374,10 +374,10 @@ final class CaptureSession: ObservableObject {
 
     /// The device-mode stop after capture has finished: finishes local transcription, writes
     /// `transcript.json`, marks the meeting as waiting for this Mac, submits it, deletes the directory on
-    /// a 2xx, then warms the summary (unless the recap already opened) and ends the meeting.
+    /// a 2xx, then warms the summary and ends the meeting.
     nonisolated static func finishOnDevice(
         meetingId: String, directory: URL, tail: [SegmentWriter.ClosedSegment], durationSeconds: Double,
-        transcriber: LocalTranscriber, transport: any DeviceTranscriptTransport, recapOpened: Bool,
+        transcriber: LocalTranscriber, transport: any DeviceTranscriptTransport,
         deviceOnly: Bool = true, cloud: (any CloudFinalizeTransport)? = nil,
         transcribeTimeout: TimeInterval? = nil, engineStopTimeout: TimeInterval = CaptureSession.engineStopTimeout,
         cloudTimeout: TimeInterval = finalizeTimeout,
@@ -414,7 +414,7 @@ final class CaptureSession: ObservableObject {
             await onStep(.fallingBackToCloud)
             return try await finishInCloud(
                 meetingId: meetingId, directory: directory, durationSeconds: durationSeconds, failure: .transcriptionTimedOut,
-                transport: transport, cloud: cloud, recapOpened: recapOpened, timeout: cloudTimeout)
+                transport: transport, cloud: cloud, timeout: cloudTimeout)
         } catch let failure as LocalTranscriber.Failure {
             Task { await transcriber.cancel() }
             await onLocalOutcome(false)
@@ -429,7 +429,7 @@ final class CaptureSession: ObservableObject {
             await onStep(.fallingBackToCloud)
             return try await finishInCloud(
                 meetingId: meetingId, directory: directory, durationSeconds: durationSeconds, failure: failure,
-                transport: transport, cloud: cloud, recapOpened: recapOpened, timeout: cloudTimeout)
+                transport: transport, cloud: cloud, timeout: cloudTimeout)
         } catch is CancellationError {
             await waitAtMost(seconds: engineStopTimeout) { await transcriber.cancel() }
             throw CancellationError()
@@ -459,14 +459,14 @@ final class CaptureSession: ObservableObject {
             throw submitFailure(error)
         }
         try? FileManager.default.removeItem(at: directory)
-        if !recapOpened { Task { await transport.warmSummary(meetingId: meetingId) } }
+        Task { await transport.warmSummary(meetingId: meetingId) }
         Task { await endMeetingIfAllowed { try await transport.endMeeting(meetingId: meetingId) } }
         return StopResult(expectedSegments: nil, transcriptRequested: true)
     }
 
     private nonisolated static func finishInCloud(
         meetingId: String, directory: URL, durationSeconds: Double, failure: LocalTranscriber.Failure,
-        transport: any DeviceTranscriptTransport, cloud: any CloudFinalizeTransport, recapOpened: Bool,
+        transport: any DeviceTranscriptTransport, cloud: any CloudFinalizeTransport,
         timeout: TimeInterval
     ) async throws -> StopResult {
         let recording = directory.appendingPathComponent(CaptureRecovery.recordingName)
@@ -479,7 +479,7 @@ final class CaptureSession: ObservableObject {
             }
         } catch where accepted.value {}
         try? FileManager.default.removeItem(at: directory)
-        if !recapOpened { Task { await transport.warmSummary(meetingId: meetingId) } }
+        Task { await transport.warmSummary(meetingId: meetingId) }
         Task { await endMeetingIfAllowed { try await transport.endMeeting(meetingId: meetingId) } }
         return StopResult(expectedSegments: nil, transcriptRequested: true, localFailure: failure)
     }

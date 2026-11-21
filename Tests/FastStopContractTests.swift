@@ -29,16 +29,4 @@ final class FastStopContractTests: XCTestCase {
             instance: instance, meetingId: "m1", expectedSegments: nil, token: "t")
         XCTAssertNil(jsonBody(request)?["defer_extraction"])
     }
-
-    func test_theRecapOpenedAtStop_asksThePageToWriteTheRecap() {
-        let url = MinutiaClient.recapURL(
-            instance: instance,
-            seriesId: UUID(uuidString: "11111111-2222-3333-4444-555555555555")!,
-            meetingId: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!,
-            autoRecap: true)
-        XCTAssertEqual(
-            url.absoluteString,
-            "https://minutia.example.com/series/11111111-2222-3333-4444-555555555555/meetings/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee?recap=auto")
-    }
-
 }

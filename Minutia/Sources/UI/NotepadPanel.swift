@@ -2,7 +2,14 @@ import AppKit
 import SwiftUI
 
 private final class NotesWindow: NSPanel {
+    var onHide: () -> Void = {}
+
     override var canBecomeKey: Bool { true }
+
+    override func orderOut(_ sender: Any?) {
+        super.orderOut(sender)
+        onHide()
+    }
 
     override func cancelOperation(_ sender: Any?) { orderOut(nil) }
 
@@ -22,8 +29,12 @@ private final class NotesWindow: NSPanel {
 final class NotepadPanel {
     private var panel: NSPanel?
     private let makeContent: () -> NSView
+    private let presence: WindowPresence
 
-    init(content: @escaping () -> NSView) { makeContent = content }
+    init(presence: WindowPresence = .shared, content: @escaping () -> NSView) {
+        self.presence = presence
+        makeContent = content
+    }
 
     private var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
@@ -34,6 +45,7 @@ final class NotepadPanel {
         let panel = panel ?? makePanel()
         self.panel = panel
         panel.alphaValue = 1
+        presence.joined("notes")
         if focus {
             panel.makeKeyAndOrderFront(nil)
         } else {
@@ -73,6 +85,7 @@ final class NotepadPanel {
         panel.sharingType = .none
         panel.minSize = NSSize(width: 240, height: 200)
         panel.contentView = makeContent()
+        panel.onHide = { [weak self] in self?.presence.closed("notes") }
         if !panel.setFrameUsingName(Self.frameName), let screen = NSScreen.main {
             let area = screen.visibleFrame
             panel.setFrameTopLeftPoint(NSPoint(x: area.maxX - 320 - 16, y: area.maxY - 16))

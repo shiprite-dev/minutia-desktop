@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import OSLog
 import Supabase
@@ -39,6 +40,8 @@ enum MinutiaClientError: Error, Equatable {
     /// The transcribe route answered 503: the server has no working transcription provider, so
     /// nothing was transcribed and the local recording must be kept for a later retry.
     case transcriptionNotConfigured
+    /// The server refused the access token: the person has to sign in again.
+    case signedOut
 }
 
 struct CheckinClaim: Equatable {
@@ -64,6 +67,8 @@ struct MinutiaClient {
     let instance: URL
     let supabase: SupabaseClient
     let tokenProvider: () async throws -> String
+    /// Forces a token refresh; used where the server only accepts a recently issued token.
+    var freshTokenProvider: (() async throws -> String)?
 
     static let audioBucket = "meeting-audio"
 
@@ -472,12 +477,9 @@ struct MinutiaClient {
     /// The web app's recap route for a meeting (src/app/(app)/series/[id]/meetings/[meetingId] on
     /// the server). The single builder for every place that opens a recap, so the shape and the
     /// lowercase-id rule cannot drift between call sites.
-    static func recapURL(instance: URL, seriesId: UUID, meetingId: UUID, autoRecap: Bool = false) -> URL {
-        let url = instance.appendingPathComponent(
+    static func recapURL(instance: URL, seriesId: UUID, meetingId: UUID) -> URL {
+        instance.appendingPathComponent(
             "series/\(seriesId.uuidString.lowercased())/meetings/\(meetingId.uuidString.lowercased())")
-        guard autoRecap, var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
-        components.queryItems = [URLQueryItem(name: "recap", value: "auto")]
-        return components.url ?? url
     }
 
     func checkin(deviceId: String, deviceName: String, canClaim: Bool) async -> CheckinClaim? {
@@ -526,5 +528,195 @@ struct MinutiaClient {
         let request = Self.agendaRequest(instance: instance, token: token)
         let (data, _) = try await URLSession.shared.data(for: request)
         return try Self.jsonDecoder.decode(AgendaResponse.self, from: data).events
+    }
+}
+
+// MARK: - Post-meeting review
+
+struct ReviewMember: Decodable, Equatable {
+    let id: UUID
+    let name: String
+}
+
+struct ReviewRow: Decodable, Equatable {
+    let id: UUID
+    let type: String
+    let category: String
+    let title: String
+    let ownerName: String
+    let ownerUserId: UUID?
+    let dueDate: String?
+    let confidence: Double
+    let relatedIssueNumber: Int?
+    let relatedIssueTitle: String?
+    let suggestedStatus: String?
+}
+
+struct ReviewMeeting: Decodable, Equatable {
+    let meetingId: UUID
+    let seriesId: UUID
+    let seriesName: String
+    let endedAt: Date?
+    let transcriptionStatus: String?
+    let suggestionsStatus: String?
+    let suggestionsReason: String?
+    let statusAt: Date?
+    let reviewer: Bool
+    let members: [ReviewMember]
+    let rows: [ReviewRow]
+    let webOnlyCount: Int
+}
+
+struct ReviewQueue: Decodable, Equatable {
+    let me: UUID
+    let meetings: [ReviewMeeting]
+}
+
+enum ReviewAction: String { case accept, reject }
+
+enum DueDateChange: Equatable { case leave, clear, set(String) }
+
+enum ReviewSaveResult: Equatable {
+    case saved, alreadyReviewed, alreadyInState, suggestionGone, itemGone, notReviewer
+    case notAMember, cannotKeepDuplicate, invalidRequest, signedOut, retryable
+}
+
+enum ReviewQueueError: Error, Equatable {
+    case meetingGone, signedOut, olderServer, failed
+}
+
+extension MinutiaClient {
+    private static let reviewDecoder: JSONDecoder = {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        decoder.dateDecodingStrategy = jsonDecoder.dateDecodingStrategy
+        return decoder
+    }()
+
+    static func handoffDigest(of nonce: String) -> String {
+        SHA256.hash(data: Data(nonce.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func makeHandoffNonce() -> (nonce: String, digest: String) {
+        let bytes = (0..<32).map { _ in UInt8.random(in: .min ... .max) }
+        let nonce = Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return (nonce, handoffDigest(of: nonce))
+    }
+
+    static func companionSessionRequest(instance: URL, handoffId: String, nonce: String, next: String) -> URLRequest {
+        var request = URLRequest(url: instance.appendingPathComponent("auth/companion-session"))
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+        let encode = { (value: String) in value.addingPercentEncoding(withAllowedCharacters: unreserved) ?? "" }
+        let uuid = try! NSRegularExpression(pattern: "[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
+        var lowered = next
+        for match in uuid.matches(in: next, range: NSRange(next.startIndex..., in: next)).reversed() {
+            let range = Range(match.range, in: lowered)!
+            lowered.replaceSubrange(range, with: lowered[range].lowercased())
+        }
+        request.httpBody = Data(
+            [("handoff_id", handoffId), ("nonce", nonce), ("next", lowered)]
+                .map { "\($0.0)=\(encode($0.1))" }.joined(separator: "&").utf8)
+        return request
+    }
+
+    func reviewQueue(meetingId: UUID?) async throws -> ReviewQueue {
+        var url = instance.appendingPathComponent("api/companion/review-queue")
+        if let meetingId {
+            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+            components.queryItems = [URLQueryItem(name: "meeting", value: meetingId.uuidString.lowercased())]
+            url = components.url!
+        }
+        var request = Self.bearerRequest(url, method: "GET", token: try await tokenProvider())
+        request.timeoutInterval = 10
+        let data: Data
+        let status: Int
+        do {
+            let (body, response) = try await URLSession.shared.data(for: request)
+            data = body
+            status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        } catch {
+            throw ReviewQueueError.failed
+        }
+        if status == 404 { throw Self.errorCode(from: data) == "meeting_gone" ? ReviewQueueError.meetingGone : .olderServer }
+        if status == 401 { throw ReviewQueueError.signedOut }
+        guard (200...299).contains(status), let queue = try? Self.reviewDecoder.decode(ReviewQueue.self, from: data)
+        else { throw ReviewQueueError.failed }
+        return queue
+    }
+
+    func review(
+        meetingId: UUID, suggestionId: UUID, action: ReviewAction, ownerUserId: UUID?, dueDate: DueDateChange
+    ) async -> ReviewSaveResult {
+        guard let token = try? await tokenProvider() else { return .retryable }
+        var request = Self.bearerRequest(
+            instance.appendingPathComponent(
+                "api/meetings/\(meetingId.uuidString.lowercased())/suggestions/\(suggestionId.uuidString.lowercased())"),
+            method: "PATCH", token: token)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        var body: [String: Any] = ["action": action.rawValue]
+        if let ownerUserId { body["owner_user_id"] = ownerUserId.uuidString.lowercased() }
+        switch dueDate {
+        case .leave: break
+        case .clear: body["due_date"] = NSNull()
+        case .set(let day): body["due_date"] = day
+        }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        guard let (data, response) = try? await URLSession.shared.data(for: request) else { return .retryable }
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if (200...299).contains(status) { return .saved }
+        if status == 401 { return .signedOut }
+        if status == 0 || status == 408 || status == 429 || status >= 500 { return .retryable }
+        switch Self.errorCode(from: data) {
+        case "already_reviewed": return .alreadyReviewed
+        case "already_in_state": return .alreadyInState
+        case "suggestion_gone": return .suggestionGone
+        case "item_gone": return .itemGone
+        case "not_reviewer": return .notReviewer
+        case "not_a_member": return .notAMember
+        case "cannot_keep_duplicate": return .cannotKeepDuplicate
+        default: return .invalidRequest
+        }
+    }
+
+    func regenerateSuggestions(meetingId: UUID) async throws {
+        var request = Self.bearerRequest(
+            instance.appendingPathComponent("api/meetings/\(meetingId.uuidString.lowercased())/suggestions"),
+            method: "POST", token: try await tokenProvider())
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data("{\"mode\":\"generate\"}".utf8)
+        let (_, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if status == 401 { throw MinutiaClientError.signedOut }
+        guard (200...299).contains(status) else { throw MinutiaClientError.serverError(status: status) }
+    }
+
+    /// The server only accepts a token issued in the last few minutes: on "stale_token" the token is
+    /// refreshed and the request sent once more.
+    func webSessionHandoff(nonceDigest: String) async throws -> String {
+        struct Envelope: Decodable { let handoffId: String }
+        var token = try await tokenProvider()
+        for attempt in 0..<2 {
+            var request = Self.bearerRequest(
+                instance.appendingPathComponent("api/companion/web-session"), method: "POST", token: token)
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: ["nonce_digest": nonceDigest])
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if status == 401 {
+                guard attempt == 0, Self.errorCode(from: data) == "stale_token" else { throw MinutiaClientError.signedOut }
+                token = try await (freshTokenProvider ?? tokenProvider)()
+                continue
+            }
+            guard (200...299).contains(status),
+                  let id = try? Self.reviewDecoder.decode(Envelope.self, from: data).handoffId
+            else { throw MinutiaClientError.serverError(status: status) }
+            return id
+        }
+        throw MinutiaClientError.signedOut
     }
 }

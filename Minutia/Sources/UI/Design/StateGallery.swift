@@ -46,7 +46,6 @@ enum StateGallery {
         panel("15-finishing", FinishingContent(label: "Uploading and requesting transcript", progress: nil, preparingSince: nil)),
         panel("16-transcribing", FinishingContent(label: "Transcribing on this Mac, 5 of 12", progress: 5.0 / 12, preparingSince: nil)),
         panel("17-preparing-model", FinishingContent(label: "Preparing the speech model", progress: nil, preparingSince: Date().addingTimeInterval(-14))),
-        panel("18-done", DoneContent()),
         panel("19-error", ErrorScreen(message: "Upload failed after several attempts. Your recording is saved on this Mac.", isMicError: false)),
         panel("20-error-mic", ErrorScreen(message: "Microphone access was denied. Allow it in System Settings, then retry.", isMicError: true)),
         panel("21-model-downloading", VStack(spacing: 0) { idle(); ModelDownloadRow(label: "Downloading model 42%", fraction: 0.42) }),

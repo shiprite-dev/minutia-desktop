@@ -79,68 +79,11 @@ final class PanelJourneyTests: XCTestCase {
     func test_aStopThatSentNothing_neverTellsTheUserItWasSent() {
         for (reason, requested, meeting) in [(AppController.StopReason.manual, false, UUID() as UUID?), (.manual, true, nil)] {
             let controller = rig.signedIn()
-            let cue = AppController.recapCue(reason: reason, transcriptRequested: requested, meetingId: meeting, seriesId: nil, instance: rig.instance)
+            let cue = AppController.recapCue(reason: reason, transcriptRequested: requested, meetingId: meeting, instance: rig.instance)
             rig.finishCleanly(controller, cue: cue)
-            let seen = rig.panel(controller)
-            XCTAssertFalse(seen.has("Sent. Your recap"), seen.text)
-            XCTAssertTrue(seen.has("SERIES"), seen.text)
+            XCTAssertNil(controller.review.model)
+            XCTAssertTrue(rig.panel(controller).has("SERIES"))
         }
-    }
-
-    func test_aManualStopThatSentTheTranscript_showsSentAndKeepsTheRecapLinkToThatMeeting() async {
-        let controller = rig.signedIn()
-        let meeting = UUID()
-        let cue = AppController.recapCue(reason: .manual, transcriptRequested: true, meetingId: meeting, seriesId: rig.boardPrep.id, instance: rig.instance)
-        rig.finishCleanly(controller, cue: cue)
-        XCTAssertTrue(rig.panel(controller).has("Sent. Your recap is on its way"))
-        controller.openRecapFromCue()
-        for _ in 0..<50 where rig.opened.isEmpty { try? await Task.sleep(nanoseconds: 20_000_000) }
-        XCTAssertEqual(rig.opened, [MinutiaClient.recapURL(instance: rig.instance, seriesId: rig.boardPrep.id, meetingId: meeting)])
-    }
-
-    func test_theSentScreen_staysUpForAReadableBeat_thenGivesWayToTheSeriesPicker() async {
-        let controller = rig.signedIn()
-        let clock = ManualClock()
-        controller.sleep = { await clock.sleep($0) }
-        let hold = controller.recapHold()
-        rig.finishCleanly(controller, cue: rig.sentCue())
-        await clock.waitForSleepers(1)
-
-        await clock.advance(1.5)
-        try? await Task.sleep(nanoseconds: 100_000_000)
-        let reading = rig.panel(controller)
-        XCTAssertTrue(reading.has("Sent. Your recap is on its way"), "gone before a user could read it: \(reading.text)")
-
-        await clock.advance(hold - 1.5 + 0.1)
-        for _ in 0..<100 where controller.recapCue != nil { try? await Task.sleep(nanoseconds: 10_000_000) }
-        let after = rig.panel(controller)
-        XCTAssertFalse(after.has("Sent. Your recap is on its way"), after.text)
-        XCTAssertTrue(after.has("SERIES"), after.text)
-    }
-
-    private func done(at elapsed: TimeInterval, reduceMotion: Bool) -> CGImage {
-        Host.render(DoneContent().environment(\.checkElapsed, elapsed).environment(\.reduceMotionOverride, reduceMotion), spin: 0.2)!
-    }
-
-    func test_theSentCheck_isNotDrawnAtFirst_isPartwayMidDraw_andIsTheFinishedCheckAfterwards() {
-        let reference = done(at: 0, reduceMotion: true)
-        let finished = Host.vermilionRuns(reference).pixels
-        XCTAssertGreaterThan(finished, 50)
-
-        XCTAssertEqual(Host.vermilionRuns(done(at: 0, reduceMotion: false)).pixels, 0, "the check is already drawn before the draw starts")
-
-        let partway = Host.vermilionRuns(done(at: CheckReveal.delay + 0.1, reduceMotion: false)).pixels
-        XCTAssertGreaterThan(partway, finished / 5)
-        XCTAssertLessThan(partway, finished * 9 / 10)
-
-        let after = done(at: CheckReveal.total + 0.5, reduceMotion: false)
-        XCTAssertEqual(Host.differingBytes(after, reference), 0, "the settled check is not the finished check")
-    }
-
-    func test_withReduceMotionOn_theSentCheckIsFinishedAtOnce() {
-        let finished = Host.vermilionRuns(done(at: CheckReveal.total + 0.5, reduceMotion: true)).pixels
-        XCTAssertEqual(Host.vermilionRuns(done(at: 0, reduceMotion: true)).pixels, finished)
-        XCTAssertGreaterThan(finished, 50)
     }
 
     // MARK: - Finishing progress

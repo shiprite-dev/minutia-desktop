@@ -441,7 +441,7 @@ final class DeviceRecoveryTests: XCTestCase {
                 _ = try await CaptureSession.finishOnDevice(
                     meetingId: DeviceFixtures.meetingId, directory: dir, tail: [DeviceFixtures.segment(1, in: dir)],
                     durationSeconds: 600, transcriber: stopLocal, transport: RecordingTransport(submitStatuses: [503]),
-                    recapOpened: true, deviceOnly: false, cloud: RecordingCloud(), sleep: { _ in })
+                    deviceOnly: false, cloud: RecordingCloud(), sleep: { _ in })
                 XCTFail("precondition: the stop's submit is not accepted")
             } catch {}
             let written = try Data(contentsOf: dir.appendingPathComponent(CaptureRecovery.transcriptName))
@@ -664,8 +664,7 @@ final class DeviceRecoveryTests: XCTestCase {
             do {
                 _ = try await CaptureSession.finishOnDevice(
                     meetingId: DeviceFixtures.meetingId, directory: dir, tail: [DeviceFixtures.segment(0, in: dir)],
-                    durationSeconds: 600, transcriber: local, transport: RecordingTransport(), recapOpened: true,
-                    deviceOnly: false, cloud: RecordingCloud(failure: URLError(.notConnectedToInternet)),
+                    durationSeconds: 600, transcriber: local, transport: RecordingTransport(), deviceOnly: false, cloud: RecordingCloud(failure: URLError(.notConnectedToInternet)),
                     transcribeTimeout: row.timeout, sleep: { _ in })
                 XCTFail("\(row.label): precondition: the cloud fallback fails")
             } catch {}
@@ -960,8 +959,7 @@ final class DeviceRecoveryTests: XCTestCase {
             do {
                 _ = try await CaptureSession.finishOnDevice(
                     meetingId: DeviceFixtures.meetingId, directory: dir, tail: [DeviceFixtures.segment(0, in: dir)],
-                    durationSeconds: 600, transcriber: local, transport: RecordingTransport(), recapOpened: true,
-                    engineStopTimeout: engineStopTimeout, sleep: { _ in })
+                    durationSeconds: 600, transcriber: local, transport: RecordingTransport(), engineStopTimeout: engineStopTimeout, sleep: { _ in })
                 inFlightAtReturn.set(engine.inFlight)
                 finish.record(nil)
             } catch {

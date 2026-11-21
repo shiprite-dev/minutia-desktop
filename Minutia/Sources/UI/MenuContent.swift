@@ -6,12 +6,6 @@ private func openMicrophoneSettings() {
     }
 }
 
-enum Celebration {
-    static func hold(reduceMotion: Bool) -> TimeInterval {
-        (reduceMotion ? 0 : CheckReveal.total) + 1.6
-    }
-}
-
 enum PanelHaptic {
     static func feedback(from old: AppPhase, to new: AppPhase) -> SensoryFeedback? {
         switch (old, new) {
@@ -63,8 +57,8 @@ struct MenuContent: View {
                 switch controller.phase {
                 case .signedOut:
                     SignInView(authManager: controller.authManager, showsMenuBarHint: controller.showsMenuBarHint)
-                case .idle where controller.recapCue != nil:
-                    DoneContent(onOpenRecap: { controller.openRecapFromCue() })
+                case .idle where controller.review.shown != nil:
+                    ReviewView(review: controller.review, onOpenRecap: controller.openRecap)
                 case .idle:
                     IdleHost(controller: controller, detectedVia: nil)
                 case .detected(let app):
@@ -75,6 +69,9 @@ struct MenuContent: View {
                         seriesName: controller.recordingSeriesName,
                         onNotes: { controller.notepad.showAndFocus() },
                         onStop: { controller.stopRecording() })
+                    if let waiting = controller.review.queueRows.first {
+                        ReviewQueueLine(row: waiting).padding(.horizontal, Space.x2).padding(.bottom, Space.x2)
+                    }
                 case .finalizing:
                     FinalizingView(session: controller.captureSession)
                 case .error(let message):
@@ -98,7 +95,7 @@ struct MenuContent: View {
         .environment(\.panelVisible, controller.panelOpen)
         .environment(\.consentPending, controller.pendingRecordConsent != nil)
         .animation(Motion.resolved(Motion.settle, reduce: reduceMotion), value: controller.phase)
-        .animation(Motion.resolved(Motion.settle, reduce: reduceMotion), value: controller.recapCue)
+        .animation(Motion.resolved(Motion.settle, reduce: reduceMotion), value: controller.review.shown?.meetingId)
         .sensoryFeedback(trigger: controller.phase) { old, new in PanelHaptic.feedback(from: old, to: new) }
         .onAppear { controller.panelOpened() }
         .onDisappear { controller.panelClosed() }
@@ -152,6 +149,7 @@ struct IdleModel {
     var micBanner: Bool
     var recovering: Bool
     var instance: URL
+    var queue: [ReviewQueueRow] = []
 }
 
 private struct IdleHost: View {
@@ -167,12 +165,14 @@ private struct IdleHost: View {
                 softHint: controller.softHint,
                 micBanner: controller.micBannerVisible,
                 recovering: controller.recoveryActive,
-                instance: controller.authManager.instance ?? InstanceConfig.resolvedInstance),
+                instance: controller.authManager.instance ?? InstanceConfig.resolvedInstance,
+                queue: controller.review.queueRows),
             onSelect: controller.pickSeries,
             onRecord: { controller.startRecording() },
             onDismissDetection: { controller.dismissDetection() },
-            onOpenURL: { NSWorkspace.shared.open($0) },
-            onOpenMicSettings: openMicrophoneSettings)
+            onOpenURL: controller.openURL,
+            onOpenMicSettings: openMicrophoneSettings,
+            onOpenReview: { controller.review.start(meetingId: $0) })
             .onAppear {
                 controller.refreshPermissionState()
                 controller.reloadSeries()
@@ -188,8 +188,11 @@ struct IdleScreen: View {
     var onDismissDetection: () -> Void = {}
     var onOpenURL: (URL) -> Void = { _ in }
     var onOpenMicSettings: () -> Void = {}
+    var onOpenReview: (UUID) -> Void = { _ in }
     @Environment(\.motionReduced) private var reduceMotion
     @Environment(\.consentPending) private var consentPending
+
+    static let queueShown = 3
 
     private var selectedName: String? { model.series.first { $0.id == model.selected }?.name }
 
@@ -214,6 +217,23 @@ struct IdleScreen: View {
                 }
                 .font(Typo.body)
                 .foregroundStyle(Brand.ink3)
+            }
+
+            if !model.queue.isEmpty {
+                Eyebrow(text: "To review")
+                VStack(spacing: 0) {
+                    ForEach(model.queue.prefix(Self.queueShown)) { row in ReviewQueueLine(row: row) { onOpenReview(row.id) } }
+                    if model.queue.count > Self.queueShown {
+                        Button(ReviewCopy.moreOnWeb(model.queue.count - Self.queueShown)) { onOpenURL(model.instance) }
+                            .buttonStyle(.plain)
+                            .font(Typo.body)
+                            .foregroundStyle(Brand.ink3)
+                            .padding(.horizontal, Space.x2)
+                            .padding(.vertical, 7)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .padding(.horizontal, -Space.x2)
             }
 
             if model.series.isEmpty {
@@ -449,51 +469,6 @@ struct FinishingContent: View {
         }
         .padding(Space.x4)
         .frame(width: Space.panelWidth, alignment: .leading)
-    }
-}
-
-struct DoneContent: View {
-    var onOpenRecap: () -> Void = {}
-    @Environment(\.motionReduced) private var reduceMotion
-    @Environment(\.checkElapsed) private var injected
-    @State private var appeared = Date()
-    @State private var settled = false
-
-    var body: some View {
-        HStack(alignment: .top, spacing: Space.x3) {
-            mark
-            VStack(alignment: .leading, spacing: Space.x1) {
-                Text("Sent. Your recap is on its way")
-                    .font(Typo.title)
-                    .fixedSize(horizontal: false, vertical: true)
-                Button("Open recap", action: onOpenRecap)
-                    .buttonStyle(QuietButtonStyle())
-            }
-        }
-        .padding(Space.x4)
-        .frame(width: Space.panelWidth, alignment: .leading)
-        .task {
-            guard !reduceMotion, injected == nil else { return }
-            try? await Task.sleep(nanoseconds: UInt64(CheckReveal.total * 1_000_000_000))
-            settled = true
-        }
-    }
-
-    @ViewBuilder
-    private var mark: some View {
-        if reduceMotion {
-            check(elapsed: .infinity)
-        } else if let injected {
-            check(elapsed: injected)
-        } else {
-            TimelineView(.animation(paused: settled)) { check(elapsed: $0.date.timeIntervalSince(appeared)) }
-        }
-    }
-
-    private func check(elapsed: TimeInterval) -> some View {
-        let progress = CheckReveal.progress(elapsed: elapsed)
-        return MarkView(barHeight: 20, includesCheck: true, checkProgress: progress, popped: CheckReveal.popped(elapsed: elapsed))
-            .sensoryFeedback(.alignment, trigger: progress == 1)
     }
 }
 

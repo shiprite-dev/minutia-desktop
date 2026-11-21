@@ -53,7 +53,7 @@ final class PanelRig {
         Host.text(menu(controller), dark: dark, scale: scale)
     }
 
-    func sentCue() -> RecapCue { RecapCue(meetingId: UUID(), seriesId: boardPrep.id, instance: instance) }
+    func sentCue() -> RecapCue { RecapCue(meetingId: UUID()) }
 
     func finishCleanly(_ controller: AppController, cue: RecapCue?) {
         controller.apply(.recordStarted)

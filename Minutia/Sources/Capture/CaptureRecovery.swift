@@ -181,7 +181,7 @@ enum CaptureRecovery {
                 do {
                     _ = try await CaptureSession.finishOnDevice(
                         meetingId: manifest.meetingId, directory: directory, tail: missing, durationSeconds: duration,
-                        transcriber: transcriber, transport: transport, recapOpened: true, deviceOnly: manifest.deviceOnly,
+                        transcriber: transcriber, transport: transport, deviceOnly: manifest.deviceOnly,
                         cloud: cloud, cloudTimeout: cloudTimeout, sleep: sleep, flushNotes: flushNotes,
                         saved: saved.flatMap(\.segments), onStep: onStep)
                     return

@@ -155,15 +155,13 @@ final class BrandMarkTests: XCTestCase {
 }
 
 final class RecapCueTests: XCTestCase {
-    private let cue = RecapCue(meetingId: UUID(), seriesId: UUID(), instance: URL(string: "https://example.com")!)
-
     func test_onlyAStopThatSentATranscriptForAMeeting_hasARecapToOpen() {
         let id = UUID(), url = URL(string: "https://example.com")!
-        XCTAssertNil(AppController.recapCue(reason: .webEnded, transcriptRequested: true, meetingId: id, seriesId: nil, instance: url))
-        XCTAssertNil(AppController.recapCue(reason: .manual, transcriptRequested: false, meetingId: id, seriesId: nil, instance: url))
-        XCTAssertNil(AppController.recapCue(reason: .manual, transcriptRequested: true, meetingId: nil, seriesId: nil, instance: url))
-        XCTAssertEqual(AppController.recapCue(reason: .manual, transcriptRequested: true, meetingId: id, seriesId: nil, instance: url)?.meetingId, id)
-        XCTAssertNotNil(AppController.recapCue(reason: .localEnded, transcriptRequested: true, meetingId: id, seriesId: nil, instance: url))
+        XCTAssertNil(AppController.recapCue(reason: .webEnded, transcriptRequested: true, meetingId: id, instance: url))
+        XCTAssertNil(AppController.recapCue(reason: .manual, transcriptRequested: false, meetingId: id, instance: url))
+        XCTAssertNil(AppController.recapCue(reason: .manual, transcriptRequested: true, meetingId: nil, instance: url))
+        XCTAssertEqual(AppController.recapCue(reason: .manual, transcriptRequested: true, meetingId: id, instance: url)?.meetingId, id)
+        XCTAssertNotNil(AppController.recapCue(reason: .localEnded, transcriptRequested: true, meetingId: id, instance: url))
     }
 }
 

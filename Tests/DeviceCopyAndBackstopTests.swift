@@ -98,8 +98,7 @@ final class DeviceCopyAndBackstopTests: XCTestCase {
                                 notesFlushTimeout: TimeInterval = CaptureSession.notesFlushTimeout) async throws -> CaptureSession.StopResult {
         try await CaptureSession.finishOnDevice(
             meetingId: DeviceFixtures.meetingId, directory: dir, tail: [DeviceFixtures.segment(3, in: dir)],
-            durationSeconds: 1_200, transcriber: local, transport: transport, recapOpened: true,
-            deviceOnly: deviceOnly, cloud: cloud, notesFlushTimeout: notesFlushTimeout, sleep: { _ in },
+            durationSeconds: 1_200, transcriber: local, transport: transport, deviceOnly: deviceOnly, cloud: cloud, notesFlushTimeout: notesFlushTimeout, sleep: { _ in },
             flushNotes: flushNotes, onStep: { steps.record($0) })
     }
 
@@ -305,7 +304,7 @@ final class DeviceCopyAndBackstopTests: XCTestCase {
                 box.set(.success(try await CaptureSession.finishOnDevice(
                     meetingId: DeviceFixtures.meetingId, directory: directory,
                     tail: [DeviceFixtures.segment(1, in: directory, start: 300)], durationSeconds: DeviceFixtures.fixtureDuration,
-                    transcriber: local, transport: transport, recapOpened: true, notesFlushTimeout: 0.3, sleep: { _ in },
+                    transcriber: local, transport: transport, notesFlushTimeout: 0.3, sleep: { _ in },
                     flushNotes: { _ = try await holdNotes() })))
             } catch {
                 box.set(.failure(error))

@@ -19,10 +19,7 @@ struct MinutiaApp: App {
             MenuContent(controller: controller, updater: updater)
                 .task { await controller.restoreSession() }
         } label: {
-            MenuBarIcon(
-                phase: controller.phase,
-                softHint: controller.softHint,
-                pendingConsent: controller.pendingRecordConsent != nil)
+            controller.menuBarIcon
         }
         .menuBarExtraStyle(.window)
 
@@ -182,13 +179,17 @@ struct MenuBarIcon: View {
     let phase: AppPhase
     let softHint: Bool
     let pendingConsent: Bool
+    var reviewDot = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hollow = false
     @State private var timer: Timer?
 
     var body: some View {
-        Image(systemName: currentSymbol)
-            .accessibilityLabel(Self.accessibilityLabel(phase: phase, pendingConsent: pendingConsent))
+        let dot = Self.showsDot(phase: phase, hasDot: reviewDot)
+        Group {
+            if dot { Image(nsImage: Self.dotted(currentSymbol)) } else { Image(systemName: currentSymbol) }
+        }
+            .accessibilityLabel(Self.accessibilityLabel(phase: phase, pendingConsent: pendingConsent, reviewDot: dot))
             .onAppear { syncPulse() }
             .onChange(of: phase) { _, _ in syncPulse() }
             .onDisappear { stopPulse() }
@@ -216,9 +217,41 @@ struct MenuBarIcon: View {
         }
     }
 
+    /// Items waiting for review light a dot on the resting glyph; recording and errors keep their own.
+    static func showsDot(phase: AppPhase, hasDot: Bool) -> Bool {
+        switch phase {
+        case .idle, .detected: hasDot
+        default: false
+        }
+    }
+
+    /// Status items render their label as a template image, so the dot is drawn into the glyph itself.
+    @MainActor private static var dottedImages: [String: NSImage] = [:]
+
+    @MainActor static func dotted(_ symbol: String) -> NSImage {
+        if let image = dottedImages[symbol] { return image }
+        let base = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 14, weight: .regular)) ?? NSImage()
+        let size = NSSize(width: base.size.width + 3, height: base.size.height)
+        let image = NSImage(size: size, flipped: false) { _ in
+            base.draw(in: NSRect(origin: .zero, size: base.size))
+            NSColor.black.setFill()
+            NSBezierPath(ovalIn: NSRect(x: size.width - 6, y: size.height - 6, width: 6, height: 6)).fill()
+            return true
+        }
+        image.isTemplate = true
+        dottedImages[symbol] = image
+        return image
+    }
+
     /// VoiceOver text for the status item, since the glyph alone conveys the phase. Mirrors the glyph
     /// precedence: recording/finalizing/error win over a pending consent.
-    static func accessibilityLabel(phase: AppPhase, pendingConsent: Bool) -> String {
+    static func accessibilityLabel(phase: AppPhase, pendingConsent: Bool, reviewDot: Bool = false) -> String {
+        let base = phaseLabel(phase: phase, pendingConsent: pendingConsent)
+        return reviewDot && !pendingConsent ? "\(base), items to review" : base
+    }
+
+    private static func phaseLabel(phase: AppPhase, pendingConsent: Bool) -> String {
         switch phase {
         case .recording: return "Minutia, recording"
         case .finalizing: return "Minutia, finishing recording"
@@ -244,10 +277,15 @@ struct MenuBarIcon: View {
     }
 }
 
+struct ReviewNotifier {
+    var post: @MainActor (ReviewNotice) -> Void
+    var clear: @MainActor () -> Void
+
+    static let live = ReviewNotifier(post: AppController.postReviewNotice, clear: AppController.clearReviewNotices)
+}
+
 struct RecapCue: Equatable {
     let meetingId: UUID
-    let seriesId: UUID?
-    let instance: URL
 }
 
 /// An outstanding request to record, triggered by the browser via `minutia://record`. Capture
@@ -293,16 +331,33 @@ final class AppController: NSObject, ObservableObject {
     /// True while the startup recovery sweep is finalizing a prior recording's orphaned upload.
     /// Drives a quiet in-menu row and folds recovery into the quit guard.
     @Published private(set) var recoveryActive: Bool = false
-    /// Set when a stop the user can follow up on has been handed to the server, so the panel can say
-    /// so and offer the recap. Cleared by the panel after its hold and by any phase change.
-    @Published private(set) var recapCue: RecapCue?
     @Published private(set) var panelOpen = true
-    func panelOpened() { panelOpen = true }
-    func panelClosed() { panelOpen = false }
+    @discardableResult
+    func panelOpened() -> Task<Void, Never>? {
+        panelOpen = true
+        return review.setPanelOpen(true)
+    }
+    func panelClosed() {
+        panelOpen = false
+        review.setPanelOpen(false)
+    }
     var announce: (String) -> Void = { AccessibilityNotification.Announcement($0).post() }
-    var recapHold: () -> TimeInterval = { Celebration.hold(reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion) }
-    var sleep: (TimeInterval) async -> Void = { try? await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) }
-    private var recapExpiry: Task<Void, Never>?
+
+    var menuBarIcon: MenuBarIcon {
+        MenuBarIcon(phase: phase, softHint: softHint, pendingConsent: pendingRecordConsent != nil, reviewDot: review.hasDot)
+    }
+
+    /// Opens a meeting's recap from the review panel.
+    var openRecap: (UUID) -> Void = { _ in }
+    let review: ReviewController
+    let recapWindow: RecapWindowController
+    private let reviewNotifier: ReviewNotifier
+    private var webSessionIdentity: AuthManager.SessionIdentity?
+    private var webStoresPruned = false
+    private var currentWebStore: UUID? {
+        guard let instance = authManager.instance, let user = authManager.client()?.supabase.auth.currentSession?.user.id else { return nil }
+        return RecapWindowController.storeIdentifier(instance: instance, userId: user.uuidString)
+    }
     @Published private(set) var selectedSeriesId: UUID?
     /// The user chose a series during the current detected meeting; detection then leaves it alone.
     private var seriesPickedThisMeeting = false
@@ -685,7 +740,6 @@ final class AppController: NSObject, ObservableObject {
     /// switch made while the meeting was recording.
     private var recordingInstance: URL?
     private var recordingLanguage: String?
-    private var earlyRecapMeetingId: UUID?
     private var lastFailedStart: FailedStart?
     /// The instance the detector's agenda provider is currently bound to. When it changes (an
     /// instance switch), the detector must be torn down and restarted so it stops polling the old
@@ -696,7 +750,7 @@ final class AppController: NSObject, ObservableObject {
     private var recoveryTask: Task<Void, Never>?
     private var recoverySlot = RecoverySlot()
     private let defaults: UserDefaults
-    private let openURL: (URL) -> Void
+    let openURL: (URL) -> Void
     private let micCheck: () -> (status: AVAuthorizationStatus, hasInputDevice: Bool)
     private var screenLocked = false
     private var asleep = false
@@ -758,10 +812,25 @@ final class AppController: NSObject, ObservableObject {
         openURL: @escaping (URL) -> Void = { NSWorkspace.shared.open($0) },
         micCheck: @escaping () -> (status: AVAuthorizationStatus, hasInputDevice: Bool) = {
             (AVCaptureDevice.authorizationStatus(for: .audio), AVCaptureDevice.default(for: .audio) != nil)
-        }
+        },
+        reviewClock: ReviewClock = .live,
+        reviewNotifier: ReviewNotifier = .live,
+        reviewClient: @escaping @MainActor (AuthManager) -> MinutiaClient? = { $0.client() },
+        windowPresence: WindowPresence = .shared,
+        recapStores: RecapStores = .webKit
     ) {
         self.defaults = defaults
-        self.authManager = AuthManager(defaults: defaults)
+        let authManager = AuthManager(defaults: defaults)
+        self.authManager = authManager
+        self.review = ReviewController(client: { reviewClient(authManager) }, clock: reviewClock, defaults: defaults, notify: reviewNotifier.post)
+        self.reviewNotifier = reviewNotifier
+        self.recapWindow = RecapWindowController(
+            account: {
+                guard let client = authManager.client() else { return nil }
+                return (client, client.supabase.auth.currentSession?.user.id.uuidString.lowercased())
+            },
+            openURL: openURL, clock: reviewClock, presence: windowPresence, defaults: defaults, stores: recapStores,
+            onSignedOut: { Task { _ = await authManager.dropSessionIfRevoked() } })
         self.openURL = openURL
         self.micCheck = micCheck
         super.init()
@@ -794,11 +863,19 @@ final class AppController: NSObject, ObservableObject {
             self?.recordFeedback = "Transcription is not enabled for this account. Audio keeps recording and will be saved."
         }
 
-        authManager.beforeSignOut = { [weak self] in await self?.reportBeforeSignOut() }
+        authManager.beforeSignOut = { [weak self] in
+            await self?.reportBeforeSignOut()
+            self?.review.forgetPosted()
+        }
+
+        review.announce = { [weak self] in self?.announce($0) }
+        review.onSignedOut = { [weak self] in Task { _ = await self?.authManager.dropSessionIfRevoked() } }
+        review.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
+        openRecap = { [weak self] in self?.openRecapWindow($0) }
 
         authManager.$sessionIdentity
             .removeDuplicates()
-            .sink { [weak self] identity in self?.handleAuthChange(signedIn: identity.email != nil) }
+            .sink { [weak self] identity in self?.handleAuthChange(identity) }
             .store(in: &cancellables)
 
         modelStore.$status
@@ -826,6 +903,10 @@ final class AppController: NSObject, ObservableObject {
     /// Connect step. Idempotent with SignInView's on-appear auto-connect.
     func restoreSession() async {
         try? await authManager.ensureConnected()
+        if !webStoresPruned {
+            webStoresPruned = true
+            await recapWindow.pruneStores(keeping: currentWebStore)
+        }
         if authManager.sessionIdentity.email != nil { Task { await modelStore.prepare(language: "en") } }
         // Recover orphaned captures on every launch, not only on a sign-in transition: a warm launch
         // restoring a Keychain session emits no signedIn transition, so a recording orphaned by a
@@ -841,7 +922,6 @@ final class AppController: NSObject, ObservableObject {
         guard next != phase else { return }
         let previous = phase
         phase = next
-        clearRecapCue()
         if next == .recording, previous != .recording { announce("Recording started") }
         restoreLastUsedAfterDetectedMeeting()
         switch Self.modelStoreCue(from: previous, to: next, signedIn: authManager.sessionIdentity.email != nil) {
@@ -926,8 +1006,14 @@ final class AppController: NSObject, ObservableObject {
         showsMenuBarHint = true
     }
 
-    private func handleAuthChange(signedIn: Bool) {
-        if signedIn {
+    private func handleAuthChange(_ identity: AuthManager.SessionIdentity) {
+        if let shown = webSessionIdentity, shown != identity {
+            Task { await recapWindow.forgetWebSessions() }
+            reviewNotifier.clear()
+        }
+        webSessionIdentity = identity.email == nil ? nil : identity
+        review.reset(account: identity.email.map { "\($0) \(identity.instance?.absoluteString ?? "")" })
+        if identity.email != nil {
             signingOut = false
             apply(.signedIn)
             FirstRun.defaultLaunchAtLogin(defaults, status: SMAppService.mainApp.status) { try SMAppService.mainApp.register() }
@@ -942,6 +1028,7 @@ final class AppController: NSObject, ObservableObject {
                 if granted == true, pointsAtMenuBar { Self.postNotification(title: "Minutia", body: FirstRun.menuBarHint) }
             }
             Task { await loadSeries() }
+            Task { await review.refreshQueue() }
             Task { await modelStore.prepare(language: "en") }
             runRecovery()
             checkInNow()
@@ -1483,6 +1570,7 @@ final class AppController: NSObject, ObservableObject {
         Task {
             let claim = await client.checkin(deviceId: deviceId, deviceName: DeviceIdentity.name, canClaim: canClaim)
             if let claim { await handleClaim(claim) }
+            Task { await review.refreshQueue() }
             checkinInFlight = false
             scheduleNextCheckin()
         }
@@ -1639,9 +1727,9 @@ final class AppController: NSObject, ObservableObject {
         pendingRecordConsent = nil
     }
 
-    /// Registers the web-record consent notification category. (Local meeting detection now surfaces
-    /// through the floating prompt and the in-menu banner, not a notification.)
-    private static func registerNotificationCategories() {
+    /// The notification categories: web-record consent, recording started, and review. (Local meeting
+    /// detection surfaces through the floating prompt and the in-menu banner, not a notification.)
+    static var notificationCategories: Set<UNNotificationCategory> {
         let confirm = UNNotificationAction(
             identifier: confirmWebRecordActionId, title: "Start recording", options: [.foreground])
         let dismiss = UNNotificationAction(
@@ -1661,7 +1749,15 @@ final class AppController: NSObject, ObservableObject {
             identifier: recordingStartedCategoryId,
             actions: [UNNotificationAction(identifier: stopRecordingActionId, title: "Stop recording", options: [])],
             intentIdentifiers: [], options: [])
-        UNUserNotificationCenter.current().setNotificationCategories([webRecord, webStart, recordingStarted])
+        let review = UNNotificationCategory(
+            identifier: reviewCategoryId,
+            actions: [UNNotificationAction(identifier: reviewActionId, title: "Review", options: [.foreground])],
+            intentIdentifiers: [], options: [])
+        return [webRecord, webStart, recordingStarted, review]
+    }
+
+    private static func registerNotificationCategories() {
+        UNUserNotificationCenter.current().setNotificationCategories(notificationCategories)
     }
 
     private static func postNotification(title: String, body: String) {
@@ -1675,31 +1771,69 @@ final class AppController: NSObject, ObservableObject {
 
     func stopRecording() { stopRecording(reason: .manual) }
 
-    nonisolated static func recapCue(reason: StopReason, transcriptRequested: Bool, meetingId: UUID?, seriesId: UUID?, instance: URL?) -> RecapCue? {
-        guard opensRecap(for: reason), transcriptRequested, let meetingId, let instance else { return nil }
-        return RecapCue(meetingId: meetingId, seriesId: seriesId, instance: instance)
+    nonisolated static func recapCue(reason: StopReason, transcriptRequested: Bool, meetingId: UUID?, instance: URL?) -> RecapCue? {
+        guard opensRecap(for: reason), transcriptRequested, let meetingId, instance != nil else { return nil }
+        return RecapCue(meetingId: meetingId)
     }
 
     func presentRecapCue(_ cue: RecapCue?) {
         guard let cue, phase == .idle else { return }
-        recapCue = cue
-        announce("Sent. Your recap is on its way")
-        let hold = recapHold()
-        recapExpiry = Task { [weak self] in
-            await self?.sleep(hold)
-            if !Task.isCancelled { self?.clearRecapCue() }
+        review.start(meetingId: cue.meetingId)
+    }
+
+    static let reviewCategoryId = "app.minutia.review"
+    static let reviewActionId = "app.minutia.review.open"
+    static let reviewMeetingIdUserInfoKey = "app.minutia.reviewMeetingId"
+
+    nonisolated static func reviewMeetingId(actionId: String, userInfo: [AnyHashable: Any]) -> UUID? {
+        guard actionId == reviewActionId || actionId == UNNotificationDefaultActionIdentifier else { return nil }
+        return (userInfo[reviewMeetingIdUserInfoKey] as? String).flatMap(UUID.init(uuidString:))
+    }
+
+    private static let reviewRequestPrefix = "review-"
+
+    static func postReviewNotice(_ notice: ReviewNotice) {
+        let content = UNMutableNotificationContent()
+        content.title = notice.title
+        content.categoryIdentifier = reviewCategoryId
+        content.userInfo = [reviewMeetingIdUserInfoKey: notice.meetingId.uuidString]
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: reviewRequestPrefix + notice.meetingId.uuidString, content: content, trigger: nil))
+    }
+
+    static func clearReviewNotices() {
+        let center = UNUserNotificationCenter.current()
+        Task {
+            let delivered = await center.deliveredNotifications().map(\.request.identifier)
+            center.removeDeliveredNotifications(withIdentifiers: delivered.filter { $0.hasPrefix(reviewRequestPrefix) })
+            let pending = await center.pendingNotificationRequests().map(\.identifier)
+            center.removePendingNotificationRequests(withIdentifiers: pending.filter { $0.hasPrefix(reviewRequestPrefix) })
         }
     }
 
-    func clearRecapCue() {
-        recapExpiry?.cancel()
-        recapExpiry = nil
-        recapCue = nil
+    /// Opens the menu panel; false when the status item could not be found.
+    var openPanel: () -> Bool = AppController.clickStatusItem
+
+    /// Without the status item the review simply waits behind the dot for the next menu click.
+    func openReview(meetingId: UUID) {
+        review.start(meetingId: meetingId)
+        guard !review.panelOpen, !openPanel() else { return }
+        Self.logger.error("Review tap: status item not found, the review waits for the next menu click")
     }
 
-    func openRecapFromCue() {
-        guard let cue = recapCue else { return }
-        Task { await openRecap(meetingId: cue.meetingId, seriesId: cue.seriesId, instance: cue.instance) }
+    /// MenuBarExtra has no API to open its window; clicking our own status item is the only way in.
+    private static func clickStatusItem() -> Bool {
+        guard let button = NSApp.windows.lazy
+            .filter({ $0.className == "NSStatusBarWindow" && $0.responds(to: NSSelectorFromString("statusItem")) })
+            .compactMap({ $0.value(forKey: "statusItem") as? NSStatusItem })
+            .first?.button else { return false }
+        button.performClick(nil)
+        return true
+    }
+
+    private func openRecapWindow(_ meetingId: UUID) {
+        let known = review.meeting?.meetingId == meetingId ? review.meeting : review.queue.first { $0.meetingId == meetingId }
+        Task { await openRecap(meetingId: meetingId, seriesId: known?.seriesId, title: known?.seriesName ?? "") }
     }
 
     /// Stop and finalize the recording. `reason` decides whether the recap opens: a manual or
@@ -1714,38 +1848,14 @@ final class AppController: NSObject, ObservableObject {
         notepad.end()
         report(.stopped, meetingId: recordingMeetingId)
         let meetingId = recordingMeetingId
-        let seriesId = recordingSeriesId
         let instance = recordingInstance
-        let early = Self.opensRecap(for: reason) && captureSession.audioMayLeaveMac && meetingId != nil && instance != nil
-        earlyRecapMeetingId = early ? meetingId : nil
-        if early, let meetingId, let instance {
-            Task {
-                try? await withTimeout(seconds: 3) { [notepad] in try await notepad.flushNow() }
-                if let client = authManager.client() {
-                    try? await withTimeout(seconds: 3) {
-                        await CaptureSession.endMeetingIfAllowed { try await client.endMeeting(meetingId: meetingId.uuidString) }
-                    }
-                }
-                await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance, autoRecap: true)
-            }
-        }
         let local = localOutcomeHandlers()
         Task {
             do {
                 let result = try await captureSession.stop(
-                    flushNotes: { [notepad] in try await notepad.flushNow() }, recapOpened: early,
+                    flushNotes: { [notepad] in try await notepad.flushNow() },
                     notifyLocalFailure: local.notify, onLocalOutcome: local.outcome)
-                recordingMeetingId = nil
-                recordingSeriesId = nil
-                recordingInstance = nil
-                apply(.finalized)
-                presentRecapCue(Self.recapCue(
-                    reason: reason, transcriptRequested: result.transcriptRequested,
-                    meetingId: meetingId, seriesId: seriesId, instance: instance))
-                runRecovery()
-                if !early, result.transcriptRequested, let meetingId, let instance, Self.opensRecap(for: reason) {
-                    await openRecap(meetingId: meetingId, seriesId: seriesId, instance: instance)
-                }
+                finishStop(result, reason: reason, meetingId: meetingId, instance: instance)
             } catch {
                 captureSession.endFinishing()
                 // The durable directory survives a timed-out finalize, so Retry finishes the upload
@@ -1754,6 +1864,19 @@ final class AppController: NSObject, ObservableObject {
                 apply(.failed(Self.finalizeFailureMessage(for: error, host: instance?.host, audioMayLeaveMac: captureSession.audioMayLeaveMac)))
             }
         }
+    }
+
+    /// After a stop the server has the recording: the panel follows it into the review. The recap
+    /// opens only when the person asks for it.
+    func finishStop(_ result: CaptureSession.StopResult, reason: StopReason, meetingId: UUID?, instance: URL?) {
+        recordingMeetingId = nil
+        recordingSeriesId = nil
+        recordingInstance = nil
+        apply(.finalized)
+        presentRecapCue(Self.recapCue(
+            reason: reason, transcriptRequested: result.transcriptRequested,
+            meetingId: meetingId, instance: instance))
+        runRecovery()
     }
 
     private func localOutcomeHandlers() -> (notify: @Sendable (LocalTranscriber.Failure) async -> Void, outcome: @Sendable (Bool) async -> Void) {
@@ -2087,7 +2210,7 @@ final class AppController: NSObject, ObservableObject {
     }
 
     /// Retry a failed finalize by re-running the durable-directory recovery for that meeting, exactly
-    /// as startup recovery does, instead of starting a fresh recording. On success the recap opens;
+    /// as startup recovery does, instead of starting a fresh recording. On success the review starts;
     /// on failure the app parks back in `.error` with the finalize target still remembered.
     private func refinalize(meetingId: String) {
         guard case .error = phase, let client = authManager.client() else { return }
@@ -2111,13 +2234,8 @@ final class AppController: NSObject, ObservableObject {
                     NotepadStore.removeIfSynced(meetingId: meetingId, in: notesRoot)
                 }
                 apply(.finalized)
-                let openedEarly = earlyRecapMeetingId.map { $0.uuidString.lowercased() == manifest.meetingId.lowercased() } ?? false
-                earlyRecapMeetingId = nil
-                if !openedEarly, let meetingUUID = UUID(uuidString: manifest.meetingId) {
-                    await openRecap(
-                        meetingId: meetingUUID,
-                        seriesId: manifest.seriesId.flatMap { UUID(uuidString: $0) },
-                        instance: manifest.instanceURL)
+                if let meetingUUID = UUID(uuidString: manifest.meetingId) {
+                    presentRecapCue(RecapCue(meetingId: meetingUUID))
                 }
             } catch {
                 switch Self.refinalizeOutcome(for: error, host: authManager.instance?.host, audioMayLeaveMac: manifest?.audioMayLeaveMac ?? true) {
@@ -2135,11 +2253,10 @@ final class AppController: NSObject, ObservableObject {
         apply(.dismissedDetection)
     }
 
-    /// Land the flowing recap in front of the user the moment finalize completes. Resolves the series
-    /// id when unknown (a web-triggered record carries none) via the meetings table; if it still
-    /// cannot be resolved, falls back to a notification rather than doing nothing. The URL is built
-    /// from the instance capture started against, not the currently-connected one.
-    private func openRecap(meetingId: UUID, seriesId: UUID?, instance: URL, autoRecap: Bool = false) async {
+    /// Opens the recap window on a meeting. Resolves the series id when unknown (a web-triggered
+    /// record carries none) via the meetings table; if it still cannot be resolved, falls back to a
+    /// notification rather than doing nothing.
+    private func openRecap(meetingId: UUID, seriesId: UUID?, title: String) async {
         var resolvedSeries = seriesId
         if resolvedSeries == nil, let client = authManager.client() {
             resolvedSeries = try? await client.meetingSeriesId(meetingId: meetingId.uuidString)
@@ -2150,7 +2267,7 @@ final class AppController: NSObject, ObservableObject {
                 body: "Open Minutia on the web to see the recap.")
             return
         }
-        openURL(MinutiaClient.recapURL(instance: instance, seriesId: resolvedSeries, meetingId: meetingId, autoRecap: autoRecap))
+        await recapWindow.show(meetingId: meetingId, seriesId: resolvedSeries, title: title).value
     }
 
     // MARK: - URL callback
@@ -2208,7 +2325,13 @@ extension AppController: UNUserNotificationCenterDelegate {
         let actionId = response.actionIdentifier
         let userInfo = response.notification.request.content.userInfo
         let claimId = userInfo[Self.claimMeetingIdUserInfoKey] as? String
+        let reviewMeetingId = Self.reviewMeetingId(actionId: actionId, userInfo: userInfo)
         Task { @MainActor in
+            if let reviewMeetingId {
+                self.openReview(meetingId: reviewMeetingId)
+                completionHandler()
+                return
+            }
             switch actionId {
             case Self.confirmWebRecordActionId:
                 self.confirmPendingRecord()

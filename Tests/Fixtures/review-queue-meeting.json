@@ -1,0 +1,68 @@
+{
+  "me": "00000000-0000-0000-0000-000000000001",
+  "meetings": [
+    {
+      "meeting_id": "b72f2ff6-6b82-4621-840a-64616835651b",
+      "series_id": "b6008c45-d6ed-4cd8-bce4-9646a5994f0b",
+      "series_name": "Weekly sync",
+      "ended_at": "2026-11-20T18:12:07.806+00:00",
+      "transcription_status": "completed",
+      "suggestions_status": "ready",
+      "suggestions_reason": null,
+      "status_at": "2026-11-20T18:12:07.806+00:00",
+      "reviewer": true,
+      "members": [
+        {
+          "id": "9c3c04a1-c478-47cb-bbe0-b690ea2ad834",
+          "name": "Priya Shah"
+        },
+        {
+          "id": "00000000-0000-0000-0000-000000000001",
+          "name": "Test User"
+        }
+      ],
+      "rows": [
+        {
+          "id": "b21af03d-04e5-45ad-9a29-ded6f57825a3",
+          "type": "new_item",
+          "category": "action",
+          "title": "Send the budget",
+          "owner_name": "Priya",
+          "owner_user_id": "9c3c04a1-c478-47cb-bbe0-b690ea2ad834",
+          "due_date": "2026-11-25",
+          "confidence": 0.92,
+          "related_issue_number": null,
+          "related_issue_title": null,
+          "suggested_status": null
+        },
+        {
+          "id": "09510a73-8b67-4227-bead-b924c17fab19",
+          "type": "new_item",
+          "category": "risk",
+          "title": "Vendor may slip",
+          "owner_name": "",
+          "owner_user_id": null,
+          "due_date": null,
+          "confidence": 0.7,
+          "related_issue_number": null,
+          "related_issue_title": null,
+          "suggested_status": null
+        },
+        {
+          "id": "f252e25c-42af-4fe3-8e53-eca0a65fbada",
+          "type": "status_update",
+          "category": "action",
+          "title": "Contract renewed",
+          "owner_name": "",
+          "owner_user_id": null,
+          "due_date": null,
+          "confidence": 0.85,
+          "related_issue_number": 1479,
+          "related_issue_title": "Renew the contract",
+          "suggested_status": "resolved"
+        }
+      ],
+      "web_only_count": 2
+    }
+  ]
+}

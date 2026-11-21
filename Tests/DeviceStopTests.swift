@@ -28,13 +28,12 @@ final class DeviceStopTests: XCTestCase {
         return local
     }
 
-    private func finish(_ local: LocalTranscriber, _ transport: RecordingTransport, recapOpened: Bool = false,
+    private func finish(_ local: LocalTranscriber, _ transport: RecordingTransport,
                         sleeps: SleepLog = SleepLog(), steps: StepLog = StepLog()) async throws -> CaptureSession.StopResult {
         try await CaptureSession.finishOnDevice(
             meetingId: DeviceFixtures.meetingId, directory: dir,
             tail: [DeviceFixtures.segment(1, in: dir, start: 300)], durationSeconds: DeviceFixtures.fixtureDuration,
-            transcriber: local, transport: transport, recapOpened: recapOpened,
-            sleep: { sleeps.record($0) }, onStep: { steps.record($0) })
+            transcriber: local, transport: transport, sleep: { sleeps.record($0) }, onStep: { steps.record($0) })
     }
 
     // MARK: Happy path
@@ -73,13 +72,6 @@ final class DeviceStopTests: XCTestCase {
         await fulfillment(of: [transport.warmed, transport.ended], timeout: 3)
         let log = transport.log
         XCTAssertLessThan(try XCTUnwrap(log.firstIndex(of: "submit")), try XCTUnwrap(log.firstIndex(of: "warmSummary")))
-    }
-
-    func test_deviceStop_skipsTheWarmUp_whenTheRecapAlreadyOpened() async throws {
-        let transport = RecordingTransport()
-        _ = try await finish(await startedTranscriber(), transport, recapOpened: true)
-        await fulfillment(of: [transport.ended], timeout: 3)
-        XCTAssertFalse(transport.log.contains("warmSummary"))
     }
 
     func test_deviceStop_reportsSubmittingLast() async throws {
@@ -360,7 +352,7 @@ final class DeviceStopTests: XCTestCase {
             try await CaptureSession.finishOnDevice(
                 meetingId: DeviceFixtures.meetingId, directory: self.dir,
                 tail: [DeviceFixtures.segment(1, in: self.dir, start: 300)], durationSeconds: DeviceFixtures.fixtureDuration,
-                transcriber: local, transport: transport, recapOpened: true, sleep: { _ in },
+                transcriber: local, transport: transport, sleep: { _ in },
                 flushNotes: { _ = try await holdNotes(); notesLanded.set(nil) },
                 onStep: { steps.record($0) })
         }
@@ -401,7 +393,7 @@ final class DeviceStopTests: XCTestCase {
         do {
             _ = try await CaptureSession.finishOnDevice(
                 meetingId: DeviceFixtures.meetingId, directory: dir, tail: [], durationSeconds: 0,
-                transcriber: await startedTranscriber(), transport: transport, recapOpened: false, sleep: { _ in })
+                transcriber: await startedTranscriber(), transport: transport, sleep: { _ in })
             XCTFail("a zero-length recording must not be submitted")
         } catch {
             guard case .nothingRecorded? = error as? CaptureSession.CaptureError else { return XCTFail("got \(error)") }
@@ -428,7 +420,7 @@ final class DeviceStopTests: XCTestCase {
                 _ = try await CaptureSession.finishOnDevice(
                     meetingId: DeviceFixtures.meetingId, directory: dir,
                     tail: [DeviceFixtures.segment(1, in: dir, start: 300)], durationSeconds: DeviceFixtures.fixtureDuration,
-                    transcriber: local, transport: transport, recapOpened: false, transcribeTimeout: 0.5, sleep: { _ in })
+                    transcriber: local, transport: transport, transcribeTimeout: 0.5, sleep: { _ in })
                 outcome.set(nil)
             } catch {
                 outcome.set(error)
@@ -454,7 +446,7 @@ final class DeviceStopTests: XCTestCase {
                 _ = try await CaptureSession.finishOnDevice(
                     meetingId: DeviceFixtures.meetingId, directory: dir,
                     tail: [DeviceFixtures.segment(1, in: dir, start: 300)], durationSeconds: DeviceFixtures.fixtureDuration,
-                    transcriber: local, transport: RecordingTransport(), recapOpened: false, transcribeTimeout: 0.5, sleep: { _ in })
+                    transcriber: local, transport: RecordingTransport(), transcribeTimeout: 0.5, sleep: { _ in })
                 outcome.set(nil)
             } catch {
                 outcome.set(error)
@@ -528,7 +520,7 @@ final class DeviceStopTests: XCTestCase {
             _ = try await CaptureSession.finishOnDevice(
                 meetingId: DeviceFixtures.meetingId, directory: dir,
                 tail: [DeviceFixtures.segment(300, in: dir, start: 300)], durationSeconds: 400,
-                transcriber: local, transport: transport, recapOpened: false, sleep: { _ in })
+                transcriber: local, transport: transport, sleep: { _ in })
             XCTFail("must throw")
         } catch {
             guard case .transcriptTooLarge? = error as? CaptureSession.CaptureError else { return XCTFail("got \(error)") }
