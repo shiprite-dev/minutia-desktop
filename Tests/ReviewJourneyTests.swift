@@ -358,8 +358,9 @@ final class ReviewJourneyTests: XCTestCase {
     private func app() -> AppController {
         let app = AppController(
             defaults: UserDefaults(suiteName: suite)!, openURL: { [weak self] in self?.opened.append($0) }, micCheck: { (.authorized, true) },
-            reviewClock: clock.review, postReviewNotice: { [weak self] in self?.notices.append($0) },
-            reviewClient: { auth in auth.instance.map(Self.client) })
+            reviewClock: clock.review,
+            reviewNotifier: ReviewNotifier(post: { [weak self] in self?.notices.append($0) }, clear: { [weak self] in self?.notices = [] }),
+            reviewClient: { auth in auth.instance.map(Self.client) }, recapStores: RecapStores(all: { [] }, remove: { _ in }))
         app.announce = { [weak self] in self?.announcements.append($0) }
         apps.append(app)
         return app
@@ -991,7 +992,7 @@ final class ReviewJourneyTests: XCTestCase {
         ReviewServer.put(try pending("Draft the hiring plan"))
         try await relaunched.authManager.signIn(email: "first@example.com", password: "pw")
         await relaunched.review.refreshQueue()
-        XCTAssertEqual(notices.map(\.meetingId), [whileClosed], "after a sign-out the next first load is quiet")
+        XCTAssertEqual(notices, [], "after a sign-out the next first load is quiet")
     }
 
     func test_postedMeetingsOlderThanTwoWeeks_areForgotten_andNewerOnesKept() async throws {
@@ -1426,6 +1427,34 @@ final class ReviewJourneyTests: XCTestCase {
         XCTAssertEqual(review.shown?.screen.message, "Taking longer than usual. We'll let you know when it's ready.")
     }
 
+    func test_signingOutOrSwitchingServers_takesAwayReviewNotificationsAlreadyShown() async throws {
+        URLProtocol.unregisterClass(ReviewServer.self)
+        URLProtocol.registerClass(AuthServerStub.self)
+        URLProtocol.registerClass(ReviewServer.self)
+        AuthServerStub.signInBody = AuthServerStub.validSessionBody
+        let app = app()
+        await app.authManager.adopt(testSupabase(instance), instance: instance)
+        try await app.authManager.signIn(email: "first@example.com", password: "pw")
+        await app.review.refreshQueue()
+        let first = UUID()
+        ReviewServer.put(try pending("Send the budget", first))
+        await app.review.refreshQueue()
+        XCTAssertEqual(notices, [ReviewNotice(title: "1 action item from Weekly sync", meetingId: first)])
+
+        await app.authManager.signOut()
+        XCTAssertEqual(notices, [], "nothing from the old account stays in Notification Center")
+
+        try await app.authManager.signIn(email: "first@example.com", password: "pw")
+        await app.review.refreshQueue()
+        let second = UUID()
+        ReviewServer.put(try pending("Book the Acme interview", second))
+        await app.review.refreshQueue()
+        XCTAssertEqual(notices.map(\.meetingId), [second])
+
+        await app.authManager.adopt(testSupabase(otherInstance), instance: otherInstance)
+        XCTAssertEqual(notices, [], "nothing from the old server stays in Notification Center")
+    }
+
     // MARK: - On screen
 
     private func readyReview(_ rows: [[String: Any]], webOnly: Int = 0) async throws -> ReviewController {
@@ -1516,6 +1545,49 @@ final class ReviewJourneyTests: XCTestCase {
                 XCTAssertTrue(seen.has(words), "dark: \(dark) missing \(words): \(seen.text)")
             }
         }
+    }
+
+    func test_aLongOwnerName_staysOnOneLine_andBothChipsStayInsideThePanel() async throws {
+        let owner = "Bartholomew Alexander Fitzgerald-Whitman"
+        XCTAssertEqual(owner.count, 40)
+        var long = try row(UUID(), "Send the budget")
+        long["owner_name"] = owner
+        long["owner_user_id"] = NSNull()
+        let review = try await readyReview([long])
+
+        let size = Host.size(panel(review))
+        XCTAssertEqual(size.width, 320)
+        XCTAssertLessThan(size.height, 200, "a one-row list leaves no tall empty area")
+        let seen = Host.text(panel(review))
+        XCTAssertTrue(seen.has("Bartholomew"), seen.text)
+        XCTAssertTrue(seen.hasLine("Nov 25"), "the date chip is still on screen: \(seen.text)")
+        let date = try XCTUnwrap(seen.frame(of: "Nov 25"))
+        XCTAssertLessThanOrEqual(date.maxX, 1)
+        XCTAssertTrue(KeyWindow(panel(review)).helps().contains(owner), "the whole name shows on hover")
+    }
+
+    func test_fiveNewItemsAndSixUpdates_scrollTheRows_andTheHeaderAndKeepStayOnScreen() async throws {
+        var rows = try (1...5).map { try row(UUID(), "Follow up on item \($0) with the team") }
+        for n in 1...6 {
+            var update = try row(UUID(), "Contract renewed \(n)", confidence: 0.85, type: "status_update")
+            update["suggested_status"] = "in_progress"
+            rows.append(update)
+        }
+        let app = app()
+        await app.authManager.adopt(testSupabase(instance), instance: instance)
+        app.apply(.signedIn)
+        app.panelOpened()
+        ReviewServer.put(try meeting(rows: rows))
+        app.presentRecapCue(RecapCue(meetingId: meetingId, seriesId: nil, instance: instance))
+        await waitUntil { app.review.shown?.screen == .ready }
+        let menu = MenuContent(controller: app, updater: UpdaterController())
+
+        XCTAssertLessThanOrEqual(Host.size(menu).height, 520)
+        let seen = Host.text(menu)
+        for line in ["Weekly sync", "Keep 11", "Skip the rest", "Open recap"] {
+            XCTAssertTrue(seen.hasLine(line), "missing \(line): \(seen.text)")
+        }
+        XCTAssertTrue(seen.has("Follow up on item 1"), seen.text)
     }
 
     func test_doneCheck_drawsAtOnceWithReduceMotion_andAnimatesWithout() async throws {

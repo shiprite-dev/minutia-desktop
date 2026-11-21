@@ -494,6 +494,64 @@ final class RecapWindowTests: XCTestCase {
         XCTAssertFalse(seen.has("Try again"), seen.text)
     }
 
+    func test_whatEachLoadFailureShows() {
+        let offline: [URLError.Code] = [.notConnectedToInternet, .networkConnectionLost, .cannotFindHost, .cannotConnectToHost, .timedOut, .dnsLookupFailed, .dataNotAllowed]
+        for code in offline { XCTAssertEqual(RecapScreen.failure(URLError(code)), .offline, "\(code)") }
+        let slow: [URLError.Code] = [.badServerResponse, .internationalRoamingOff, .callIsActive, .resourceUnavailable, .httpTooManyRedirects, .zeroByteResource, .badURL]
+        for code in slow { XCTAssertEqual(RecapScreen.failure(URLError(code)), .slow, "\(code)") }
+        let insecure: [Error] = [
+            URLError(.serverCertificateUntrusted), URLError(.secureConnectionFailed), URLError(.serverCertificateHasBadDate),
+            URLError(.clientCertificateRequired), NSError(domain: "WebKitErrorDomain", code: -1202), NSError(domain: "WebKitErrorDomain", code: -1200),
+        ]
+        for error in insecure { XCTAssertEqual(RecapScreen.failure(error), .insecure, "\(error)") }
+        XCTAssertNil(RecapScreen.failure(URLError(.cancelled)), "a navigation the window itself stopped shows nothing")
+        XCTAssertNil(RecapScreen.failure(NSError(domain: "WebKitErrorDomain", code: 102)), "a link handed to the browser shows nothing")
+    }
+
+    func test_aFailureThatIsNotTheConnection_saysTakingLonger_withTryAgainAndOpenInBrowser() async throws {
+        fake.answerMeetings(.hang)
+        let controller = recap()
+        await controller.show(meetingId: meetingId, seriesId: fake.seriesId, title: "Weekly sync").value
+        let webView = try XCTUnwrap(controller.webView)
+        controller.webView(webView, didFailProvisionalNavigation: nil, withError: URLError(.badServerResponse) as NSError)
+
+        XCTAssertEqual(announced, ["Taking longer than usual"])
+        let seen = onScreen(controller)
+        XCTAssertTrue(seen.hasLine("Taking longer than usual"), seen.text)
+        XCTAssertTrue(seen.hasLine("Try again"), seen.text)
+        XCTAssertTrue(seen.hasLine("Open in browser"), seen.text)
+        XCTAssertFalse(seen.has("You're offline"), seen.text)
+    }
+
+    func test_everyCertificateFailure_fromEitherWebKitCallback_saysItCantOpenSecurely() async throws {
+        fake.answerMeetings(.hang)
+        let controller = recap()
+        await openedRecapLoading(controller)
+        let webView = try XCTUnwrap(controller.webView)
+        let failures: [NSError] = [
+            URLError(.serverCertificateUntrusted) as NSError, URLError(.secureConnectionFailed) as NSError,
+            NSError(domain: "WebKitErrorDomain", code: -1202),
+        ]
+        for error in failures {
+            for provisional in [true, false] {
+                controller.tryAgain()
+                await waitUntil { controller.screen == .loading }
+                if provisional {
+                    controller.webView(webView, didFailProvisionalNavigation: nil, withError: error)
+                } else {
+                    controller.webView(webView, didFail: nil, withError: error)
+                }
+                XCTAssertEqual(controller.screen, .insecure, "\(error.domain) \(error.code) provisional: \(provisional)")
+            }
+        }
+        XCTAssertEqual(announced, Array(repeating: "Can't open this server securely", count: 6))
+    }
+
+    private func openedRecapLoading(_ controller: RecapWindowController) async {
+        await controller.show(meetingId: meetingId, seriesId: fake.seriesId, title: "Weekly sync").value
+        await waitUntil { fake.server.requests(fake.meetingPath(meetingId)).count == 1 }
+    }
+
     // MARK: - One window
 
     func test_theSameMeetingFocusesTheWindow_anotherMeetingNavigatesItWithoutSigningInAgain() async {

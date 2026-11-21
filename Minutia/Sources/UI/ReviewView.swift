@@ -72,7 +72,23 @@ struct ReviewView: View {
         }
     }
 
+    /// The rows scroll once they are taller than this, so the header and the Keep footer stay on screen.
+    static let rowsMaxHeight: CGFloat = 380
+
     private var rows: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                rowList
+            }
+            .frame(maxHeight: Self.rowsMaxHeight)
+            .fixedSize(horizontal: false, vertical: true)
+            .onChange(of: focused) { _, id in
+                if let id { proxy.scrollTo(id) }
+            }
+        }
+    }
+
+    private var rowList: some View {
         VStack(alignment: .leading, spacing: 0) {
             ForEach(review.groups, id: \.title) { group in
                 ReviewSection(title: group.title)
@@ -86,6 +102,7 @@ struct ReviewView: View {
                         onRetry: { Task { await review.retry(row.id) } })
                         .focusable()
                         .focused($focused, equals: row.id)
+                        .id(row.id)
                 }
             }
             if let more = review.moreOnWeb {
@@ -176,7 +193,7 @@ private struct ReviewRowView: View {
                         state(note)
                     } else {
                         if let owner = row.owner { chip(owner, editable: row.editable) { ownerMenu } }
-                        if let due = row.due { chip(due, editable: row.editable) { dueMenu } }
+                        if let due = row.due { chip(due, editable: row.editable) { dueMenu }.layoutPriority(1) }
                     }
                 }
             }
@@ -208,17 +225,18 @@ private struct ReviewRowView: View {
     @ViewBuilder
     private func chip<Items: View>(_ text: String, editable: Bool, @ViewBuilder items: () -> Items) -> some View {
         if editable {
-            Menu(text, content: items)
+            Menu(content: items) { Text(text).lineLimit(1).truncationMode(.tail) }
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
-                .fixedSize()
+                .fixedSize(horizontal: false, vertical: true)
+                .help(text)
                 .font(Typo.caption)
                 .padding(.horizontal, 7)
                 .padding(.vertical, 1)
                 .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(.quaternary, lineWidth: 0.5))
                 .accessibilityLabel("\(text). Change")
         } else {
-            Text(text).font(Typo.caption).foregroundStyle(Brand.ink2)
+            Text(text).font(Typo.caption).foregroundStyle(Brand.ink2).lineLimit(1).help(text)
                 .padding(.horizontal, 7).padding(.vertical, 1)
                 .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(.quaternary, lineWidth: 0.5))
         }

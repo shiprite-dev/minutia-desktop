@@ -277,6 +277,13 @@ struct MenuBarIcon: View {
     }
 }
 
+struct ReviewNotifier {
+    var post: @MainActor (ReviewNotice) -> Void
+    var clear: @MainActor () -> Void
+
+    static let live = ReviewNotifier(post: AppController.postReviewNotice, clear: AppController.clearReviewNotices)
+}
+
 struct RecapCue: Equatable {
     let meetingId: UUID
     let seriesId: UUID?
@@ -341,6 +348,7 @@ final class AppController: NSObject, ObservableObject {
     var openRecap: (UUID) -> Void = { _ in }
     let review: ReviewController
     let recapWindow: RecapWindowController
+    private let reviewNotifier: ReviewNotifier
     private var webSessionIdentity: AuthManager.SessionIdentity?
     private var webStoresPruned = false
     private var currentWebStore: UUID? {
@@ -803,7 +811,7 @@ final class AppController: NSObject, ObservableObject {
             (AVCaptureDevice.authorizationStatus(for: .audio), AVCaptureDevice.default(for: .audio) != nil)
         },
         reviewClock: ReviewClock = .live,
-        postReviewNotice: @escaping @MainActor (ReviewNotice) -> Void = AppController.postReviewNotice,
+        reviewNotifier: ReviewNotifier = .live,
         reviewClient: @escaping @MainActor (AuthManager) -> MinutiaClient? = { $0.client() },
         windowPresence: WindowPresence = .shared,
         recapStores: RecapStores = .webKit
@@ -811,7 +819,8 @@ final class AppController: NSObject, ObservableObject {
         self.defaults = defaults
         let authManager = AuthManager(defaults: defaults)
         self.authManager = authManager
-        self.review = ReviewController(client: { reviewClient(authManager) }, clock: reviewClock, defaults: defaults, notify: postReviewNotice)
+        self.review = ReviewController(client: { reviewClient(authManager) }, clock: reviewClock, defaults: defaults, notify: reviewNotifier.post)
+        self.reviewNotifier = reviewNotifier
         self.recapWindow = RecapWindowController(
             account: {
                 guard let client = authManager.client() else { return nil }
@@ -995,7 +1004,10 @@ final class AppController: NSObject, ObservableObject {
     }
 
     private func handleAuthChange(_ identity: AuthManager.SessionIdentity) {
-        if let shown = webSessionIdentity, shown != identity { Task { await recapWindow.forgetWebSessions() } }
+        if let shown = webSessionIdentity, shown != identity {
+            Task { await recapWindow.forgetWebSessions() }
+            reviewNotifier.clear()
+        }
         webSessionIdentity = identity.email == nil ? nil : identity
         review.reset(account: identity.email.map { "\($0) \(identity.instance?.absoluteString ?? "")" })
         if identity.email != nil {
@@ -1771,13 +1783,25 @@ final class AppController: NSObject, ObservableObject {
         return (userInfo[reviewMeetingIdUserInfoKey] as? String).flatMap(UUID.init(uuidString:))
     }
 
+    private static let reviewRequestPrefix = "review-"
+
     static func postReviewNotice(_ notice: ReviewNotice) {
         let content = UNMutableNotificationContent()
         content.title = notice.title
         content.categoryIdentifier = reviewCategoryId
         content.userInfo = [reviewMeetingIdUserInfoKey: notice.meetingId.uuidString]
         UNUserNotificationCenter.current().add(
-            UNNotificationRequest(identifier: "review-\(notice.meetingId.uuidString)", content: content, trigger: nil))
+            UNNotificationRequest(identifier: reviewRequestPrefix + notice.meetingId.uuidString, content: content, trigger: nil))
+    }
+
+    static func clearReviewNotices() {
+        let center = UNUserNotificationCenter.current()
+        Task {
+            let delivered = await center.deliveredNotifications().map(\.request.identifier)
+            center.removeDeliveredNotifications(withIdentifiers: delivered.filter { $0.hasPrefix(reviewRequestPrefix) })
+            let pending = await center.pendingNotificationRequests().map(\.identifier)
+            center.removePendingNotificationRequests(withIdentifiers: pending.filter { $0.hasPrefix(reviewRequestPrefix) })
+        }
     }
 
     /// Opens the menu panel; false when the status item could not be found.

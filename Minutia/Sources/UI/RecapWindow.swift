@@ -31,6 +31,20 @@ enum RecapScreen: Equatable {
         case .loading, .page: nil
         }
     }
+
+    private static let offlineCodes: Set<Int> = [
+        NSURLErrorNotConnectedToInternet, NSURLErrorNetworkConnectionLost, NSURLErrorCannotFindHost, NSURLErrorCannotConnectToHost,
+        NSURLErrorTimedOut, NSURLErrorDNSLookupFailed, NSURLErrorDataNotAllowed,
+    ]
+
+    /// What a failed load shows. WebKit reports some certificate failures under its own error domain.
+    static func failure(_ error: Error) -> RecapScreen? {
+        let error = error as NSError
+        guard [NSURLErrorDomain, "WebKitErrorDomain"].contains(error.domain), error.code != NSURLErrorCancelled else { return nil }
+        if (NSURLErrorClientCertificateRequired...NSURLErrorSecureConnectionFailed).contains(error.code) { return .insecure }
+        guard error.domain == NSURLErrorDomain else { return nil }
+        return offlineCodes.contains(error.code) ? .offline : .slow
+    }
 }
 
 struct RecapStores {
@@ -79,10 +93,6 @@ final class RecapWindowController: NSObject, ObservableObject {
     private static let removalKey = "recap.storesToRemove"
     private static let createdKey = "recap.createdStores"
     private static let handoffReuse: TimeInterval = 9 * 60
-    private static let offline: Set<URLError.Code> = [
-        .notConnectedToInternet, .networkConnectionLost, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
-        .timedOut, .dataNotAllowed, .internationalRoamingOff,
-    ]
 
     init(
         account: @escaping () async -> Account?,
@@ -228,7 +238,7 @@ final class RecapWindowController: NSObject, ObservableObject {
         case .failure(MinutiaClientError.serverError(status: 404)):
             window?.close()
             openURL(current.page)
-        case .failure(let error as URLError) where Self.offline.contains(error.code):
+        case .failure(let error) where RecapScreen.failure(error) == .offline:
             setScreen(.offline)
         case .failure(let error):
             if error as? MinutiaClientError == .signedOut { onSignedOut() }
@@ -399,9 +409,7 @@ extension RecapWindowController: WKNavigationDelegate, WKUIDelegate {
     }
 
     private func fail(_ error: Error) {
-        let error = error as NSError
-        guard error.domain == NSURLErrorDomain, error.code != NSURLErrorCancelled else { return }
-        setScreen((NSURLErrorClientCertificateRequired...NSURLErrorSecureConnectionFailed).contains(error.code) ? .insecure : .offline)
+        if let screen = RecapScreen.failure(error) { setScreen(screen) }
     }
 
     func webView(
