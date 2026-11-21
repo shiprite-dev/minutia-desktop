@@ -149,6 +149,9 @@ final class RecapWindowTests: XCTestCase {
     }
 
     override func tearDown() async throws {
+        // An app left signed in keeps refreshing its session and checking in after the test ends,
+        // and those requests land in whichever URL stub a later suite has registered.
+        for app in apps { try? await app.authManager.supabase?.auth.signOut(scope: .local) }
         for app in apps { await app.recapWindow.forgetWebSessions() }
         for controller in controllers { await controller.forgetWebSessions() }
         controllers = []

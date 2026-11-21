@@ -2,12 +2,16 @@ import CryptoKit
 import XCTest
 @testable import Minutia
 
+/// Answers only requests to the running test's own host. Apps and auth clients left over from
+/// other suites keep polling and refreshing in the background; a stub that claimed every request
+/// recorded their traffic as this test's.
 private final class ReviewStub: URLProtocol {
+    nonisolated(unsafe) static var host: String?
     nonisolated(unsafe) static var handler: ((URLRequest) -> Result<(Int, String), URLError>)?
     nonisolated(unsafe) static var seen: [URLRequest] = []
     nonisolated(unsafe) static var seenBodies: [Data] = []
 
-    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canInit(with request: URLRequest) -> Bool { host != nil && request.url?.host == host }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func stopLoading() {}
 
@@ -40,7 +44,8 @@ private final class ReviewStub: URLProtocol {
 }
 
 final class ReviewClientTests: XCTestCase {
-    private let instance = URL(string: "https://minutia.example.com")!
+    private let host = "review-\(UUID().uuidString.lowercased()).example.com"
+    private lazy var instance = URL(string: "https://\(host)")!
     private let meeting = UUID(uuidString: "3F95FFD6-FD1E-4640-AACC-89E1C051F742")!
     private let suggestion = UUID(uuidString: "F04A05E1-1FF7-4B9F-A50B-3BDF2A7DB083")!
 
@@ -49,12 +54,14 @@ final class ReviewClientTests: XCTestCase {
         ReviewStub.handler = nil
         ReviewStub.seen = []
         ReviewStub.seenBodies = []
+        ReviewStub.host = host
         URLProtocol.registerClass(ReviewStub.self)
     }
 
     override func tearDown() {
         URLProtocol.unregisterClass(ReviewStub.self)
         ReviewStub.handler = nil
+        ReviewStub.host = nil
         super.tearDown()
     }
 
@@ -63,7 +70,7 @@ final class ReviewClientTests: XCTestCase {
     private func client(refreshes: Refreshes = Refreshes()) -> MinutiaClient {
         MinutiaClient(
             instance: instance,
-            supabase: testSupabase(URL(string: "https://supabase.example.com")!),
+            supabase: testSupabase(instance),
             tokenProvider: { "test-access-token" },
             freshTokenProvider: { refreshes.count += 1; return "refreshed-token" })
     }
@@ -358,7 +365,7 @@ final class ReviewClientTests: XCTestCase {
             next: "/series/B6008C45-D6ED-4CD8-BCE4-9646A5994F0B?meeting=3F95FFD6-FD1E-4640-AACC-89E1C051F742&Tab=Notes")
 
         XCTAssertEqual(request.httpMethod, "POST")
-        XCTAssertEqual(request.url?.absoluteString, "https://minutia.example.com/auth/companion-session")
+        XCTAssertEqual(request.url?.absoluteString, "https://\(host)/auth/companion-session")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/x-www-form-urlencoded")
         let body = String(data: try XCTUnwrap(request.httpBody), encoding: .utf8)
         XCTAssertEqual(
