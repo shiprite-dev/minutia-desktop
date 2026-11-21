@@ -59,6 +59,37 @@ struct RecapStores {
 /// The one Minutia window that shows a meeting's web page. Each time the window opens it signs in
 /// with a fresh one-time handoff into a web data store of its own per server and account, so it is
 /// always the Mac's account; the Mac's own session never enters it.
+/// What the page may ask the person: choose files, or answer a JavaScript alert, confirm or prompt.
+struct RecapDialogs {
+    enum Ask: Equatable { case alert, confirm, prompt(defaultText: String?) }
+
+    var chooseFiles: @MainActor (_ multiple: Bool, _ directories: Bool, _ window: NSWindow?) async -> [URL]?
+    var ask: @MainActor (_ kind: Ask, _ message: String, _ window: NSWindow?) async -> (ok: Bool, text: String?)
+
+    static let live = RecapDialogs(
+        chooseFiles: { multiple, directories, window in
+            let panel = NSOpenPanel()
+            panel.allowsMultipleSelection = multiple
+            panel.canChooseDirectories = directories
+            let response = if let window { await panel.beginSheetModal(for: window) } else { panel.runModal() }
+            return response == .OK ? panel.urls : nil
+        },
+        ask: { kind, message, window in
+            let alert = NSAlert()
+            alert.messageText = message
+            alert.addButton(withTitle: "OK")
+            if kind != .alert { alert.addButton(withTitle: "Cancel") }
+            var field: NSTextField?
+            if case .prompt(let defaultText) = kind {
+                field = NSTextField(string: defaultText ?? "")
+                field?.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
+                alert.accessoryView = field
+            }
+            let response = if let window { await alert.beginSheetModal(for: window) } else { alert.runModal() }
+            return (response == .alertFirstButtonReturn, field?.stringValue)
+        })
+}
+
 @MainActor
 final class RecapWindowController: NSObject, ObservableObject {
     typealias Account = (client: MinutiaClient, userId: String?)
@@ -79,6 +110,7 @@ final class RecapWindowController: NSObject, ObservableObject {
     private let stores: RecapStores
     private let announce: (String) -> Void
     private let onSignedOut: () -> Void
+    private let dialogs: RecapDialogs
     private var current: (meetingId: UUID, page: URL, next: String, client: MinutiaClient, store: UUID)?
     private var windowStore: UUID?
     private var signedIn = false
@@ -106,7 +138,8 @@ final class RecapWindowController: NSObject, ObservableObject {
         defaults: UserDefaults = .standard,
         stores: RecapStores = .webKit,
         announce: @escaping (String) -> Void = { AccessibilityNotification.Announcement($0).post() },
-        onSignedOut: @escaping () -> Void = {}
+        onSignedOut: @escaping () -> Void = {},
+        dialogs: RecapDialogs = .live
     ) {
         self.account = account
         self.openURL = openURL
@@ -117,6 +150,7 @@ final class RecapWindowController: NSObject, ObservableObject {
         self.stores = stores
         self.announce = announce
         self.onSignedOut = onSignedOut
+        self.dialogs = dialogs
         super.init()
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
@@ -428,6 +462,25 @@ extension RecapWindowController: WKNavigationDelegate, WKUIDelegate {
         type: WKMediaCaptureType
     ) async -> WKPermissionDecision {
         .deny
+    }
+
+    func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters, initiatedByFrame frame: WKFrameInfo) async -> [URL]? {
+        await dialogs.chooseFiles(parameters.allowsMultipleSelection, parameters.allowsDirectories, window)
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo) async {
+        _ = await dialogs.ask(.alert, message, window)
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo) async -> Bool {
+        await dialogs.ask(.confirm, message, window).ok
+    }
+
+    func webView(
+        _ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?, initiatedByFrame frame: WKFrameInfo
+    ) async -> String? {
+        let answer = await dialogs.ask(.prompt(defaultText: defaultText), prompt, window)
+        return answer.ok ? answer.text : nil
     }
 }
 

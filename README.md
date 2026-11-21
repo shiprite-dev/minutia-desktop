@@ -10,7 +10,7 @@ Minutia Desktop records meeting audio directly on your Mac, microphone plus syst
 
 - **Records mic + system audio.** A CoreAudio process tap captures everything playing on your Mac (macOS 14.4+), mixed with your microphone into a single stream.
 - **Uploads while the meeting runs.** Audio is cut into 5-minute m4a segments and queued for transcription as each one closes, so the recap is already assembling before you hang up.
-- **Finalizes on stop.** Stopping uploads the tail of the recording, requests the final transcription pass, and opens the flowing recap for that meeting in your browser.
+- **Reviews right in the menu after you stop.** Stopping sends the rest of the recording and asks for the transcript. The menu then shows the action items found in the meeting, so you can keep, skip, or hand them to a teammate without leaving your Mac. Open recap shows the full meeting notes in their own window, already signed in.
 - **Detects meetings automatically.** Watches for a live microphone plus a corroborating signal: Zoom's `CptHost` helper process, the Teams bundle id, or a calendar event in progress, then surfaces a "Record this meeting?" notification with a one-click Record action.
 - **Signs in three ways.** "Sign in with browser" hands off to your Minutia instance and completes via a `minutia://` callback; email/password and Google are available as a fallback.
 

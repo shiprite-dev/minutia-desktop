@@ -118,6 +118,10 @@ final class RecapWindowTests: XCTestCase {
     private var opened: [URL] = []
     private var copied: [String] = []
     private var announced: [String] = []
+    private var asked: [String] = []
+    private var chosenFiles: [URL]?
+    private var answer = false
+    private var typed: String?
     private var signOutChecks = 0
     private var policies: [NSApplication.ActivationPolicy] = []
     private var presence: WindowPresence!
@@ -166,7 +170,16 @@ final class RecapWindowTests: XCTestCase {
             account: { (MinutiaClient(instance: base, supabase: testSupabase(base), tokenProvider: token), user()) },
             openURL: { [weak self] in self?.opened.append($0) }, copy: { [weak self] in self?.copied.append($0) },
             clock: clock.review, presence: presence, defaults: defaults, stores: stores,
-            announce: { [weak self] in self?.announced.append($0) }, onSignedOut: { [weak self] in self?.signOutChecks += 1 })
+            announce: { [weak self] in self?.announced.append($0) }, onSignedOut: { [weak self] in self?.signOutChecks += 1 },
+            dialogs: RecapDialogs(
+                chooseFiles: { [weak self] multiple, _, window in
+                    self?.asked.append("files multiple=\(multiple) sheet=\(window != nil)")
+                    return self?.chosenFiles
+                },
+                ask: { [weak self] kind, message, window in
+                    self?.asked.append("\(kind) \(message) sheet=\(window != nil)")
+                    return (self?.answer ?? false, self?.typed)
+                }))
         controllers.append(controller)
         return controller
     }
@@ -681,6 +694,33 @@ final class RecapWindowTests: XCTestCase {
     }
 
     // MARK: - What the page may do
+
+    func test_aFileInputOnThePage_opensTheFilePanel_andThePageGetsTheChosenFiles() async throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("issues.csv")
+        try Data("title\nSend the budget\n".utf8).write(to: file)
+        chosenFiles = [file]
+        fake.addToMeetingPage("<input type=file id=pick multiple onchange=\"fetch('/report?files='+[...this.files].map(f=>f.name).join(','))\">")
+        let controller = recap()
+        await openedRecap(controller)
+
+        _ = try? await controller.webView?.evaluateJavaScript("document.getElementById('pick').click(); 1")
+        await waitUntil { !fake.server.requests("/report").isEmpty }
+        XCTAssertEqual(asked, ["files multiple=true sheet=true"])
+        XCTAssertEqual(fake.server.requests("/report").map(\.query), ["files=issues.csv"])
+    }
+
+    func test_thePagesConfirmAlertAndPrompt_showWhatThePersonAnswers() async {
+        answer = true
+        typed = "Board prep"
+        fake.runOnMeetingPage(
+            "alert('Saved'); fetch('/report?confirm='+confirm('Delete this item?')+'&prompt='+encodeURIComponent(prompt('Rename the series', 'Weekly sync')))")
+        let controller = recap()
+        await openedRecap(controller)
+
+        await waitUntil { !fake.server.requests("/report").isEmpty }
+        XCTAssertEqual(asked, ["alert Saved sheet=true", "confirm Delete this item? sheet=true", "prompt(defaultText: Optional(\"Weekly sync\")) Rename the series sheet=true"])
+        XCTAssertEqual(fake.server.requests("/report").map(\.query), ["confirm=true&prompt=Board%20prep"])
+    }
 
     func test_thePageAskingForTheMicrophone_isRefused() async {
         fake.runOnMeetingPage(
