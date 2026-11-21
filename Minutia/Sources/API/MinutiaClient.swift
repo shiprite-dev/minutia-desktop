@@ -582,7 +582,7 @@ enum ReviewSaveResult: Equatable {
 }
 
 enum ReviewQueueError: Error, Equatable {
-    case meetingGone, signedOut, failed
+    case meetingGone, signedOut, olderServer, failed
 }
 
 extension MinutiaClient {
@@ -641,7 +641,7 @@ extension MinutiaClient {
         } catch {
             throw ReviewQueueError.failed
         }
-        if status == 404, Self.errorCode(from: data) == "meeting_gone" { throw ReviewQueueError.meetingGone }
+        if status == 404 { throw Self.errorCode(from: data) == "meeting_gone" ? ReviewQueueError.meetingGone : .olderServer }
         if status == 401 { throw ReviewQueueError.signedOut }
         guard (200...299).contains(status), let queue = try? Self.reviewDecoder.decode(ReviewQueue.self, from: data)
         else { throw ReviewQueueError.failed }

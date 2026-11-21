@@ -77,6 +77,7 @@ final class ReviewController: ObservableObject {
     static let readyPoll: TimeInterval = 30
     static let pollLimit: TimeInterval = 15 * 60
     static let doneHold: TimeInterval = 4
+    static let loadAttempts = 3
 
     @Published private(set) var model: ReviewModel?
     @Published private(set) var queue: [ReviewMeeting] = []
@@ -96,6 +97,7 @@ final class ReviewController: ObservableObject {
     private var retrying: UUID?
     private var postedHere: Set<UUID> = []
     private var generation = 0
+    private var loadFailures = 0
     private var pollStarted = Date.distantPast
     private var pollTask: Task<Void, Never>?
     private var closeTask: Task<Void, Never>?
@@ -123,6 +125,7 @@ final class ReviewController: ObservableObject {
         hidden = false
         pollStarted = clock.now()
         if model?.meetingId != meetingId {
+            loadFailures = 0
             let queued = queue.first { $0.meetingId == meetingId }
             meeting = queued
             show(queued.map { ReviewModel.from($0, now: clock.now(), previous: nil) }
@@ -180,6 +183,10 @@ final class ReviewController: ObservableObject {
             schedulePoll()
             return nil
         }
+        if hidden, let model, !Self.working(model.screen) {
+            hidden = false
+            if let line = spoken(model) { announce(line) }
+        }
         return Task {
             await refresh()
             await refreshQueue()
@@ -194,6 +201,7 @@ final class ReviewController: ObservableObject {
             guard generation == self.generation, model?.meetingId == id else { return }
             me = response.me
             guard let fetched = response.meetings.first(where: { $0.meetingId == id }) else { throw ReviewQueueError.meetingGone }
+            loadFailures = 0
             meeting = fetched
             merge(fetched)
             if !saving, retrying != id { show(ReviewModel.from(fetched, now: clock.now(), previous: model)) }
@@ -206,7 +214,12 @@ final class ReviewController: ObservableObject {
             guard generation == self.generation else { return }
             model?.signedOut = true
             onSignedOut()
-        } catch {}
+        } catch {
+            guard generation == self.generation, let shown = model, shown.meetingId == id else { return }
+            loadFailures += 1
+            let unreachable = error as? ReviewQueueError == .olderServer || loadFailures >= Self.loadAttempts
+            if unreachable, Self.working(shown.screen), !saving, retrying != id { show(ReviewModel(meetingId: id, screen: .notAvailable)) }
+        }
         schedulePoll()
     }
 
@@ -332,7 +345,10 @@ final class ReviewController: ObservableObject {
         if next.screen == .ready, !next.readOnly, let meeting, meeting.meetingId == next.meetingId {
             noticeOnce(meeting, post: !panelOpen || hidden)
         }
-        if hidden, !Self.working(next.screen) { return dismiss() }
+        if hidden, !Self.working(next.screen) {
+            if next.screen == .ready { dismiss() }
+            return
+        }
         if case .done = next.screen {
             if closeTask == nil { scheduleClose() }
         } else {
@@ -409,7 +425,9 @@ final class ReviewController: ObservableObject {
         }
     }
 
-    private nonisolated static func waits(_ meeting: ReviewMeeting) -> Bool { meeting.reviewer && !meeting.rows.isEmpty }
+    private nonisolated static func waits(_ meeting: ReviewMeeting) -> Bool {
+        meeting.reviewer && !meeting.rows.isEmpty && meeting.suggestionsStatus != nil
+    }
 
     private nonisolated static func sorted(_ meetings: [ReviewMeeting]) -> [ReviewMeeting] {
         meetings.sorted { ($0.endedAt ?? .distantPast) > ($1.endedAt ?? .distantPast) }

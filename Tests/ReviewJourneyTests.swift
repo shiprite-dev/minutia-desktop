@@ -26,12 +26,33 @@ final class ReviewServer: URLProtocol {
     nonisolated(unsafe) private static var onRetry: [String: [String: Any]] = [:]
     nonisolated(unsafe) private static var holdRetryFlag = false
     nonisolated(unsafe) private static var refuseRetryFlag = false
+    nonisolated(unsafe) private static var olderFlag = false
+    nonisolated(unsafe) private static var queueFailsFlag = false
+    nonisolated(unsafe) private static var signedOutFlag = false
 
     static func reset() {
         lock.withLock {
             meetings = [:]; order = []; gone = []; refusals = [:]; held = []; seen = []
             offlineFlag = false; holdFlag = false; loseFlag = false; onRetry = [:]; holdRetryFlag = false; refuseRetryFlag = false
+            olderFlag = false; queueFailsFlag = false; signedOutFlag = false
         }
+    }
+
+    /// A server from before the review queue: Next.js answers the unknown route with its HTML 404 page.
+    static var olderServer: Bool {
+        get { lock.withLock { olderFlag } }
+        set { lock.withLock { olderFlag = newValue } }
+    }
+
+    static var queueFails: Bool {
+        get { lock.withLock { queueFailsFlag } }
+        set { lock.withLock { queueFailsFlag = newValue } }
+    }
+
+    /// The person signed out on the web: every API route answers 401 the way the real routes do.
+    static var signedOutOnTheWeb: Bool {
+        get { lock.withLock { signedOutFlag } }
+        set { lock.withLock { signedOutFlag = newValue } }
     }
 
     static var offline: Bool {
@@ -132,23 +153,14 @@ final class ReviewServer: URLProtocol {
 
     private static func answer(method: String, path: String, query: String?, body: [String: Any]) -> (Int, String) {
         let parts = path.split(separator: "/").map(String.init)
-        switch (method, parts.count) {
-        case ("GET", _) where path == "/api/companion/review-queue":
-            let me = "00000000-0000-0000-0000-000000000001"
-            if let query, query.hasPrefix("meeting=") {
-                let id = String(query.dropFirst("meeting=".count))
-                guard let meeting = meetings[id], !gone.contains(id) else { return (404, "{\"code\":\"meeting_gone\"}") }
-                return (200, json(["me": me, "meetings": [meeting]]))
-            }
-            return (200, json(["me": me, "meetings": order.filter { !gone.contains($0) }.compactMap { meetings[$0] }]))
-        case ("PATCH", 5):
-            let (meeting, suggestion) = (parts[2], parts[4])
-            if gone.contains(meeting) { return (404, "{\"code\":\"suggestion_gone\"}") }
-            if let refusal = refusals[suggestion] { return refusal }
-            let left = (meetings[meeting]?["rows"] as? [[String: Any]])?.filter { $0["id"] as? String != suggestion }
-            meetings[meeting]?["rows"] = left
-            return (200, "{\"suggestion\":{},\"code\":\"saved\"}")
-        case ("POST", 4) where parts[3] == "suggestions": return (401, "{\"error\":\"Not authenticated\",\"request_id\":\"8c1c2f3e-6a52-4f55-9d0b-0d1f7d9f9c11\"}")
+        if path == "/rest/v1/meetings" {
+            return (200, json(["series_id": (order.first.flatMap { meetings[$0]?["series_id"] }) ?? "b6008c45-d6ed-4cd8-bce4-9646a5994f0b"]))
+        }
+        if olderFlag { return (404, "<!DOCTYPE html><html><head><title>404: This page could not be found.</title></head><body></body></html>") }
+        if signedOutFlag {
+            switch (method, parts.count) {
+            case ("PATCH", 5): return (401, "{\"error\":\"Not authenticated\",\"code\":\"not_signed_in\",\"request_id\":\"8c1c2f3e-6a52-4f55-9d0b-0d1f7d9f9c11\"}")
+            case ("POST", 4) where parts[3] == "suggestions": return (401, "{\"error\":\"Not authenticated\",\"request_id\":\"8c1c2f3e-6a52-4f55-9d0b-0d1f7d9f9c11\"}")
             default: return (401, "{\"error\":\"Not authenticated\"}")
             }
         }
@@ -834,17 +846,29 @@ final class ReviewJourneyTests: XCTestCase {
         XCTAssertEqual(announcements, ["Transcribing", "Finding action items", "3 action items from Weekly sync"])
     }
 
-    func test_closedWhileFinding_andItFails_nothingIsPostedAndTheReviewIsGone() async throws {
+    func test_closedWhileFinding_andItFails_theNextMenuOpenSaysWhyWithTryAgain_andNothingIsPosted() async throws {
         ReviewServer.put(try meeting(suggestions: "pending"))
         let review = review()
+        await openPanel(review)
         await review.start(meetingId: meetingId).value
         review.close()
         ReviewServer.update(meetingId) { $0["suggestions_status"] = "failed" }
         await tick(3)
-        await waitUntil { review.model == nil }
-        XCTAssertNil(review.shown)
-        XCTAssertEqual(clock.sleeping, 0)
+        await waitUntil { ReviewServer.meetingReads == 2 && clock.sleeping == 0 }
+        XCTAssertNil(review.shown, "nothing covers the menu until it opens again")
         XCTAssertTrue(notices.isEmpty)
+        XCTAssertFalse(review.hasDot)
+
+        review.setPanelOpen(false)
+        await openPanel(review)
+        XCTAssertEqual(review.shown?.screen.message, "We couldn't find action items this time.")
+        XCTAssertEqual(review.buttons.map(\.title), ["Try again", "Done", "Open recap"])
+        let seen = Host.text(panel(review))
+        XCTAssertTrue(seen.hasLine("We couldn't find action items this time."), seen.text)
+        XCTAssertTrue(seen.hasLine("Try again"), seen.text)
+        XCTAssertTrue(seen.hasLine("Open recap"), seen.text)
+        XCTAssertTrue(notices.isEmpty)
+        XCTAssertFalse(review.hasDot)
     }
 
     private func pending(_ title: String, _ id: UUID = UUID()) throws -> [String: Any] {
@@ -1268,6 +1292,74 @@ final class ReviewJourneyTests: XCTestCase {
         XCTAssertEqual(texts(review), ["New items", "Send the budget"])
         XCTAssertEqual(review.buttons.map(\.title), ["Keep 1", "Skip the rest", "Open recap"])
         XCTAssertEqual(announcements, ["Finding action items", "1 action item from Weekly sync"], "the failed line never comes back for this press")
+    }
+
+    private func menu(_ app: AppController) -> MenuContent { MenuContent(controller: app, updater: UpdaterController()) }
+
+    func test_afterStop_onAnOlderServer_endsWithOpenRecap() async throws {
+        ReviewServer.olderServer = true
+        let app = app()
+        await app.authManager.adopt(testSupabase(instance), instance: instance)
+        app.apply(.signedIn)
+        app.panelOpened()
+
+        app.presentRecapCue(RecapCue(meetingId: meetingId, seriesId: nil, instance: instance))
+
+        await waitUntil { app.review.shown?.screen == .notAvailable }
+        XCTAssertEqual(app.review.buttons.map(\.title), ["Done", "Open recap"])
+        let seen = Host.text(menu(app))
+        XCTAssertTrue(seen.hasLine("Done"), seen.text)
+        XCTAssertTrue(seen.hasLine("Open recap"), seen.text)
+        XCTAssertFalse(seen.has("Transcribing"), seen.text)
+        XCTAssertEqual(clock.sleeping, 0, "nothing more to wait for")
+        app.openRecap(meetingId)
+        await waitUntil { opened.count == 1 }
+        XCTAssertEqual(opened.map(\.absoluteString), [
+            "https://minutia.example.com/series/b6008c45-d6ed-4cd8-bce4-9646a5994f0b/meetings/3f95ffd6-fd1e-4640-aacc-89e1c051f742",
+        ])
+    }
+
+    func test_afterStop_whenTheReviewKeepsFailing_endsWithOpenRecap() async throws {
+        ReviewServer.queueFails = true
+        let app = app()
+        await app.authManager.adopt(testSupabase(instance), instance: instance)
+        app.apply(.signedIn)
+        await app.panelOpened()?.value
+
+        app.presentRecapCue(RecapCue(meetingId: meetingId, seriesId: nil, instance: instance))
+        await waitUntil { ReviewServer.meetingReads == 1 && clock.sleeping == 1 }
+        await tick(3)
+        await waitUntil { ReviewServer.meetingReads == 2 && clock.sleeping == 1 }
+        XCTAssertEqual(app.review.shown?.screen.message, "Transcribing", "two misses are not yet the end")
+
+        await tick(3)
+        await waitUntil { app.review.shown?.screen == .notAvailable }
+        XCTAssertEqual(app.review.buttons.map(\.title), ["Done", "Open recap"])
+        let seen = Host.text(menu(app))
+        XCTAssertTrue(seen.hasLine("Done"), seen.text)
+        XCTAssertTrue(seen.hasLine("Open recap"), seen.text)
+        XCTAssertFalse(seen.has("Transcribing"), seen.text)
+        XCTAssertEqual(clock.sleeping, 0, "it stops asking")
+    }
+
+    func test_aMeetingFromBeforeTheUpgrade_withPendingRows_lightsNoDotShowsNoQueueLineAndPostsNothing() async throws {
+        let app = app()
+        await app.authManager.adopt(testSupabase(instance), instance: instance)
+        app.apply(.signedIn)
+        await app.review.refreshQueue()
+        let rows = try [row(UUID(), "Send the budget"), row(UUID(), "Book the Acme interview"), row(UUID(), "Draft the hiring plan")]
+        ReviewServer.put(try meeting(suggestions: nil, rows: rows, endedAgo: 3600))
+
+        await app.review.refreshQueue()
+        await app.review.start(meetingId: meetingId).value
+        app.review.close()
+        app.apply(.recordStarted)
+
+        XCTAssertFalse(app.review.hasDot)
+        XCTAssertEqual(app.review.queueRows.map(\.title), [])
+        let seen = Host.text(menu(app))
+        XCTAssertFalse(seen.has("to review"), seen.text)
+        XCTAssertTrue(notices.isEmpty)
     }
 
     // MARK: - On screen
