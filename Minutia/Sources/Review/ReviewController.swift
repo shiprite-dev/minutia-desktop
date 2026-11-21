@@ -93,12 +93,14 @@ final class ReviewController: ObservableObject {
     private let notify: (ReviewNotice) -> Void
     private let defaults: UserDefaults
     private(set) var panelOpen = false
-    private var retrying = false
+    private var retrying: UUID?
+    private var postedHere: Set<UUID> = []
     private var generation = 0
     private var pollStarted = Date.distantPast
     private var pollTask: Task<Void, Never>?
     private var closeTask: Task<Void, Never>?
-    private static let notifiedKey = "review.notifiedMeetings"
+    private static let notifiedKey = "review.postedMeetings"
+    private static let postedKeep: TimeInterval = 14 * 86_400
     private static let accountKey = "review.notifiedAccount"
 
     init(
@@ -125,6 +127,8 @@ final class ReviewController: ObservableObject {
             meeting = queued
             show(queued.map { ReviewModel.from($0, now: clock.now(), previous: nil) }
                 ?? ReviewModel(meetingId: meetingId, screen: .transcribing(elapsed: nil)))
+        } else if let line = spoken(model) {
+            announce(line)
         }
         return Task { await refresh() }
     }
@@ -147,18 +151,27 @@ final class ReviewController: ObservableObject {
         meeting = nil
     }
 
-    /// A different account (or none) starts with no posted meetings, so its first queue load is quiet.
+    /// A nil account (launch before the session is restored, or signed out) leaves the posted list
+    /// alone; only a switch from one known account to another starts it fresh.
     func reset(account: String? = nil) {
-        if defaults.string(forKey: Self.accountKey) != account {
-            defaults.removeObject(forKey: Self.notifiedKey)
+        if let account {
+            if let stored = defaults.string(forKey: Self.accountKey), stored != account { defaults.removeObject(forKey: Self.notifiedKey) }
             defaults.set(account, forKey: Self.accountKey)
         }
         generation += 1
         saving = false
-        retrying = false
+        retrying = nil
         dismiss()
         queue = []
         me = nil
+    }
+
+    @discardableResult
+    /// An explicit sign-out: whoever signs in next starts with a quiet first queue load.
+    func forgetPosted() {
+        defaults.removeObject(forKey: Self.notifiedKey)
+        defaults.removeObject(forKey: Self.accountKey)
+        postedHere = []
     }
 
     @discardableResult
@@ -184,7 +197,7 @@ final class ReviewController: ObservableObject {
             guard let fetched = response.meetings.first(where: { $0.meetingId == id }) else { throw ReviewQueueError.meetingGone }
             meeting = fetched
             merge(fetched)
-            if !saving, !retrying { show(ReviewModel.from(fetched, now: clock.now(), previous: model)) }
+            if !saving, retrying != id { show(ReviewModel.from(fetched, now: clock.now(), previous: model)) }
         } catch ReviewQueueError.meetingGone {
             guard generation == self.generation, !saving else { return }
             queue.removeAll { $0.meetingId == id }
@@ -206,9 +219,15 @@ final class ReviewController: ObservableObject {
             guard generation == self.generation else { return }
             me = response.me
             queue = Self.sorted(response.meetings.filter(Self.waits))
-            let firstLoad = defaults.stringArray(forKey: Self.notifiedKey) == nil
-            if firstLoad { defaults.set([String](), forKey: Self.notifiedKey) }
-            for meeting in queue { noticeOnce(meeting, post: !panelOpen && !firstLoad) }
+            let stored = defaults.dictionary(forKey: Self.notifiedKey) as? [String: Date]
+            let now = clock.now()
+            let waiting = Set(queue.map { $0.meetingId.uuidString })
+            var posted = (stored ?? [:]).filter { now.timeIntervalSince($0.value) < Self.postedKeep || waiting.contains($0.key) }
+            for meeting in queue where posted[meeting.meetingId.uuidString] == nil {
+                posted[meeting.meetingId.uuidString] = now
+                if stored != nil, !panelOpen, !postedHere.contains(meeting.meetingId) { post(meeting) }
+            }
+            defaults.set(posted, forKey: Self.notifiedKey)
         } catch ReviewQueueError.signedOut {
             guard generation == self.generation else { return }
             onSignedOut()
@@ -247,11 +266,11 @@ final class ReviewController: ObservableObject {
     }
 
     func tryAgain() async {
-        guard !retrying, let failed = model, let id = failed.meetingId, let client = client() else { return }
+        guard let failed = model, let id = failed.meetingId, retrying != id, let client = client() else { return }
         let transcription = failed.screen == .transcriptionFailed
         guard transcription || (failed.screen == .findingFailed && meeting?.reviewer == true) else { return }
         let generation = generation
-        retrying = true
+        retrying = id
         show(ReviewModel(meetingId: id, screen: transcription ? .transcribing(elapsed: nil) : .finding))
         do {
             if transcription {
@@ -261,13 +280,14 @@ final class ReviewController: ObservableObject {
             }
         } catch {
             guard generation == self.generation else { return }
-            retrying = false
+            if retrying == id { retrying = nil }
             if model?.meetingId == id { show(failed) }
             if case MinutiaClientError.signedOut = error { onSignedOut() }
             return
         }
         guard generation == self.generation else { return }
-        retrying = false
+        if retrying == id { retrying = nil }
+        guard model?.meetingId == id else { return }
         pollStarted = clock.now()
         await refresh()
     }
@@ -322,11 +342,23 @@ final class ReviewController: ObservableObject {
         }
     }
 
-    private func noticeOnce(_ meeting: ReviewMeeting, post: Bool) {
-        var notified = Set((defaults.stringArray(forKey: Self.notifiedKey) ?? []).compactMap(UUID.init))
-        guard Self.waits(meeting), notified.insert(meeting.meetingId).inserted else { return }
-        defaults.set(notified.map(\.uuidString), forKey: Self.notifiedKey)
-        if post { notify(ReviewNotice(title: ReviewCopy.notificationTitle(count: meeting.rows.count, series: meeting.seriesName), meetingId: meeting.meetingId)) }
+    /// Before the first queue load nothing is stored, so that load still sees every waiting meeting
+    /// as already there; this run remembers what it posted in the meantime.
+    private func noticeOnce(_ meeting: ReviewMeeting, post shouldPost: Bool) {
+        let id = meeting.meetingId
+        guard Self.waits(meeting), !postedHere.contains(id) else { return }
+        if var posted = defaults.dictionary(forKey: Self.notifiedKey) as? [String: Date] {
+            guard posted[id.uuidString] == nil else { return }
+            posted[id.uuidString] = clock.now()
+            defaults.set(posted, forKey: Self.notifiedKey)
+        }
+        postedHere.insert(id)
+        if shouldPost { post(meeting) }
+    }
+
+    private func post(_ meeting: ReviewMeeting) {
+        postedHere.insert(meeting.meetingId)
+        notify(ReviewNotice(title: ReviewCopy.notificationTitle(count: meeting.rows.count, series: meeting.seriesName), meetingId: meeting.meetingId))
     }
 
     private func scheduleClose() {
@@ -448,9 +480,9 @@ extension ReviewController {
                 recap,
             ]
         case .transcriptionFailed:
-            return [ReviewButtonState(button: .tryAgain, enabled: !retrying), finish, recap]
+            return [ReviewButtonState(button: .tryAgain, enabled: retrying != model.meetingId), finish, recap]
         case .findingFailed where meeting?.reviewer == true:
-            return [ReviewButtonState(button: .tryAgain, enabled: !retrying), finish, recap]
+            return [ReviewButtonState(button: .tryAgain, enabled: retrying != model.meetingId), finish, recap]
         case .partlyDone:
             return [ReviewButtonState(button: .reviewRest, enabled: true), finish, recap]
         case .transcribing, .finding, .slow:

@@ -182,7 +182,7 @@ private struct ReviewRowView: View {
             }
         }
         .padding(.horizontal, Space.x2)
-        .padding(.vertical, 7)
+        .padding(.vertical, 5)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.primary.opacity(hovered || focused ? 0.05 : 0), in: RoundedRectangle(cornerRadius: 7))
         .onHover { hovered = $0 }

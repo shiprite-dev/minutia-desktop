@@ -835,7 +835,10 @@ final class AppController: NSObject, ObservableObject {
             self?.recordFeedback = "Transcription is not enabled for this account. Audio keeps recording and will be saved."
         }
 
-        authManager.beforeSignOut = { [weak self] in await self?.reportBeforeSignOut() }
+        authManager.beforeSignOut = { [weak self] in
+            await self?.reportBeforeSignOut()
+            self?.review.forgetPosted()
+        }
 
         review.announce = { [weak self] in self?.announce($0) }
         review.onSignedOut = { [weak self] in Task { _ = await self?.authManager.dropSessionIfRevoked() } }
@@ -1758,10 +1761,11 @@ final class AppController: NSObject, ObservableObject {
     /// Opens the menu panel; false when the status item could not be found.
     var openPanel: () -> Bool = AppController.clickStatusItem
 
+    /// Without the status item the review simply waits behind the dot for the next menu click.
     func openReview(meetingId: UUID) {
         review.start(meetingId: meetingId)
         guard !review.panelOpen, !openPanel() else { return }
-        NSApplication.shared.activate()
+        Self.logger.error("Review tap: status item not found, the review waits for the next menu click")
     }
 
     /// MenuBarExtra has no API to open its window; clicking our own status item is the only way in.
