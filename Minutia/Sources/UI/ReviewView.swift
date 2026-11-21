@@ -30,9 +30,9 @@ struct ReviewView: View {
                 Task { await review.keep() }
                 return .handled
             }
-            .onKeyPress(.escape) {
-                review.close()
-                return .handled
+            .background {
+                // Escape closes the review from any screen, even once the focused row is gone.
+                Button("", action: review.close).keyboardShortcut(.cancelAction).opacity(0).accessibilityHidden(true)
             }
         }
     }

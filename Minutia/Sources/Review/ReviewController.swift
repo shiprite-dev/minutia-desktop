@@ -76,6 +76,7 @@ final class ReviewController: ObservableObject {
     static let workingPoll: TimeInterval = 3
     static let readyPoll: TimeInterval = 30
     static let pollLimit: TimeInterval = 15 * 60
+    static let queueLimit: TimeInterval = 10
     static let doneHold: TimeInterval = 4
 
     @Published private(set) var model: ReviewModel?
@@ -97,6 +98,8 @@ final class ReviewController: ObservableObject {
     private var postedHere: Set<UUID> = []
     private var generation = 0
     private var queueTask: Task<Void, Never>?
+    /// The menu opened again while a closed review was still working: its end screen shows as it lands.
+    private var openedSinceClose = false
     private var queueMissingOn: URL?
     private var transcribingSince: (meetingId: UUID, at: Date)?
     private var pollStarted = Date.distantPast
@@ -143,6 +146,7 @@ final class ReviewController: ObservableObject {
         closeTask?.cancel()
         closeTask = nil
         hidden = true
+        openedSinceClose = false
     }
 
     private func dismiss() {
@@ -180,6 +184,7 @@ final class ReviewController: ObservableObject {
     @discardableResult
     func setPanelOpen(_ open: Bool) -> Task<Void, Never>? {
         panelOpen = open
+        openedSinceClose = open && hidden
         guard open else {
             schedulePoll()
             return nil
@@ -221,10 +226,20 @@ final class ReviewController: ObservableObject {
         schedulePoll()
     }
 
-    /// Joins the queue load already running instead of starting a second one.
+    /// Joins the queue load already running instead of starting a second one. A load (sign-in refresh
+    /// included) that runs past `queueLimit` stops holding up the next one.
     func refreshQueue() async {
         if let queueTask { return await queueTask.value }
-        let task = Task { await loadQueue() }
+        let task = Task { [clock] in
+            await FirstAnswer<Void>.race { first in
+                let limit = Task { await clock.sleep(Self.queueLimit); first.give(()) }
+                Task {
+                    await self.loadQueue()
+                    limit.cancel()
+                    first.give(())
+                }
+            }
+        }
         queueTask = task
         await task.value
         queueTask = nil
@@ -365,6 +380,12 @@ final class ReviewController: ObservableObject {
         model = next
         let line = spoken(next)
         let sameScreen = before?.meetingId == next.meetingId && before?.readOnly == next.readOnly && spoken(before) == line
+        if hidden, openedSinceClose {
+            switch next.screen {
+            case .transcriptionFailed, .findingFailed, .none, .nobodySpoke, .notAvailable: hidden = false
+            default: break
+            }
+        }
         if !hidden, !sameScreen, let line { announce(line) }
         if next.screen == .ready, !next.readOnly, let meeting, meeting.meetingId == next.meetingId {
             noticeOnce(meeting, post: !panelOpen || hidden)

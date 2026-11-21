@@ -122,6 +122,7 @@ final class RecapWindowTests: XCTestCase {
     private var chosenFiles: [URL]?
     private var answer = false
     private var typed: String?
+    private var holdAnswer: (() async -> (ok: Bool, text: String?))?
     private var signOutChecks = 0
     private var policies: [NSApplication.ActivationPolicy] = []
     private var presence: WindowPresence!
@@ -172,12 +173,13 @@ final class RecapWindowTests: XCTestCase {
             clock: clock.review, presence: presence, defaults: defaults, stores: stores,
             announce: { [weak self] in self?.announced.append($0) }, onSignedOut: { [weak self] in self?.signOutChecks += 1 },
             dialogs: RecapDialogs(
-                chooseFiles: { [weak self] multiple, _, window in
-                    self?.asked.append("files multiple=\(multiple) sheet=\(window != nil)")
+                chooseFiles: { [weak self] multiple, _, _ in
+                    self?.asked.append("files multiple=\(multiple)")
                     return self?.chosenFiles
                 },
-                ask: { [weak self] kind, message, window in
-                    self?.asked.append("\(kind) \(message) sheet=\(window != nil)")
+                ask: { [weak self] kind, message, _ in
+                    self?.asked.append("\(kind) \(message)")
+                    if let self, let hold = self.holdAnswer { return await hold() }
                     return (self?.answer ?? false, self?.typed)
                 }))
         controllers.append(controller)
@@ -672,7 +674,8 @@ final class RecapWindowTests: XCTestCase {
         defer { UserDefaults.standard.removeObject(forKey: "NSWindow Frame MinutiaRecap") }
         let controller = recap()
         await openedRecap(controller)
-        let frame = NSRect(x: 180, y: 140, width: 900, height: 640)
+        let visible = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1024, height: 700)
+        let frame = NSRect(x: visible.minX + 37, y: visible.minY + 23, width: 600, height: 450)
         controller.window?.setFrame(frame, display: false)
         controller.window?.performClose(nil)
         await waitUntil { controller.window == nil }
@@ -705,7 +708,7 @@ final class RecapWindowTests: XCTestCase {
 
         _ = try? await controller.webView?.evaluateJavaScript("document.getElementById('pick').click(); 1")
         await waitUntil { !fake.server.requests("/report").isEmpty }
-        XCTAssertEqual(asked, ["files multiple=true sheet=true"])
+        XCTAssertEqual(asked, ["files multiple=true"])
         XCTAssertEqual(fake.server.requests("/report").map(\.query), ["files=issues.csv"])
     }
 
@@ -718,18 +721,87 @@ final class RecapWindowTests: XCTestCase {
         await openedRecap(controller)
 
         await waitUntil { !fake.server.requests("/report").isEmpty }
-        XCTAssertEqual(asked, ["alert Saved sheet=true", "confirm Delete this item? sheet=true", "prompt(defaultText: Optional(\"Weekly sync\")) Rename the series sheet=true"])
+        XCTAssertEqual(asked, ["alert Saved", "confirm Delete this item?", "prompt(defaultText: Optional(\"Weekly sync\")) Rename the series"])
         XCTAssertEqual(fake.server.requests("/report").map(\.query), ["confirm=true&prompt=Board%20prep"])
     }
 
-    func test_thePageAskingForTheMicrophone_isRefused() async {
-        fake.runOnMeetingPage(
-            "navigator.mediaDevices.getUserMedia({audio:true}).then(()=>fetch('/report?mic=granted')).catch(e=>fetch('/report?mic='+e.name))")
+    func test_aPageQuestionWithNoWindow_isAnsweredAtOnce_withoutAsking() async {
+        answer = true
+        typed = "Board prep"
+        chosenFiles = [URL(fileURLWithPath: "/tmp/issues.csv")]
+        let controller = recap()
+
+        let confirmed = await controller.pageAsks(.confirm, "Delete this item?")
+        let prompted = await controller.pageAsks(.prompt(defaultText: nil), "Rename the series")
+        let files = await controller.pageChoosesFiles(multiple: true, directories: false)
+
+        XCTAssertEqual(confirmed.ok, false)
+        XCTAssertNil(prompted.ok ? prompted.text : nil)
+        XCTAssertNil(files)
+        XCTAssertEqual(asked, [], "nothing is shown without the recap window")
+    }
+
+    func test_aSecondPageQuestionWhileOneIsOpen_getsTheDefaultAtOnce() async {
         let controller = recap()
         await openedRecap(controller)
+        var release: CheckedContinuation<(ok: Bool, text: String?), Never>?
+        holdAnswer = { await withCheckedContinuation { release = $0 } }
 
-        await waitUntil { !fake.server.requests("/report").isEmpty }
-        XCTAssertEqual(fake.server.requests("/report").map(\.query), ["mic=NotAllowedError"])
+        var kept: Bool?
+        Task { kept = await controller.pageAsks(.confirm, "Delete this item?").ok }
+        await waitUntil { release != nil }
+        var answered: [String] = []
+        Task {
+            let second = await controller.pageAsks(.confirm, "Delete that one too?")
+            let files = await controller.pageChoosesFiles(multiple: false, directories: false)
+            answered = ["confirm \(second.ok)", "files \(files.map(\.count) ?? 0)"]
+        }
+        await waitUntil { !answered.isEmpty }
+        XCTAssertEqual(answered, ["confirm false", "files 0"])
+        XCTAssertEqual(asked, ["confirm Delete this item?"], "one question at a time")
+
+        release?.resume(returning: (true, nil))
+        await waitUntil { kept != nil }
+        XCTAssertEqual(kept, true, "the open question keeps the person's answer")
+    }
+
+    func test_closingTheWindowWithAQuestionOpen_answersItOnceWithTheDefault() async {
+        let controller = recap()
+        await openedRecap(controller)
+        var release: CheckedContinuation<(ok: Bool, text: String?), Never>?
+        holdAnswer = { await withCheckedContinuation { release = $0 } }
+        var answers: [Bool] = []
+
+        Task {
+            let answer = await controller.pageAsks(.confirm, "Delete this item?")
+            answers.append(answer.ok)
+        }
+        await waitUntil { release != nil }
+        controller.window?.close()
+        await waitUntil { !answers.isEmpty }
+        XCTAssertEqual(answers, [false])
+
+        release?.resume(returning: (true, nil))
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(answers, [false], "a late answer is not delivered a second time")
+    }
+
+    func test_thePageAskingForTheMicrophoneOrCamera_isRefused() async throws {
+        let catcher = FrameCatcher()
+        let configuration = WKWebViewConfiguration()
+        configuration.userContentController.add(catcher, name: "frame")
+        let page = WKWebView(frame: .zero, configuration: configuration)
+        page.loadHTMLString("<script>webkit.messageHandlers.frame.postMessage(1)</script>", baseURL: fake.base)
+        await waitUntil { catcher.frame != nil }
+        let frame = try XCTUnwrap(catcher.frame)
+        let controller = recap()
+        await openedRecap(controller)
+        let webView = try XCTUnwrap(controller.webView)
+
+        for type in [WKMediaCaptureType.microphone, .camera, .cameraAndMicrophone] {
+            let decision = await controller.webView(webView, decideMediaCapturePermissionsFor: frame.securityOrigin, initiatedBy: frame, type: type)
+            XCTAssertEqual(decision, .deny, "\(type.rawValue)")
+        }
     }
 
     func test_linksToOtherSitesNewWindowsAndMail_openOutside_andTheRecapStays() async {
@@ -786,6 +858,15 @@ final class RecapWindowTests: XCTestCase {
         XCTAssertFalse(screen.reads(["Weekly sync", "available"]), "an extra word is not the same screen")
         XCTAssertFalse(screen.reads(["Weekly sync"]), "a missing line is not the same screen")
         XCTAssertFalse(screen.reads(["Not available", "Weekly sync"]), "order counts")
+        let withIcons = Seen(text: "", frames: [
+            ("Weekly sync", CGRect(x: 0.1, y: 0.8, width: 0.3, height: 0.05)), ("X", CGRect(x: 0.9, y: 0.8, width: 0.03, height: 0.05)),
+            ("!", CGRect(x: 0.1, y: 0.6, width: 0.03, height: 0.05)), ("Not available", CGRect(x: 0.1, y: 0.5, width: 0.3, height: 0.05)),
+        ])
+        XCTAssertTrue(withIcons.reads(["Weekly sync", "Not available"]), "a lone icon glyph is not a word")
+        let glued = Seen(text: "", frames: [("Weekly sync", CGRect(x: 0.1, y: 0.8, width: 0.3, height: 0.05)), ("X Not available", CGRect(x: 0.1, y: 0.5, width: 0.3, height: 0.05))])
+        XCTAssertFalse(glued.reads(["Weekly sync", "Not available"]), "a glyph inside a line still counts")
+        let negated = Seen(text: "", frames: [("Weekly sync", CGRect(x: 0.1, y: 0.8, width: 0.3, height: 0.05)), ("Not not available", CGRect(x: 0.1, y: 0.5, width: 0.3, height: 0.05))])
+        XCTAssertFalse(negated.reads(["Weekly sync", "Not available"]), "a negated line is not the same screen")
     }
 
     func test_launchPruning_leavesDataStoresTheAppDidNotMake() async {
@@ -939,5 +1020,13 @@ final class RecapWindowTests: XCTestCase {
 
         XCTAssertEqual(stores.removed, [stale])
         XCTAssertEqual(stores.ids, [signedInStore])
+    }
+}
+
+private final class FrameCatcher: NSObject, WKScriptMessageHandler {
+    var frame: WKFrameInfo?
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        frame = message.frameInfo
     }
 }

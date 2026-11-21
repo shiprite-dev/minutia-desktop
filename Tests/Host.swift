@@ -212,9 +212,15 @@ struct Seen {
         return !needle.isEmpty && frames.contains { Self.tokens($0.0) == needle }
     }
 
-    /// True only when the whole screen reads `expected`, top to bottom and left to right, and nothing else.
+    /// Icons OCR may read as a lone glyph on some Macs and not others (the close button's X, the
+    /// failure badge's !). Only a reading that is nothing but one of these is set aside.
+    static let iconGlyphs: Set<String> = ["X", "x", "×", "!"]
+
+    /// True only when the whole screen reads `expected`, top to bottom and left to right, and nothing
+    /// else apart from lone icon glyphs.
     func reads(_ expected: [String]) -> Bool {
-        let ordered = frames.sorted { abs($0.1.midY - $1.1.midY) > 0.02 ? $0.1.midY > $1.1.midY : $0.1.minX < $1.1.minX }
+        let words = frames.filter { !Self.iconGlyphs.contains($0.0.trimmingCharacters(in: .whitespaces)) }
+        let ordered = words.sorted { abs($0.1.midY - $1.1.midY) > 0.02 ? $0.1.midY > $1.1.midY : $0.1.minX < $1.1.minX }
         return Self.tokens(ordered.map(\.0).joined(separator: " ")) == Self.tokens(expected.joined(separator: " "))
     }
 

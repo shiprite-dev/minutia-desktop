@@ -532,6 +532,31 @@ final class ReviewJourneyTests: XCTestCase {
         XCTAssertEqual(ReviewServer.queueLoads(on: server.host!), 1, "never two queue loads at once")
     }
 
+    func test_aSignInRefreshThatNeverAnswers_doesNotStopTheNextQueueLoad() async throws {
+        var hung = true
+        let review = ReviewController(
+            client: {
+                hung
+                    ? MinutiaClient(
+                        instance: URL(string: "https://hung.example.com")!, supabase: testSupabase(URL(string: "https://supabase.example.com")!),
+                        tokenProvider: { try await Task.sleep(nanoseconds: 3_600_000_000_000); return "token" })
+                    : Self.client(URL(string: "https://fresh.example.com")!)
+            },
+            clock: clock.review, defaults: UserDefaults(suiteName: suite)!, notify: { _ in })
+        reviews.append(review)
+        ReviewServer.put(try meeting(rows: [row(UUID(), "Send the budget")]))
+
+        var finished = false
+        Task { await review.refreshQueue(); finished = true }
+        await tick(10)
+        await waitUntil { finished }
+
+        hung = false
+        Task { await review.refreshQueue() }
+        await waitUntil { review.queueRows.map(\.title) == ["Weekly sync · today · 1 to review"] }
+        XCTAssertEqual(ReviewServer.queueLoads(on: "fresh.example.com"), 1)
+    }
+
     func test_anUnchangedQueue_isNotPublishedAgain() async throws {
         ReviewServer.put(try meeting(rows: [row(UUID(), "Send the budget")]))
         let review = review()
@@ -1005,6 +1030,22 @@ final class ReviewJourneyTests: XCTestCase {
         XCTAssertEqual(announcements, ["Transcribing", "Finding action items", "3 action items from Weekly sync"])
     }
 
+    func test_closedWhileFinding_andItFailsJustAsTheMenuOpens_showsWhyRightAway() async throws {
+        ReviewServer.put(try meeting(suggestions: "pending"))
+        let review = review()
+        await openPanel(review)
+        await review.start(meetingId: meetingId).value
+        review.close()
+        review.setPanelOpen(false)
+
+        ReviewServer.update(meetingId) { $0["suggestions_status"] = "failed" }
+        await openPanel(review)
+        XCTAssertEqual(review.shown?.screen.message, "We couldn't find action items this time.")
+        XCTAssertEqual(review.buttons.map(\.title), ["Try again", "Done", "Open recap"])
+        XCTAssertTrue(notices.isEmpty)
+        XCTAssertFalse(review.hasDot)
+    }
+
     func test_closedWhileFinding_andItFails_theNextMenuOpenSaysWhyWithTryAgain_andNothingIsPosted() async throws {
         ReviewServer.put(try meeting(suggestions: "pending"))
         let review = review()
@@ -1013,7 +1054,7 @@ final class ReviewJourneyTests: XCTestCase {
         review.close()
         ReviewServer.update(meetingId) { $0["suggestions_status"] = "failed" }
         await tick(3)
-        await waitUntil { ReviewServer.meetingReads == 2 && clock.sleeping == 0 }
+        await waitUntil { review.model?.screen == .findingFailed }
         XCTAssertNil(review.shown, "nothing covers the menu until it opens again")
         XCTAssertTrue(notices.isEmpty)
         XCTAssertFalse(review.hasDot)
@@ -1795,8 +1836,9 @@ final class ReviewJourneyTests: XCTestCase {
         XCTAssertEqual(ReviewServer.saves.map(\.path), ["/api/meetings/3f95ffd6-fd1e-4640-aacc-89e1c051f742/suggestions/\(ids[2].uuidString.lowercased())"])
         XCTAssertTrue(window.seen().has("1 item tracked"))
 
+        window.dropFocus()
         window.press(.escape)
-        XCTAssertNil(review.shown)
+        XCTAssertNil(review.shown, "Escape closes the review even with no row to focus")
         XCTAssertFalse(window.seen().has("tracked"))
     }
 
@@ -2066,6 +2108,12 @@ final class KeyWindow {
 
     func spin(_ seconds: TimeInterval) { RunLoop.current.run(until: Date().addingTimeInterval(seconds)) }
 
+    /// Nothing in the window has keyboard focus, as after the focused row leaves the screen.
+    func dropFocus() {
+        window.makeFirstResponder(nil)
+        spin(0.1)
+    }
+
     func press(_ key: Key) {
         let (code, text): (UInt16, String) = switch key {
         case .up: (126, String(UnicodeScalar(NSUpArrowFunctionKey)!))
@@ -2076,10 +2124,13 @@ final class KeyWindow {
         }
         let flags: NSEvent.ModifierFlags = [.up, .down].contains(key) ? [.numericPad, .function] : []
         for type in [NSEvent.EventType.keyDown, .keyUp] {
-            window.sendEvent(NSEvent.keyEvent(
+            let event = NSEvent.keyEvent(
                 with: type, location: .zero, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime,
                 windowNumber: window.windowNumber, context: nil, characters: text, charactersIgnoringModifiers: text,
-                isARepeat: false, keyCode: code)!)
+                isARepeat: false, keyCode: code)!
+            // AppKit offers every key-down to the window's shortcuts before the focused view, as here.
+            if type == .keyDown, window.performKeyEquivalent(with: event) { continue }
+            window.sendEvent(event)
         }
         spin(0.2)
     }

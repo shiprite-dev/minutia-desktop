@@ -56,23 +56,20 @@ struct RecapStores {
         remove: { try await WKWebsiteDataStore.remove(forIdentifier: $0) })
 }
 
-/// The one Minutia window that shows a meeting's web page. Each time the window opens it signs in
-/// with a fresh one-time handoff into a web data store of its own per server and account, so it is
-/// always the Mac's account; the Mac's own session never enters it.
 /// What the page may ask the person: choose files, or answer a JavaScript alert, confirm or prompt.
+/// Each is a sheet on the recap window.
 struct RecapDialogs {
     enum Ask: Equatable { case alert, confirm, prompt(defaultText: String?) }
 
-    var chooseFiles: @MainActor (_ multiple: Bool, _ directories: Bool, _ window: NSWindow?) async -> [URL]?
-    var ask: @MainActor (_ kind: Ask, _ message: String, _ window: NSWindow?) async -> (ok: Bool, text: String?)
+    var chooseFiles: @MainActor (_ multiple: Bool, _ directories: Bool, _ window: NSWindow) async -> [URL]?
+    var ask: @MainActor (_ kind: Ask, _ message: String, _ window: NSWindow) async -> (ok: Bool, text: String?)
 
     static let live = RecapDialogs(
         chooseFiles: { multiple, directories, window in
             let panel = NSOpenPanel()
             panel.allowsMultipleSelection = multiple
             panel.canChooseDirectories = directories
-            let response = if let window { await panel.beginSheetModal(for: window) } else { panel.runModal() }
-            return response == .OK ? panel.urls : nil
+            return await panel.beginSheetModal(for: window) == .OK ? panel.urls : nil
         },
         ask: { kind, message, window in
             let alert = NSAlert()
@@ -85,11 +82,32 @@ struct RecapDialogs {
                 field?.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
                 alert.accessoryView = field
             }
-            let response = if let window { await alert.beginSheetModal(for: window) } else { alert.runModal() }
-            return (response == .alertFirstButtonReturn, field?.stringValue)
+            return (await alert.beginSheetModal(for: window) == .alertFirstButtonReturn, field?.stringValue)
         })
 }
 
+/// Hands out the first of several answers and drops the rest, so an awaiting caller resumes exactly once.
+@MainActor
+final class FirstAnswer<Value> {
+    private var continuation: CheckedContinuation<Value, Never>?
+
+    static func race(_ start: (FirstAnswer) -> Void) async -> Value {
+        await withCheckedContinuation { continuation in
+            let first = FirstAnswer()
+            first.continuation = continuation
+            start(first)
+        }
+    }
+
+    func give(_ value: Value) {
+        continuation?.resume(returning: value)
+        continuation = nil
+    }
+}
+
+/// The one Minutia window that shows a meeting's web page. Each time the window opens it signs in
+/// with a fresh one-time handoff into a web data store of its own per server and account, so it is
+/// always the Mac's account; the Mac's own session never enters it.
 @MainActor
 final class RecapWindowController: NSObject, ObservableObject {
     typealias Account = (client: MinutiaClient, userId: String?)
@@ -111,6 +129,8 @@ final class RecapWindowController: NSObject, ObservableObject {
     private let announce: (String) -> Void
     private let onSignedOut: () -> Void
     private let dialogs: RecapDialogs
+    private var endDialog: (() -> Void)?
+    private var dialogsShown = 0
     private var current: (meetingId: UUID, page: URL, next: String, client: MinutiaClient, store: UUID)?
     private var windowStore: UUID?
     private var signedIn = false
@@ -377,6 +397,9 @@ private final class RecapWindow: NSWindow {
 
 extension RecapWindowController: NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
+        window?.sheets.forEach { window?.endSheet($0) }
+        endDialog?()
+        endDialog = nil
         generation += 1
         slow?.cancel()
         webView?.navigationDelegate = nil
@@ -465,22 +488,45 @@ extension RecapWindowController: WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters, initiatedByFrame frame: WKFrameInfo) async -> [URL]? {
-        await dialogs.chooseFiles(parameters.allowsMultipleSelection, parameters.allowsDirectories, window)
+        await pageChoosesFiles(multiple: parameters.allowsMultipleSelection, directories: parameters.allowsDirectories)
     }
 
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo) async {
-        _ = await dialogs.ask(.alert, message, window)
+        _ = await pageAsks(.alert, message)
     }
 
     func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo) async -> Bool {
-        await dialogs.ask(.confirm, message, window).ok
+        await pageAsks(.confirm, message).ok
     }
 
     func webView(
         _ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?, initiatedByFrame frame: WKFrameInfo
     ) async -> String? {
-        let answer = await dialogs.ask(.prompt(defaultText: defaultText), prompt, window)
+        let answer = await pageAsks(.prompt(defaultText: defaultText), prompt)
         return answer.ok ? answer.text : nil
+    }
+
+    func pageChoosesFiles(multiple: Bool, directories: Bool) async -> [URL]? {
+        await oneDialog(nil) { [dialogs] in await dialogs.chooseFiles(multiple, directories, $0) }
+    }
+
+    func pageAsks(_ kind: RecapDialogs.Ask, _ message: String) async -> (ok: Bool, text: String?) {
+        await oneDialog((false, nil)) { [dialogs] in await dialogs.ask(kind, message, $0) }
+    }
+
+    /// One sheet at a time, only on an open window; closing the window answers the open one with `fallback`.
+    private func oneDialog<Value>(_ fallback: Value, _ show: @escaping @MainActor (NSWindow) async -> Value) async -> Value {
+        guard let window, endDialog == nil else { return fallback }
+        dialogsShown += 1
+        let mine = dialogsShown
+        return await FirstAnswer.race { first in
+            endDialog = { first.give(fallback) }
+            Task {
+                let value = await show(window)
+                first.give(value)
+                if mine == dialogsShown { endDialog = nil }
+            }
+        }
     }
 }
 
