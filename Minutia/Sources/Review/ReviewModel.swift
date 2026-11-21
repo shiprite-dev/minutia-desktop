@@ -45,15 +45,12 @@ struct ReviewModel: Equatable {
     var updateRows: [ReviewRow] = []
     var moreOnWeb = 0
     var readOnly = false
-    var signedOut = false
     var selection: Set<UUID> = []
     var edits: [UUID: RowEdit] = [:]
     var rowState: [UUID: RowState] = [:]
     /// Saves that failed in transit: the server may have done them and the answer got lost.
     var lostAnswers: Set<UUID> = []
     var listUpdated = false
-
-    var lessSureIndex: Int? { newRows.firstIndex { $0.confidence < Self.confident } }
 
     var keepCount: Int {
         (newRows + updateRows).filter {
@@ -184,10 +181,7 @@ struct ReviewModel: Equatable {
             readOnly = true
             selection = []
             rowState[id] = .idle
-        case .signedOut:
-            signedOut = true
-            rowState[id] = .failed
-        case .invalidRequest, .retryable: rowState[id] = .failed
+        case .signedOut, .invalidRequest, .retryable: rowState[id] = .failed
         }
         settle()
     }
@@ -201,8 +195,6 @@ struct ReviewModel: Equatable {
         let updated = updateRows.filter { selection.contains($0.id) && rowState[$0.id] == .saved }.count
         screen = open.isEmpty ? .done(kept: kept, updated: updated) : .partlyDone(kept: kept + updated, left: open.count)
     }
-
-    var doneLine: String { screen.message }
 }
 
 private extension RowState {

@@ -405,7 +405,7 @@ final class ReviewJourneyTests: XCTestCase {
         app.apply(.recordStarted)
         app.apply(.recordStopped)
         app.apply(.finalized)
-        app.presentRecapCue(RecapCue(meetingId: meetingId, seriesId: nil, instance: instance))
+        app.presentRecapCue(RecapCue(meetingId: meetingId))
         await waitUntil { app.review.title == "Weekly sync" }
         XCTAssertEqual(app.review.model?.screen.message, "Transcribing")
 
@@ -426,7 +426,7 @@ final class ReviewJourneyTests: XCTestCase {
 
         XCTAssertEqual(ReviewServer.saves.map(\.path), ids.map { "/api/meetings/3f95ffd6-fd1e-4640-aacc-89e1c051f742/suggestions/\($0.uuidString.lowercased())" })
         XCTAssertEqual(ReviewServer.saves.map { $0.body["action"] as? String }, ["accept", "accept", "accept"])
-        XCTAssertEqual(app.review.model?.doneLine, "3 items tracked")
+        XCTAssertEqual(app.review.model?.screen.message, "3 items tracked")
         XCTAssertEqual(app.review.buttons.map(\.title), ["Done", "Open recap"])
         XCTAssertEqual(ReviewServer.pendingRows(meetingId), [])
         XCTAssertEqual(announcements, ["Recording started", "Transcribing", "Finding action items", "3 action items from Weekly sync", "3 items tracked"])
@@ -442,7 +442,7 @@ final class ReviewJourneyTests: XCTestCase {
         await app.authManager.adopt(testSupabase(instance), instance: instance)
         app.apply(.signedIn)
         ReviewServer.put(try meeting(rows: [row(UUID(), "Send the budget")]))
-        app.presentRecapCue(RecapCue(meetingId: meetingId, seriesId: nil, instance: instance))
+        app.presentRecapCue(RecapCue(meetingId: meetingId))
         await waitUntil { app.review.model?.screen == .ready }
 
         app.openRecap(meetingId)
@@ -464,7 +464,7 @@ final class ReviewJourneyTests: XCTestCase {
 
         app.finishStop(
             CaptureSession.StopResult(expectedSegments: 3, transcriptRequested: true), reason: .manual,
-            meetingId: meetingId, seriesId: UUID(), instance: instance)
+            meetingId: meetingId, instance: instance)
 
         XCTAssertEqual(app.phase, .idle)
         await waitUntil { app.review.model?.screen == .transcribing(elapsed: nil) && app.review.title == "Weekly sync" }
@@ -485,7 +485,7 @@ final class ReviewJourneyTests: XCTestCase {
         await review.keep()
 
         XCTAssertEqual(ReviewServer.pendingRows(meetingId), [], "the server kept it")
-        XCTAssertEqual(review.model?.doneLine, "1 item tracked")
+        XCTAssertEqual(review.model?.screen.message, "1 item tracked")
         XCTAssertEqual(ReviewServer.saves.count, 1)
     }
 
@@ -511,7 +511,7 @@ final class ReviewJourneyTests: XCTestCase {
         XCTAssertEqual(review.buttons.first?.title, "Keep 1")
 
         await review.keep()
-        XCTAssertEqual(review.model?.doneLine, "2 items tracked")
+        XCTAssertEqual(review.model?.screen.message, "2 items tracked")
         let accepted = ReviewServer.saves.filter { $0.path.hasSuffix(first.uuidString.lowercased()) }.count
         XCTAssertEqual(accepted, 2, "one refused while offline, one kept: never sent again after it was kept")
         XCTAssertEqual(ReviewServer.saves.count, 4)
@@ -547,7 +547,7 @@ final class ReviewJourneyTests: XCTestCase {
         ReviewServer.releaseSaves()
         await keeping.value
 
-        XCTAssertEqual(review.model?.doneLine, "1 item tracked")
+        XCTAssertEqual(review.model?.screen.message, "1 item tracked")
         XCTAssertEqual(ReviewServer.saves.count, 2)
         XCTAssertEqual(ReviewServer.pendingRows(meetingId), [])
     }
@@ -577,7 +577,7 @@ final class ReviewJourneyTests: XCTestCase {
         await review.keep()
         XCTAssertEqual(ReviewServer.saves.suffix(3).map { $0.body["action"] as? String }, ["accept", "accept", "accept"])
         XCTAssertEqual(ReviewServer.pendingRows(meetingId), ["Maybe 4", "Maybe 5"], "rows the Mac never showed are left alone")
-        XCTAssertEqual(review.model?.doneLine, "3 items tracked. 2 still to review.")
+        XCTAssertEqual(review.model?.screen.message, "3 items tracked. 2 still to review.")
     }
 
     func test_panelClosedWhenReady_postsOneNotification_reviewOpensTheMeeting() async throws {
@@ -585,7 +585,7 @@ final class ReviewJourneyTests: XCTestCase {
         await app.authManager.adopt(testSupabase(instance), instance: instance)
         app.apply(.signedIn)
         ReviewServer.put(try meeting(suggestions: "pending"))
-        app.presentRecapCue(RecapCue(meetingId: meetingId, seriesId: nil, instance: instance))
+        app.presentRecapCue(RecapCue(meetingId: meetingId))
         app.panelClosed()
         await waitUntil { app.review.model?.screen == .finding }
 
@@ -647,7 +647,7 @@ final class ReviewJourneyTests: XCTestCase {
         app.apply(.recordStarted)
 
         XCTAssertEqual(app.phase, .recording)
-        XCTAssertEqual(app.review.waitingLine, "Weekly sync · today · 3 to review")
+        XCTAssertEqual(app.review.queueRows.first?.title, "Weekly sync · today · 3 to review")
         XCTAssertNil(app.review.model, "the review waits instead of covering the recording")
         app.apply(.recordStopped)
         app.apply(.finalized)
@@ -704,11 +704,11 @@ final class ReviewJourneyTests: XCTestCase {
         ReviewServer.holdSaves = false
         ReviewServer.releaseSaves()
         await keeping.value
-        XCTAssertEqual(review.model?.doneLine, "1 item tracked")
+        XCTAssertEqual(review.model?.screen.message, "1 item tracked")
         XCTAssertEqual(ReviewServer.pendingRows(meetingId), [])
         review.setPanelOpen(false)
         await review.setPanelOpen(true)?.value
-        XCTAssertEqual(review.model?.doneLine, "1 item tracked")
+        XCTAssertEqual(review.model?.screen.message, "1 item tracked")
     }
 
     func test_keepWhoseAnswerIsLostWhileThePanelReopens_endsOnOneItemTracked_neverSaving() async throws {
@@ -728,10 +728,10 @@ final class ReviewJourneyTests: XCTestCase {
         ReviewServer.holdSaves = false
         ReviewServer.releaseSaves()
         await keeping.value
-        XCTAssertEqual(review.shown?.doneLine, "1 item tracked")
+        XCTAssertEqual(review.shown?.screen.message, "1 item tracked")
         review.setPanelOpen(false)
         await review.setPanelOpen(true)?.value
-        XCTAssertEqual(review.shown?.doneLine, "1 item tracked")
+        XCTAssertEqual(review.shown?.screen.message, "1 item tracked")
         XCTAssertNil(note(review, "Send the budget"), "no row is left saying Saving")
         XCTAssertEqual(ReviewServer.pendingRows(meetingId), [])
         XCTAssertEqual(ReviewServer.saves.count, 1)
@@ -743,7 +743,7 @@ final class ReviewJourneyTests: XCTestCase {
         app.apply(.signedIn)
         app.panelOpened()
         ReviewServer.put(try meeting(rows: [row(UUID(), "Send the budget"), row(UUID(), "Book the Acme interview")]))
-        app.presentRecapCue(RecapCue(meetingId: meetingId, seriesId: nil, instance: instance))
+        app.presentRecapCue(RecapCue(meetingId: meetingId))
         await waitUntil { app.review.model?.screen == .ready }
 
         ReviewServer.holdSaves = true
@@ -766,7 +766,7 @@ final class ReviewJourneyTests: XCTestCase {
         app.apply(.signedIn)
         app.panelOpened()
         ReviewServer.put(try meeting(rows: [row(UUID(), "Send the budget"), row(UUID(), "Book the Acme interview")]))
-        app.presentRecapCue(RecapCue(meetingId: meetingId, seriesId: nil, instance: instance))
+        app.presentRecapCue(RecapCue(meetingId: meetingId))
         await waitUntil { app.review.model?.screen == .ready }
 
         ReviewServer.holdSaves = true
@@ -1165,7 +1165,7 @@ final class ReviewJourneyTests: XCTestCase {
         await openPanel(review)
         await review.start(meetingId: meetingId).value
         await review.keep()
-        XCTAssertEqual(review.shown?.doneLine, "1 item tracked")
+        XCTAssertEqual(review.shown?.screen.message, "1 item tracked")
         await waitUntil { clock.sleeping == 1 }
 
         await review.start(meetingId: other).value
@@ -1250,7 +1250,7 @@ final class ReviewJourneyTests: XCTestCase {
         XCTAssertNil(review.groups[1].rows[0].owner)
 
         await review.keep()
-        XCTAssertEqual(review.model?.doneLine, "1 item tracked, 1 updated")
+        XCTAssertEqual(review.model?.screen.message, "1 item tracked, 1 updated")
     }
 
     // MARK: - Polling
@@ -1338,7 +1338,7 @@ final class ReviewJourneyTests: XCTestCase {
         app.apply(.signedIn)
         app.panelOpened()
 
-        app.presentRecapCue(RecapCue(meetingId: meetingId, seriesId: nil, instance: instance))
+        app.presentRecapCue(RecapCue(meetingId: meetingId))
 
         await waitUntil { app.review.shown?.screen == .notAvailable }
         XCTAssertEqual(app.review.buttons.map(\.title), ["Done", "Open recap"])
@@ -1361,7 +1361,7 @@ final class ReviewJourneyTests: XCTestCase {
         app.apply(.signedIn)
         await app.panelOpened()?.value
 
-        app.presentRecapCue(RecapCue(meetingId: meetingId, seriesId: nil, instance: instance))
+        app.presentRecapCue(RecapCue(meetingId: meetingId))
         await waitUntil { ReviewServer.meetingReads == 1 && clock.sleeping == 1 }
         await tick(3)
         await waitUntil { ReviewServer.meetingReads == 2 && clock.sleeping == 1 }
@@ -1538,7 +1538,7 @@ final class ReviewJourneyTests: XCTestCase {
         await app.authManager.adopt(testSupabase(instance), instance: instance)
         try await app.authManager.signIn(email: "first@example.com", password: "pw")
         ReviewServer.put(try meeting(rows: [row(UUID(), "Send the budget"), row(UUID(), "Book the Acme interview")]))
-        app.presentRecapCue(RecapCue(meetingId: meetingId, seriesId: nil, instance: instance))
+        app.presentRecapCue(RecapCue(meetingId: meetingId))
         await waitUntil { app.review.shown?.screen == .ready }
 
         ReviewServer.signedOutOnTheWeb = true
@@ -1597,7 +1597,7 @@ final class ReviewJourneyTests: XCTestCase {
         let review = review()
         await review.start(meetingId: meetingId).value
         await review.keep()
-        XCTAssertEqual(review.shown?.doneLine, "1 item tracked")
+        XCTAssertEqual(review.shown?.screen.message, "1 item tracked")
 
         await tick(3.9)
         try? await Task.sleep(nanoseconds: 200_000_000)
@@ -1657,7 +1657,7 @@ final class ReviewJourneyTests: XCTestCase {
 
         await review.keep()
         await review.skipRest()
-        XCTAssertEqual(review.shown?.doneLine, "1 item tracked")
+        XCTAssertEqual(review.shown?.screen.message, "1 item tracked")
         window.spin(0.3)
         XCTAssertEqual(window.controls().map(\.label).sorted(), ["Close review", "Done", "Open recap"])
     }
@@ -1685,7 +1685,7 @@ final class ReviewJourneyTests: XCTestCase {
         app.apply(.signedIn)
         app.panelOpened()
         ReviewServer.put(try meeting(rows: rows, webOnly: 1))
-        app.presentRecapCue(RecapCue(meetingId: meetingId, seriesId: nil, instance: instance))
+        app.presentRecapCue(RecapCue(meetingId: meetingId))
         await waitUntil { app.review.shown?.screen == .ready }
         let menu = MenuContent(controller: app, updater: UpdaterController())
         for dark in [false, true] {
@@ -1730,7 +1730,7 @@ final class ReviewJourneyTests: XCTestCase {
         app.apply(.signedIn)
         app.panelOpened()
         ReviewServer.put(try meeting(rows: rows))
-        app.presentRecapCue(RecapCue(meetingId: meetingId, seriesId: nil, instance: instance))
+        app.presentRecapCue(RecapCue(meetingId: meetingId))
         await waitUntil { app.review.shown?.screen == .ready }
         let menu = MenuContent(controller: app, updater: UpdaterController())
 
@@ -1749,7 +1749,7 @@ final class ReviewJourneyTests: XCTestCase {
     func test_doneCheck_isPartwayMidDraw_andSettlesToTheFinishedCheck() async throws {
         let review = try await readyReview([row(UUID(), "Send the budget")])
         await review.keep()
-        XCTAssertEqual(review.shown?.doneLine, "1 item tracked")
+        XCTAssertEqual(review.shown?.screen.message, "1 item tracked")
 
         let reference = try done(review, at: 0, reduceMotion: true)
         XCTAssertTrue(Host.read(reference).hasLine("1 item tracked"), "the panel rendered")
@@ -1842,7 +1842,7 @@ final class ReviewJourneyTests: XCTestCase {
         await app.authManager.adopt(testSupabase(instance), instance: instance)
         app.apply(.signedIn)
         ReviewServer.put(try meeting(rows: [row(UUID(), "Send the budget")]))
-        app.presentRecapCue(RecapCue(meetingId: meetingId, seriesId: nil, instance: instance))
+        app.presentRecapCue(RecapCue(meetingId: meetingId))
         await waitUntil { app.review.shown?.screen == .ready }
         let menu = MenuContent(controller: app, updater: UpdaterController())
         XCTAssertTrue(Host.text(menu).has("Send the budget"))

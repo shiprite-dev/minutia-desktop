@@ -214,7 +214,6 @@ final class ReviewController: ObservableObject {
             return
         } catch ReviewQueueError.signedOut {
             guard generation == self.generation else { return }
-            model?.signedOut = true
             onSignedOut()
         } catch {
             guard generation == self.generation, let shown = model, shown.meetingId == id else { return }
@@ -555,8 +554,6 @@ extension ReviewController {
         }
     }
 
-    var waitingLine: String? { queueRows.first?.title }
-
     private func item(_ row: ReviewRow, _ model: ReviewModel) -> ReviewRowItem {
         let state = model.rowState[row.id] ?? .idle
         let isUpdate = row.type == "status_update"
@@ -586,13 +583,20 @@ extension ReviewController {
         if let choice = [DueChoice.today, .tomorrow, .nextWeek].first(where: { Self.dueChange($0, now: now) == .set(day) }) {
             return choice.title
         }
-        let parse = DateFormatter()
-        parse.locale = Locale(identifier: "en_US_POSIX")
-        parse.dateFormat = "yyyy-MM-dd"
-        guard let date = parse.date(from: day) else { return day }
-        parse.dateFormat = "MMM d"
-        return parse.string(from: date)
+        guard let date = Self.isoDay.date(from: day) else { return day }
+        return Self.monthDay.string(from: date)
     }
+
+    private static func posix(_ format: String) -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = format
+        return formatter
+    }
+
+    private static let isoDay = posix("yyyy-MM-dd")
+    private static let monthDay = posix("MMM d")
+    private static let weekday = posix("EEEE")
 
     nonisolated static func rowTitle(_ row: ReviewRow) -> String {
         guard row.type == "status_update", let number = row.relatedIssueNumber else { return row.title }
@@ -610,14 +614,11 @@ extension ReviewController {
         }
     }
 
-    nonisolated static func relativeDay(_ date: Date, now: Date, calendar: Calendar = .current) -> String {
+    static func relativeDay(_ date: Date, now: Date) -> String {
+        let calendar = Calendar.current
         let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: date), to: calendar.startOfDay(for: now)).day ?? 0
         if days <= 0 { return "today" }
         if days == 1 { return "yesterday" }
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = calendar.timeZone
-        formatter.dateFormat = days < 7 ? "EEEE" : "MMM d"
-        return formatter.string(from: date)
+        return (days < 7 ? weekday : monthDay).string(from: date)
     }
 }

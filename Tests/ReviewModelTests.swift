@@ -95,7 +95,6 @@ final class ReviewModelTests: XCTestCase {
         XCTAssertEqual(model.selection, Set(rows.map(\.id)))
         XCTAssertEqual(model.keepCount, 3)
         XCTAssertEqual(ReviewCopy.keep(model.keepCount), "Keep 3")
-        XCTAssertNil(model.lessSureIndex)
     }
 
     func test_ready_lessSureItemsComeAfterTheConfidentOnesAndStartUnselected() {
@@ -104,7 +103,6 @@ final class ReviewModelTests: XCTestCase {
         let second = row("Second", confidence: 0.9)
         let model = ReviewModel.from(meeting(rows: [unsure, first, second]), now: now, previous: nil)
         XCTAssertEqual(model.newRows.map(\.title), ["First", "Second", "Maybe"])
-        XCTAssertEqual(model.lessSureIndex, 2)
         XCTAssertEqual(model.selection, [first.id, second.id])
         XCTAssertEqual(ReviewCopy.keep(model.keepCount), "Keep 2")
     }
@@ -220,11 +218,10 @@ final class ReviewModelTests: XCTestCase {
         }
     }
 
-    func test_signedOutAnswer_marksTheModelAndLeavesTheItemPending() {
+    func test_signedOutAnswer_leavesTheItemPending() {
         let a = row("A")
         var model = ReviewModel.from(meeting(rows: [a]), now: now, previous: nil)
         model.apply(.signedOut, to: a.id)
-        XCTAssertTrue(model.signedOut)
         XCTAssertEqual(model.rowState[a.id], .failed)
         XCTAssertEqual(model.keepCount, 1)
         XCTAssertEqual(model.screen, .ready)
@@ -237,7 +234,7 @@ final class ReviewModelTests: XCTestCase {
         model.apply(.retryable, to: b.id)
         XCTAssertEqual(model.screen, .ready)
         XCTAssertEqual(model.keepCount, 1)
-        XCTAssertEqual(model.doneLine, "")
+        XCTAssertEqual(model.screen.message, "")
         model.apply(.saved, to: b.id)
         XCTAssertEqual(model.screen, .done(kept: 2, updated: 0))
     }
@@ -263,7 +260,7 @@ final class ReviewModelTests: XCTestCase {
             var model = ReviewModel.from(meeting(rows: news + ups), now: now, previous: nil)
             for r in news + ups { model.apply(.saved, to: r.id) }
             XCTAssertEqual(model.screen, .done(kept: k, updated: u))
-            XCTAssertEqual(model.doneLine, line)
+            XCTAssertEqual(model.screen.message, line)
         }
     }
 
@@ -273,17 +270,17 @@ final class ReviewModelTests: XCTestCase {
         model.apply(.saved, to: a.id)
         model.apply(.saved, to: b.id)
         XCTAssertEqual(model.screen, .partlyDone(kept: 2, left: 1))
-        XCTAssertEqual(model.doneLine, "2 items tracked. 1 still to review.")
+        XCTAssertEqual(model.screen.message, "2 items tracked. 1 still to review.")
         model.apply(.saved, to: c.id)
         XCTAssertEqual(model.screen, .done(kept: 2, updated: 0))
-        XCTAssertEqual(model.doneLine, "2 items tracked")
+        XCTAssertEqual(model.screen.message, "2 items tracked")
     }
 
     func test_partlyDone_singularItemAndPluralLeft() {
         let a = row("A"), b = row("B", confidence: 0.1), c = row("C", confidence: 0.1)
         var model = ReviewModel.from(meeting(rows: [a, b, c]), now: now, previous: nil)
         model.apply(.saved, to: a.id)
-        XCTAssertEqual(model.doneLine, "1 item tracked. 2 still to review.")
+        XCTAssertEqual(model.screen.message, "1 item tracked. 2 still to review.")
     }
 
     func test_rowsReviewedOnTheWebDuringTheRun_stillLetTheRestFinishAsDone() {
@@ -292,7 +289,7 @@ final class ReviewModelTests: XCTestCase {
         model.apply(.saved, to: a.id)
         model.apply(.alreadyReviewed, to: b.id)
         XCTAssertEqual(model.screen, .done(kept: 1, updated: 0))
-        XCTAssertEqual(model.doneLine, "1 item tracked")
+        XCTAssertEqual(model.screen.message, "1 item tracked")
     }
 
     func test_olderMeetingWithoutStatuses_showsNotAvailable() {
@@ -323,21 +320,21 @@ final class ReviewModelTests: XCTestCase {
         var model = ReviewModel.from(meeting(rows: [a]), now: now, previous: nil)
         model.apply(.alreadyReviewed, to: a.id)
         XCTAssertEqual(model.screen, .done(kept: 0, updated: 0))
-        XCTAssertEqual(model.doneLine, "No items tracked")
+        XCTAssertEqual(model.screen.message, "No items tracked")
     }
 
     func test_partlyDone_countsAKeptStatusUpdate() {
         let update = row("Contract renewed", type: "status_update"), left = row("Maybe", confidence: 0.2)
         var model = ReviewModel.from(meeting(rows: [left, update]), now: now, previous: nil)
         model.apply(.saved, to: update.id)
-        XCTAssertEqual(model.doneLine, "1 item tracked. 1 still to review.")
+        XCTAssertEqual(model.screen.message, "1 item tracked. 1 still to review.")
     }
 
     func test_partlyDone_withNothingKept_saysNoItemsTracked() {
         let gone = row("A"), left = row("Maybe", confidence: 0.2)
         var model = ReviewModel.from(meeting(rows: [gone, left]), now: now, previous: nil)
         model.apply(.alreadyReviewed, to: gone.id)
-        XCTAssertEqual(model.doneLine, "No items tracked. 1 still to review.")
+        XCTAssertEqual(model.screen.message, "No items tracked. 1 still to review.")
     }
 
     func test_refreshAfterKeepingOne_doesNotForgetItWhenTheNextOneIsKept() {
@@ -348,7 +345,7 @@ final class ReviewModelTests: XCTestCase {
         XCTAssertEqual(model.screen, .ready)
         model.apply(.saved, to: b.id)
         XCTAssertEqual(model.screen, .done(kept: 2, updated: 0))
-        XCTAssertEqual(model.doneLine, "2 items tracked")
+        XCTAssertEqual(model.screen.message, "2 items tracked")
     }
 
     func test_aKeepWhoseAnswerWasLost_andThatLeftThePendingList_countsAsTracked() {
@@ -358,7 +355,7 @@ final class ReviewModelTests: XCTestCase {
         XCTAssertEqual(model.screen, .ready)
         model = ReviewModel.from(meeting(rows: []), now: now, previous: model)
         XCTAssertEqual(model.screen, .done(kept: 1, updated: 0))
-        XCTAssertEqual(model.doneLine, "1 item tracked")
+        XCTAssertEqual(model.screen.message, "1 item tracked")
     }
 
     func test_aSkipWhoseAnswerWasLost_andThatLeftThePendingList_countsAsSkipped() {
@@ -367,7 +364,7 @@ final class ReviewModelTests: XCTestCase {
         model.apply(.retryable, to: b.id)
         model = ReviewModel.from(meeting(rows: []), now: now, previous: model)
         XCTAssertEqual(model.screen, .done(kept: 0, updated: 0))
-        XCTAssertEqual(model.doneLine, "No items tracked")
+        XCTAssertEqual(model.screen.message, "No items tracked")
     }
 
     func test_aLostKeepThatIsStillPending_staysCouldntSave() {
@@ -394,7 +391,7 @@ final class ReviewModelTests: XCTestCase {
         model.apply(.saved, to: u.id)
         model = ReviewModel.from(meeting(rows: []), now: now, previous: model)
         XCTAssertEqual(model.screen, .done(kept: 1, updated: 1))
-        XCTAssertEqual(model.doneLine, "1 item tracked, 1 updated")
+        XCTAssertEqual(model.screen.message, "1 item tracked, 1 updated")
     }
 
     func test_rerun_aRowStillSavingStaysSavingAndItsLateResultLandsOnTheShownRow() {

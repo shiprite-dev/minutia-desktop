@@ -34,7 +34,6 @@ enum ReviewCopy {
     static let windowOffline = "You're offline"
     static let windowCert = "Can't open this server securely"
     static let openInBrowser = "Open in browser"
-    static let signedOut = "You were signed out. Sign in again to record."
 
     static func keep(_ n: Int) -> String { "Keep \(n)" }
     static func moreOnWeb(_ n: Int) -> String { "\(n) more on the web" }

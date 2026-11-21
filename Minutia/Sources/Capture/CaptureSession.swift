@@ -374,7 +374,7 @@ final class CaptureSession: ObservableObject {
 
     /// The device-mode stop after capture has finished: finishes local transcription, writes
     /// `transcript.json`, marks the meeting as waiting for this Mac, submits it, deletes the directory on
-    /// a 2xx, then warms the summary (unless the recap already opened) and ends the meeting.
+    /// a 2xx, then warms the summary and ends the meeting.
     nonisolated static func finishOnDevice(
         meetingId: String, directory: URL, tail: [SegmentWriter.ClosedSegment], durationSeconds: Double,
         transcriber: LocalTranscriber, transport: any DeviceTranscriptTransport,

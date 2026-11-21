@@ -128,7 +128,7 @@ final class PanelFlowTests: XCTestCase {
 
     func test_webEndedStop_goesStraightToIdle() {
         let controller = signedIn()
-        finishCleanly(controller, cue: AppController.recapCue(reason: .webEnded, transcriptRequested: true, meetingId: UUID(), seriesId: nil, instance: instance))
+        finishCleanly(controller, cue: AppController.recapCue(reason: .webEnded, transcriptRequested: true, meetingId: UUID(), instance: instance))
         XCTAssertNil(controller.review.model)
         XCTAssertTrue(panel(controller).has("SERIES"))
     }

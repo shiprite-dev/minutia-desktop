@@ -226,7 +226,10 @@ struct MenuBarIcon: View {
     }
 
     /// Status items render their label as a template image, so the dot is drawn into the glyph itself.
-    static func dotted(_ symbol: String) -> NSImage {
+    @MainActor private static var dottedImages: [String: NSImage] = [:]
+
+    @MainActor static func dotted(_ symbol: String) -> NSImage {
+        if let image = dottedImages[symbol] { return image }
         let base = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: 14, weight: .regular)) ?? NSImage()
         let size = NSSize(width: base.size.width + 3, height: base.size.height)
@@ -237,6 +240,7 @@ struct MenuBarIcon: View {
             return true
         }
         image.isTemplate = true
+        dottedImages[symbol] = image
         return image
     }
 
@@ -282,8 +286,6 @@ struct ReviewNotifier {
 
 struct RecapCue: Equatable {
     let meetingId: UUID
-    let seriesId: UUID?
-    let instance: URL
 }
 
 /// An outstanding request to record, triggered by the browser via `minutia://record`. Capture
@@ -1769,9 +1771,9 @@ final class AppController: NSObject, ObservableObject {
 
     func stopRecording() { stopRecording(reason: .manual) }
 
-    nonisolated static func recapCue(reason: StopReason, transcriptRequested: Bool, meetingId: UUID?, seriesId: UUID?, instance: URL?) -> RecapCue? {
-        guard opensRecap(for: reason), transcriptRequested, let meetingId, let instance else { return nil }
-        return RecapCue(meetingId: meetingId, seriesId: seriesId, instance: instance)
+    nonisolated static func recapCue(reason: StopReason, transcriptRequested: Bool, meetingId: UUID?, instance: URL?) -> RecapCue? {
+        guard opensRecap(for: reason), transcriptRequested, let meetingId, instance != nil else { return nil }
+        return RecapCue(meetingId: meetingId)
     }
 
     func presentRecapCue(_ cue: RecapCue?) {
@@ -1846,7 +1848,6 @@ final class AppController: NSObject, ObservableObject {
         notepad.end()
         report(.stopped, meetingId: recordingMeetingId)
         let meetingId = recordingMeetingId
-        let seriesId = recordingSeriesId
         let instance = recordingInstance
         let local = localOutcomeHandlers()
         Task {
@@ -1854,7 +1855,7 @@ final class AppController: NSObject, ObservableObject {
                 let result = try await captureSession.stop(
                     flushNotes: { [notepad] in try await notepad.flushNow() },
                     notifyLocalFailure: local.notify, onLocalOutcome: local.outcome)
-                finishStop(result, reason: reason, meetingId: meetingId, seriesId: seriesId, instance: instance)
+                finishStop(result, reason: reason, meetingId: meetingId, instance: instance)
             } catch {
                 captureSession.endFinishing()
                 // The durable directory survives a timed-out finalize, so Retry finishes the upload
@@ -1867,14 +1868,14 @@ final class AppController: NSObject, ObservableObject {
 
     /// After a stop the server has the recording: the panel follows it into the review. The recap
     /// opens only when the person asks for it.
-    func finishStop(_ result: CaptureSession.StopResult, reason: StopReason, meetingId: UUID?, seriesId: UUID?, instance: URL?) {
+    func finishStop(_ result: CaptureSession.StopResult, reason: StopReason, meetingId: UUID?, instance: URL?) {
         recordingMeetingId = nil
         recordingSeriesId = nil
         recordingInstance = nil
         apply(.finalized)
         presentRecapCue(Self.recapCue(
             reason: reason, transcriptRequested: result.transcriptRequested,
-            meetingId: meetingId, seriesId: seriesId, instance: instance))
+            meetingId: meetingId, instance: instance))
         runRecovery()
     }
 
@@ -2234,9 +2235,7 @@ final class AppController: NSObject, ObservableObject {
                 }
                 apply(.finalized)
                 if let meetingUUID = UUID(uuidString: manifest.meetingId) {
-                    presentRecapCue(RecapCue(
-                        meetingId: meetingUUID, seriesId: manifest.seriesId.flatMap { UUID(uuidString: $0) },
-                        instance: manifest.instanceURL))
+                    presentRecapCue(RecapCue(meetingId: meetingUUID))
                 }
             } catch {
                 switch Self.refinalizeOutcome(for: error, host: authManager.instance?.host, audioMayLeaveMac: manifest?.audioMayLeaveMac ?? true) {

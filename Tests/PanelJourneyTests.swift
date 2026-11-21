@@ -79,7 +79,7 @@ final class PanelJourneyTests: XCTestCase {
     func test_aStopThatSentNothing_neverTellsTheUserItWasSent() {
         for (reason, requested, meeting) in [(AppController.StopReason.manual, false, UUID() as UUID?), (.manual, true, nil)] {
             let controller = rig.signedIn()
-            let cue = AppController.recapCue(reason: reason, transcriptRequested: requested, meetingId: meeting, seriesId: nil, instance: rig.instance)
+            let cue = AppController.recapCue(reason: reason, transcriptRequested: requested, meetingId: meeting, instance: rig.instance)
             rig.finishCleanly(controller, cue: cue)
             XCTAssertNil(controller.review.model)
             XCTAssertTrue(rig.panel(controller).has("SERIES"))
