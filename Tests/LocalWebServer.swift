@@ -27,12 +27,14 @@ final class LocalWebServer: @unchecked Sendable {
         }
     }
 
-    enum Reply {
+    indirect enum Reply {
         case respond(status: Int, headers: [String: String], body: String)
         /// Hold the connection open with no answer.
         case hang
         /// Close the connection without answering, as a dropped network does.
         case drop
+        /// Answer after a delay, as a slow server does.
+        case delayed(TimeInterval, Reply)
     }
 
     private let listener: NWListener
@@ -122,11 +124,17 @@ final class LocalWebServer: @unchecked Sendable {
             recorded.append(request)
             return route(request)
         }
+        send(reply, on: connection)
+    }
+
+    private func send(_ reply: Reply, on connection: NWConnection) {
         switch reply {
         case .hang:
             lock.withLock { held.append(connection) }
         case .drop:
             connection.cancel()
+        case .delayed(let seconds, let later):
+            queue.asyncAfter(deadline: .now() + seconds) { [weak self] in self?.send(later, on: connection) }
         case .respond(let status, let headers, let body):
             var head = "HTTP/1.1 \(status) \(Self.reason(status))\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n"
             for (name, value) in headers { head += "\(name): \(value)\r\n" }

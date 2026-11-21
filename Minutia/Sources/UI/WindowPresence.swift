@@ -1,7 +1,7 @@
 import AppKit
 
 /// Owns the Dock icon for the menu-bar app. A menu-bar app opens windows without becoming active,
-/// so they never take key and text fields cannot focus; while any window (Settings, the recap) is
+/// so they never take key and text fields cannot focus; while any window (Settings, notes, the recap) is
 /// open the app is a regular app with a Dock icon and in Cmd-Tab, and it goes back to menu-bar only
 /// after the last one closes, so closing one never drops the icon while another is still open.
 @MainActor
@@ -18,10 +18,12 @@ final class WindowPresence {
         self.activate = activate
     }
 
-    func opened(_ id: String) {
+    /// `activate: false` keeps a window that must not steal focus (the notes panel during a call)
+    /// from pulling the app in front.
+    func opened(_ id: String, activate: Bool = true) {
         if open.isEmpty { setPolicy(.regular) }
         open.insert(id)
-        activate()
+        if activate { self.activate() }
     }
 
     func closed(_ id: String) {

@@ -342,6 +342,11 @@ final class AppController: NSObject, ObservableObject {
     let review: ReviewController
     let recapWindow: RecapWindowController
     private var webSessionIdentity: AuthManager.SessionIdentity?
+    private var webStoresPruned = false
+    private var currentWebStore: UUID? {
+        guard let instance = authManager.instance, let user = authManager.client()?.supabase.auth.currentSession?.user.id else { return nil }
+        return RecapWindowController.storeIdentifier(instance: instance, userId: user.uuidString)
+    }
     @Published private(set) var selectedSeriesId: UUID?
     /// The user chose a series during the current detected meeting; detection then leaves it alone.
     private var seriesPickedThisMeeting = false
@@ -800,7 +805,8 @@ final class AppController: NSObject, ObservableObject {
         reviewClock: ReviewClock = .live,
         postReviewNotice: @escaping @MainActor (ReviewNotice) -> Void = AppController.postReviewNotice,
         reviewClient: @escaping @MainActor (AuthManager) -> MinutiaClient? = { $0.client() },
-        windowPresence: WindowPresence = .shared
+        windowPresence: WindowPresence = .shared,
+        recapStores: RecapStores = .webKit
     ) {
         self.defaults = defaults
         let authManager = AuthManager(defaults: defaults)
@@ -809,9 +815,9 @@ final class AppController: NSObject, ObservableObject {
         self.recapWindow = RecapWindowController(
             account: {
                 guard let client = authManager.client() else { return nil }
-                return (client, try? await client.supabase.auth.session.user.id.uuidString.lowercased())
+                return (client, client.supabase.auth.currentSession?.user.id.uuidString.lowercased())
             },
-            openURL: openURL, clock: reviewClock, presence: windowPresence,
+            openURL: openURL, clock: reviewClock, presence: windowPresence, defaults: defaults, stores: recapStores,
             onSignedOut: { Task { _ = await authManager.dropSessionIfRevoked() } })
         self.openURL = openURL
         self.micCheck = micCheck
@@ -885,6 +891,10 @@ final class AppController: NSObject, ObservableObject {
     /// Connect step. Idempotent with SignInView's on-appear auto-connect.
     func restoreSession() async {
         try? await authManager.ensureConnected()
+        if !webStoresPruned {
+            webStoresPruned = true
+            await recapWindow.pruneStores(keeping: currentWebStore)
+        }
         if authManager.sessionIdentity.email != nil { Task { await modelStore.prepare(language: "en") } }
         // Recover orphaned captures on every launch, not only on a sign-in transition: a warm launch
         // restoring a Keychain session emits no signedIn transition, so a recording orphaned by a

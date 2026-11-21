@@ -15,6 +15,9 @@ final class FakeMinutia: @unchecked Sendable {
     private var mintStatus = 200
     private var meetingReply: LocalWebServer.Reply?
     private var meetingScript = ""
+    private var meetingBody = ""
+    private var mintDelay: TimeInterval = 0
+    private var sessionJSON = AuthServerStub.validSessionBody
     let seriesId = UUID(uuidString: "B6008C45-D6ED-4CD8-BCE4-9646A5994F0B")!
 
     init() throws { server = try LocalWebServer() }
@@ -31,6 +34,9 @@ final class FakeMinutia: @unchecked Sendable {
     func expireWebSessions() { lock.withLock { session = "session-\(UUID().uuidString)" } }
     func answerMeetings(_ reply: LocalWebServer.Reply?) { lock.withLock { meetingReply = reply } }
     func runOnMeetingPage(_ script: String) { lock.withLock { meetingScript = script } }
+    func addToMeetingPage(_ html: String) { lock.withLock { meetingBody = html } }
+    func slowMints(_ seconds: TimeInterval) { lock.withLock { mintDelay = seconds } }
+    func signInReturns(_ body: String) { lock.withLock { sessionJSON = body } }
 
     func meetingPath(_ meetingId: UUID) -> String {
         "/series/\(seriesId.uuidString.lowercased())/meetings/\(meetingId.uuidString.lowercased())"
@@ -43,9 +49,12 @@ final class FakeMinutia: @unchecked Sendable {
             let digest = (try? JSONSerialization.jsonObject(with: request.body) as? [String: String])?["nonce_digest"] ?? ""
             return lock.withLock {
                 digests.append(digest)
-                return mintStatus == 200
-                    ? .respond(status: 200, headers: json, body: "{\"handoff_id\":\"handoff-\(digests.count)\"}")
-                    : .respond(status: mintStatus, headers: json, body: "{\"error\":\"refused\"}")
+                let reply: LocalWebServer.Reply = switch mintStatus {
+                case 200: .respond(status: 200, headers: json, body: "{\"handoff_id\":\"handoff-\(digests.count)\"}")
+                case 401: .respond(status: 401, headers: json, body: "{\"error\":\"Not authenticated\",\"code\":\"not_signed_in\"}")
+                default: .respond(status: mintStatus, headers: json, body: "{\"error\":\"refused\"}")
+                }
+                return mintDelay > 0 ? .delayed(mintDelay, reply) : reply
             }
         case ("POST", "/auth/companion-session"):
             let form = request.form
@@ -59,10 +68,10 @@ final class FakeMinutia: @unchecked Sendable {
             }
         case ("GET", "/login"):
             return .respond(status: 200, headers: [:], body: "<html><body><h1>Sign in to Minutia</h1></body></html>")
-        case ("GET", "/report"):
+        case ("GET", "/report"), ("GET", "/frame-same"):
             return .respond(status: 204, headers: [:], body: "")
         case ("POST", "/auth/v1/token"):
-            return .respond(status: 200, headers: json.merging(["X-Supabase-Api-Version": "2024-01-01"]) { $1 }, body: AuthServerStub.validSessionBody)
+            return .respond(status: 200, headers: json.merging(["X-Supabase-Api-Version": "2024-01-01"]) { $1 }, body: lock.withLock { sessionJSON })
         case ("GET", "/auth/v1/user"):
             return .respond(status: 200, headers: json, body: AuthServerStub.userBody)
         case ("GET", "/rest/v1/meetings"):
@@ -73,7 +82,7 @@ final class FakeMinutia: @unchecked Sendable {
                 guard request.header("Cookie")?.contains("sb-session=\(session)") == true else {
                     return .respond(status: 302, headers: ["Location": "/login?next=\(path)"], body: "")
                 }
-                return .respond(status: 200, headers: [:], body: "<html><body><h1>Recap for Weekly sync</h1><script>\(meetingScript)</script></body></html>")
+                return .respond(status: 200, headers: [:], body: "<html><body><h1>Recap for Weekly sync</h1>\(meetingBody)<script>\(meetingScript)</script></body></html>")
             }
         default:
             return .respond(status: 404, headers: json, body: "{}")
@@ -83,12 +92,33 @@ final class FakeMinutia: @unchecked Sendable {
     var mintedDigests: [String] { lock.withLock { digests } }
 }
 
+/// Stands in for WebKit's data store list; a removal can be made to fail.
+@MainActor
+final class StoreDouble {
+    var ids: [UUID]
+    var failing: Set<UUID> = []
+    private(set) var removed: [UUID] = []
+
+    init(_ ids: [UUID]) { self.ids = ids }
+
+    var stores: RecapStores {
+        RecapStores(all: { self.ids }, remove: { id in
+            if self.failing.contains(id) { throw URLError(.cannotRemoveFile) }
+            self.removed.append(id)
+            self.ids.removeAll { $0 == id }
+        })
+    }
+}
+
 @MainActor
 final class RecapWindowTests: XCTestCase {
     private var fake: FakeMinutia!
+    private var elsewhere: FakeMinutia!
     private var clock: TestClock!
     private var opened: [URL] = []
     private var copied: [String] = []
+    private var announced: [String] = []
+    private var signOutChecks = 0
     private var policies: [NSApplication.ActivationPolicy] = []
     private var presence: WindowPresence!
     private var controllers: [RecapWindowController] = []
@@ -101,9 +131,13 @@ final class RecapWindowTests: XCTestCase {
     override func setUp() async throws {
         fake = try FakeMinutia()
         _ = try await fake.start()
+        elsewhere = try FakeMinutia()
+        _ = try await elsewhere.start()
         clock = TestClock()
         opened = []
         copied = []
+        announced = []
+        signOutChecks = 0
         policies = []
         suite = "RecapWindowTests.\(UUID().uuidString)"
         presence = WindowPresence(setPolicy: { [weak self] in self?.policies.append($0) }, activate: {})
@@ -116,15 +150,22 @@ final class RecapWindowTests: XCTestCase {
         apps = []
         clock.drain()
         fake.server.stop()
+        elsewhere.server.stop()
         UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
     }
 
-    private func recap(userId: String? = UUID().uuidString.lowercased(), token: @escaping () async throws -> String = { "token" }) -> RecapWindowController {
+    private var defaults: UserDefaults { UserDefaults(suiteName: suite)! }
+
+    private func recap(
+        userId: String? = UUID().uuidString.lowercased(), stores: RecapStores = .webKit,
+        token: @escaping () async throws -> String = { "token" }
+    ) -> RecapWindowController {
         let base = fake.base
         let controller = RecapWindowController(
             account: { (MinutiaClient(instance: base, supabase: testSupabase(base), tokenProvider: token), userId) },
             openURL: { [weak self] in self?.opened.append($0) }, copy: { [weak self] in self?.copied.append($0) },
-            clock: clock.review, presence: presence)
+            clock: clock.review, presence: presence, defaults: defaults, stores: stores,
+            announce: { [weak self] in self?.announced.append($0) }, onSignedOut: { [weak self] in self?.signOutChecks += 1 })
         controllers.append(controller)
         return controller
     }
@@ -160,28 +201,44 @@ final class RecapWindowTests: XCTestCase {
         NSApp.sendAction(action, to: item.target, from: item)
     }
 
+    private func press(_ characters: String, _ modifiers: NSEvent.ModifierFlags, in window: NSWindow?, file: StaticString = #filePath, line: UInt = #line) {
+        guard let window, let event = NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: modifiers, timestamp: 0, windowNumber: window.windowNumber,
+            context: nil, characters: characters, charactersIgnoringModifiers: characters, isARepeat: false, keyCode: 0)
+        else { return XCTFail("no window", file: file, line: line) }
+        XCTAssertTrue(window.performKeyEquivalent(with: event), "\(characters) was not handled", file: file, line: line)
+    }
+
     private func openedRecap(_ controller: RecapWindowController, _ meeting: UUID? = nil) async {
         await controller.show(meetingId: meeting ?? meetingId, seriesId: fake.seriesId, title: "Weekly sync").value
         await waitUntil { controller.screen == .page }
     }
 
+    private func paths(after count: Int = 0) -> [String] {
+        fake.server.requests.dropFirst(count).map { "\($0.method) \($0.path)" }
+    }
+
     // MARK: - Navigation rules
 
-    func test_whereEachLinkOpens_sameServerInTheWindow_everythingElseInTheBrowser_scriptsNowhere() {
+    func test_whereEachLinkOpens_sameServerInTheWindow_everythingElseOutside_scriptsAndLocalSchemesNowhere() {
         let instance = URL(string: "https://minutia.example.com")!
-        let decide = { (url: String, main: Bool, download: Bool) in
-            RecapNavigation.decide(url: URL(string: url)!, instance: instance, isMainFrame: main, isDownload: download)
+        let decide = { (url: String, newWindow: Bool, download: Bool) in
+            RecapNavigation.decide(url: URL(string: url)!, instance: instance, isNewWindow: newWindow, isDownload: download)
         }
-        XCTAssertEqual(decide("https://minutia.example.com/issues/42", true, false), .allow)
-        XCTAssertEqual(decide("https://MINUTIA.example.com:443/series", true, false), .allow)
-        XCTAssertEqual(decide("https://github.com/shiprite-dev", true, false), .openInBrowser)
-        XCTAssertEqual(decide("http://minutia.example.com/issues/42", true, false), .openInBrowser)
-        XCTAssertEqual(decide("https://minutia.example.com:8443/issues/42", true, false), .openInBrowser)
-        XCTAssertEqual(decide("https://minutia.example.com/issues/42", false, false), .openInBrowser)
-        XCTAssertEqual(decide("https://minutia.example.com/api/export.csv", true, true), .openInBrowser)
-        XCTAssertEqual(decide("javascript:alert(document.cookie)", true, false), .deny)
-        XCTAssertEqual(decide("file:///etc/passwd", true, false), .deny)
-        XCTAssertEqual(decide("minutia://record", true, false), .deny)
+        XCTAssertEqual(decide("https://minutia.example.com/issues/42", false, false), .allow)
+        XCTAssertEqual(decide("https://MINUTIA.example.com:443/series", false, false), .allow)
+        XCTAssertEqual(decide("https://github.com/shiprite-dev", false, false), .openInBrowser)
+        XCTAssertEqual(decide("http://minutia.example.com/issues/42", false, false), .openInBrowser)
+        XCTAssertEqual(decide("https://minutia.example.com:8443/issues/42", false, false), .openInBrowser)
+        XCTAssertEqual(decide("https://minutia.example.com/issues/42", true, false), .openInBrowser)
+        XCTAssertEqual(decide("https://minutia.example.com/api/export.csv", false, true), .openInBrowser)
+        XCTAssertEqual(decide("mailto:owner@example.com", false, false), .openInBrowser)
+        XCTAssertEqual(decide("javascript:alert(document.cookie)", false, false), .deny)
+        XCTAssertEqual(decide("file:///etc/passwd", false, false), .deny)
+        XCTAssertEqual(decide("about:blank", false, false), .deny)
+        XCTAssertEqual(decide("data:text/html,<h1>hi</h1>", false, false), .deny)
+        XCTAssertEqual(decide("blob:https://minutia.example.com/1b4e28ba-2fa1-11d2-883f-0016d3cca427", false, false), .deny)
+        XCTAssertEqual(decide("minutia://record", false, false), .deny)
     }
 
     func test_eachAccountOnEachServer_getsItsOwnWebData() {
@@ -199,11 +256,7 @@ final class RecapWindowTests: XCTestCase {
         let controller = recap()
         await openedRecap(controller)
 
-        XCTAssertEqual(fake.server.requests.map { "\($0.method) \($0.path)" }, [
-            "POST /api/companion/web-session",
-            "POST /auth/companion-session",
-            "GET \(fake.meetingPath(meetingId))",
-        ])
+        XCTAssertEqual(paths(), ["POST /api/companion/web-session", "POST /auth/companion-session", "GET \(fake.meetingPath(meetingId))"])
         let post = try XCTUnwrap(fake.server.requests("/auth/companion-session").first)
         let nonce = try XCTUnwrap(post.form["nonce"])
         XCTAssertEqual(fake.mintedDigests, [SHA256.hash(data: Data(nonce.utf8)).map { String(format: "%02x", $0) }.joined()])
@@ -235,46 +288,40 @@ final class RecapWindowTests: XCTestCase {
         return origin == appOrigin
     }
 
-    func test_reopening_withTheWebSessionStillValid_loadsTheRecapWithoutAnotherHandoff() async {
-        let first = recap(userId: "ec4109b3-9e36-4a3d-8701-ac066af779f1")
-        await openedRecap(first)
-        first.window?.performClose(nil)
-        await waitUntil { first.window == nil }
-        let before = fake.server.requests.count
-
-        await openedRecap(first)
-
-        XCTAssertEqual(fake.server.requests.dropFirst(before).map { "\($0.method) \($0.path)" }, ["GET \(fake.meetingPath(meetingId))"])
-        XCTAssertEqual(fake.mintedDigests.count, 1)
-        let text = await pageText(first)
-        XCTAssertEqual(text, "Recap for Weekly sync")
-    }
-
-    func test_anExpiredWebSession_mintsOneHandoff_andNeverShowsTheSignInPage() async {
-        let controller = recap()
+    func test_reopeningAfterClosing_signsInAgainWithANewHandoff_soTheWindowIsAlwaysTheMacsAccount() async {
+        let controller = recap(userId: "ec4109b3-9e36-4a3d-8701-ac066af779f1")
         await openedRecap(controller)
         controller.window?.performClose(nil)
         await waitUntil { controller.window == nil }
-        fake.expireWebSessions()
+        let before = fake.server.requests.count
 
         await openedRecap(controller)
 
-        XCTAssertEqual(fake.mintedDigests.count, 2)
-        XCTAssertEqual(fake.server.requests("/login").count, 0)
+        XCTAssertEqual(paths(after: before), ["POST /api/companion/web-session", "POST /auth/companion-session", "GET \(fake.meetingPath(meetingId))"])
+        XCTAssertEqual(fake.server.requests("/auth/companion-session").last?.form["handoff_id"], "handoff-2")
         let text = await pageText(controller)
         XCTAssertEqual(text, "Recap for Weekly sync")
     }
 
-    func test_aRefusedHandoff_showsTheWebSignInPage_andAsksOnlyOnce() async {
+    func test_aRefusedHandoff_loadsTheMeeting_soTheWebSignInPageShows_andAsksOnlyOnce() async {
         fake.refuseMints(429)
         let controller = recap()
         await openedRecap(controller)
 
         let text = await pageText(controller)
         XCTAssertEqual(text, "Sign in to Minutia")
-        XCTAssertEqual(fake.mintedDigests.count, 1)
-        XCTAssertEqual(fake.server.requests("/auth/companion-session").count, 0)
+        XCTAssertEqual(paths(), ["POST /api/companion/web-session", "GET \(fake.meetingPath(meetingId))", "GET /login"])
         XCTAssertEqual(opened, [])
+    }
+
+    func test_theServerSayingSignedOut_runsTheMacsSignOutCheck_andShowsTheWebSignIn() async {
+        fake.refuseMints(401)
+        let controller = recap()
+        await openedRecap(controller)
+
+        XCTAssertEqual(signOutChecks, 1)
+        let text = await pageText(controller)
+        XCTAssertEqual(text, "Sign in to Minutia")
     }
 
     func test_anOlderServer_opensTheMeetingInTheBrowser_andNoWindowStays() async {
@@ -287,6 +334,37 @@ final class RecapWindowTests: XCTestCase {
         XCTAssertEqual(policies, [.regular, .accessory])
     }
 
+    func test_threeTryAgainPressesDuringASlowSignIn_askForOneHandoff() async {
+        fake.slowMints(1)
+        let controller = recap()
+        controller.show(meetingId: meetingId, seriesId: fake.seriesId, title: "Weekly sync")
+        await waitUntil { fake.server.requests("/api/companion/web-session").count == 1 }
+        controller.tryAgain()
+        controller.tryAgain()
+        controller.tryAgain()
+
+        await waitUntil { controller.screen == .page }
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(fake.mintedDigests.count, 1)
+        XCTAssertEqual(fake.server.requests("/auth/companion-session").count, 1)
+        let text = await pageText(controller)
+        XCTAssertEqual(text, "Recap for Weekly sync")
+    }
+
+    func test_closingDuringASlowSignIn_thenReopening_usesTheHandoffAlreadyMinted() async {
+        fake.slowMints(0.6)
+        let controller = recap()
+        controller.show(meetingId: meetingId, seriesId: fake.seriesId, title: "Weekly sync")
+        await waitUntil { fake.server.requests("/api/companion/web-session").count == 1 }
+        controller.window?.performClose(nil)
+        try? await Task.sleep(nanoseconds: 900_000_000)
+
+        await openedRecap(controller)
+
+        XCTAssertEqual(fake.mintedDigests.count, 1)
+        XCTAssertEqual(fake.server.requests("/auth/companion-session").map { $0.form["handoff_id"] }, ["handoff-1"])
+    }
+
     // MARK: - What the window shows
 
     func test_offlineWhileSigningIn_saysYoureOffline_withTryAgain() async {
@@ -294,6 +372,8 @@ final class RecapWindowTests: XCTestCase {
         await controller.show(meetingId: meetingId, seriesId: fake.seriesId, title: "Weekly sync").value
         await waitUntil { controller.screen == .offline }
 
+        XCTAssertEqual(announced, ["You're offline"])
+        XCTAssertEqual(opened, [])
         let seen = onScreen(controller)
         XCTAssertTrue(seen.has("You're offline"), seen.text)
         XCTAssertTrue(seen.has("Try again"), seen.text)
@@ -306,6 +386,7 @@ final class RecapWindowTests: XCTestCase {
         let controller = recap()
         await controller.show(meetingId: meetingId, seriesId: fake.seriesId, title: "Weekly sync").value
         await waitUntil { controller.screen == .offline }
+        XCTAssertEqual(announced, ["You're offline"])
         let seen = onScreen(controller)
         XCTAssertTrue(seen.has("You're offline"), seen.text)
         XCTAssertFalse(seen.has("Recap for Weekly sync"), seen.text)
@@ -315,6 +396,7 @@ final class RecapWindowTests: XCTestCase {
         await waitUntil { controller.screen == .page }
         let text = await pageText(controller)
         XCTAssertEqual(text, "Recap for Weekly sync")
+        XCTAssertEqual(fake.mintedDigests.count, 1, "the window is already signed in")
     }
 
     func test_aSlowServer_showsTheTitle_thenAfterEightSecondsSaysTakingLonger_withTryAgainAndOpenInBrowser() async {
@@ -325,6 +407,7 @@ final class RecapWindowTests: XCTestCase {
 
         clock.advance(7.9)
         try? await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(announced, [])
         let early = onScreen(controller)
         XCTAssertTrue(early.has("Weekly sync"), early.text)
         XCTAssertFalse(early.has("Taking longer than usual"), early.text)
@@ -332,6 +415,7 @@ final class RecapWindowTests: XCTestCase {
 
         clock.advance(0.1)
         await waitUntil { controller.screen == .slow }
+        XCTAssertEqual(announced, ["Taking longer than usual"])
         let late = onScreen(controller)
         XCTAssertTrue(late.has("Taking longer than usual"), late.text)
         XCTAssertTrue(late.has("Try again"), late.text)
@@ -341,6 +425,22 @@ final class RecapWindowTests: XCTestCase {
         XCTAssertEqual(opened.map(\.absoluteString), [page(meetingId).absoluteString])
     }
 
+    func test_theSlowNoticeNeverAppearsAfterTheWindowCloses() async {
+        fake.answerMeetings(.hang)
+        let controller = recap()
+        await controller.show(meetingId: meetingId, seriesId: fake.seriesId, title: "Weekly sync").value
+        await waitUntil { fake.server.requests(fake.meetingPath(meetingId)).count == 1 }
+        controller.window?.performClose(nil)
+        await waitUntil { controller.window == nil }
+
+        clock.advance(8)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertEqual(announced, [])
+        XCTAssertNotEqual(controller.screen, .slow)
+        XCTAssertEqual(policies, [.regular, .accessory])
+    }
+
     func test_aServerCertificateTheMacRejects_saysItCantOpenSecurely_withOpenInBrowser() async throws {
         fake.answerMeetings(.hang)
         let controller = recap()
@@ -348,6 +448,7 @@ final class RecapWindowTests: XCTestCase {
         let webView = try XCTUnwrap(controller.webView)
         controller.webView(webView, didFailProvisionalNavigation: nil, withError: URLError(.serverCertificateUntrusted) as NSError)
 
+        XCTAssertEqual(announced, ["Can't open this server securely"])
         let seen = onScreen(controller)
         XCTAssertTrue(seen.has("Can't open this server securely"), seen.text)
         XCTAssertTrue(seen.has("Open in browser"), seen.text)
@@ -357,7 +458,7 @@ final class RecapWindowTests: XCTestCase {
 
     // MARK: - One window
 
-    func test_theSameMeetingFocusesTheWindow_anotherMeetingNavigatesIt() async {
+    func test_theSameMeetingFocusesTheWindow_anotherMeetingNavigatesItWithoutSigningInAgain() async {
         let controller = recap()
         await openedRecap(controller)
         let window = controller.window
@@ -371,6 +472,7 @@ final class RecapWindowTests: XCTestCase {
 
         await controller.show(meetingId: otherMeeting, seriesId: fake.seriesId, title: "Board prep").value
         await waitUntil { controller.screen == .page && controller.webView?.url?.path == fake.meetingPath(otherMeeting) }
+        XCTAssertEqual(paths(after: before), ["GET \(fake.meetingPath(otherMeeting))"])
         XCTAssertTrue(controller.window === window)
         XCTAssertEqual(controller.window?.title, "Board prep")
         XCTAssertEqual(NSApp.windows.filter { $0.frameAutosaveName == "MinutiaRecap" && $0.isVisible }.count, 1)
@@ -387,15 +489,30 @@ final class RecapWindowTests: XCTestCase {
         XCTAssertEqual(opened.map(\.absoluteString), [page(meetingId).absoluteString])
     }
 
+    func test_keyboard_commandBracketGoesBack_commandRReloads_commandShiftCCopiesTheLink() async {
+        let controller = recap()
+        await openedRecap(controller)
+        await controller.show(meetingId: otherMeeting, seriesId: fake.seriesId, title: "Board prep").value
+        await waitUntil { controller.screen == .page && controller.webView?.url?.path == fake.meetingPath(otherMeeting) }
+
+        press("C", [.command, .shift], in: controller.window)
+        XCTAssertEqual(copied, [page(otherMeeting).absoluteString])
+
+        press("[", .command, in: controller.window)
+        await waitUntil { controller.webView?.url?.path == fake.meetingPath(meetingId) && controller.webView?.isLoading == false }
+        try? await Task.sleep(nanoseconds: 300_000_000)
+
+        let before = fake.server.requests(fake.meetingPath(meetingId)).count
+        press("r", .command, in: controller.window)
+        await waitUntil { fake.server.requests(fake.meetingPath(meetingId)).count == before + 1 }
+    }
+
     func test_commandW_closesTheWindow_andTheDockIconGoes_whileTheAppKeepsRunning() async throws {
         let controller = recap()
         await openedRecap(controller)
         let window = try XCTUnwrap(controller.window)
-        let commandW = try XCTUnwrap(NSEvent.keyEvent(
-            with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0, windowNumber: window.windowNumber,
-            context: nil, characters: "w", charactersIgnoringModifiers: "w", isARepeat: false, keyCode: 13))
 
-        XCTAssertTrue(window.performKeyEquivalent(with: commandW))
+        press("w", .command, in: window)
 
         await waitUntil { controller.window == nil }
         XCTAssertFalse(window.isVisible)
@@ -415,6 +532,20 @@ final class RecapWindowTests: XCTestCase {
         XCTAssertEqual(policies, [.regular, .accessory])
     }
 
+    func test_theDockIconStays_whileTheNotesWindowIsOpenAndTheRecapCloses() async {
+        let notes = NotepadPanel(presence: presence) { NSView() }
+        let controller = recap()
+        notes.show(focus: false)
+        await openedRecap(controller)
+
+        controller.window?.performClose(nil)
+        await waitUntil { controller.window == nil }
+        XCTAssertEqual(policies, [.regular])
+
+        notes.hide()
+        XCTAssertEqual(policies, [.regular, .accessory])
+    }
+
     func test_wakingFromSleep_reloadsTheMeeting() async {
         let controller = recap()
         await openedRecap(controller)
@@ -423,6 +554,7 @@ final class RecapWindowTests: XCTestCase {
         NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification, object: NSWorkspace.shared)
 
         await waitUntil { fake.server.requests(fake.meetingPath(meetingId)).count == before + 1 && controller.screen == .page }
+        XCTAssertEqual(fake.mintedDigests.count, 1)
     }
 
     // MARK: - What the page may do
@@ -437,7 +569,7 @@ final class RecapWindowTests: XCTestCase {
         XCTAssertEqual(fake.server.requests("/report").map(\.query), ["mic=NotAllowedError"])
     }
 
-    func test_linksToOtherSitesAndNewWindows_openInTheBrowser_andTheRecapStays() async {
+    func test_linksToOtherSitesNewWindowsAndMail_openOutside_andTheRecapStays() async {
         let controller = recap()
         await openedRecap(controller)
 
@@ -445,25 +577,81 @@ final class RecapWindowTests: XCTestCase {
         await waitUntil { opened.count == 1 }
         _ = try? await controller.webView?.evaluateJavaScript("window.open('\(page(otherMeeting).absoluteString)', '_blank'); 1")
         await waitUntil { opened.count == 2 }
+        _ = try? await controller.webView?.evaluateJavaScript("location.href = 'mailto:owner@example.com'; 1")
+        await waitUntil { opened.count == 3 }
         _ = try? await controller.webView?.evaluateJavaScript("location.href = 'javascript:document.title=1'; 1")
         try? await Task.sleep(nanoseconds: 300_000_000)
 
-        XCTAssertEqual(opened.map(\.absoluteString), ["https://github.com/shiprite-dev", page(otherMeeting).absoluteString])
+        XCTAssertEqual(opened.map(\.absoluteString), ["https://github.com/shiprite-dev", page(otherMeeting).absoluteString, "mailto:owner@example.com"])
         XCTAssertEqual(controller.webView?.url?.path, fake.meetingPath(meetingId))
         let text = await pageText(controller)
         XCTAssertEqual(text, "Recap for Weekly sync")
     }
 
+    func test_aServerRedirectToAnotherSite_opensInTheBrowser_andNeverLoadsInTheWindow() async {
+        let away = elsewhere.base.appendingPathComponent("away").absoluteString
+        fake.answerMeetings(.respond(status: 302, headers: ["Location": away], body: ""))
+        let controller = recap()
+        await controller.show(meetingId: meetingId, seriesId: fake.seriesId, title: "Weekly sync").value
+
+        await waitUntil { opened.count == 1 }
+        XCTAssertEqual(opened.map(\.absoluteString), [away])
+        XCTAssertEqual(elsewhere.server.requests.count, 0)
+    }
+
+    func test_aFrameFromAnotherSiteIsBlocked_andAFrameFromTheSameServerLoads() async {
+        fake.addToMeetingPage("<iframe src=\"\(elsewhere.base.absoluteString)/frame\"></iframe><iframe src=\"/frame-same\"></iframe>")
+        let controller = recap()
+        await openedRecap(controller)
+
+        await waitUntil { fake.server.requests("/frame-same").count == 1 }
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(elsewhere.server.requests.count, 0)
+        XCTAssertEqual(opened, [])
+    }
+
+    // MARK: - Web data removal
+
+    func test_aRemovalThatFails_isRetriedAtTheNextLaunch() async {
+        let stuck = UUID()
+        let first = StoreDouble([stuck])
+        first.failing = [stuck]
+        await recap(stores: first.stores).forgetWebSessions()
+        XCTAssertEqual(first.ids, [stuck])
+
+        let nextLaunch = StoreDouble([])
+        await recap(stores: nextLaunch.stores).pruneStores(keeping: nil)
+
+        XCTAssertEqual(nextLaunch.removed, [stuck])
+    }
+
     // MARK: - Through the app
 
-    private func signedInApp() async throws -> AppController {
+    private func app(stores: RecapStores = .webKit) -> AppController {
         let app = AppController(
-            defaults: UserDefaults(suiteName: suite)!, openURL: { [weak self] in self?.opened.append($0) }, micCheck: { (.authorized, true) },
-            reviewClock: clock.review, windowPresence: presence)
+            defaults: defaults, openURL: { [weak self] in self?.opened.append($0) }, micCheck: { (.authorized, true) },
+            reviewClock: clock.review, windowPresence: presence, recapStores: stores)
         apps.append(app)
+        return app
+    }
+
+    private func signedInApp(stores: RecapStores = .webKit) async throws -> AppController {
+        let app = app(stores: stores)
         await app.authManager.adopt(testSupabase(fake.base), instance: fake.base)
         try await app.authManager.signIn(email: "first@example.com", password: "pw")
         return app
+    }
+
+    private var signedInStore: UUID {
+        NSUUID(uuidBytes: Array(SHA256.hash(data: Data("\(fake.base.absoluteString)|\(signedInUser)".utf8)))) as UUID
+    }
+
+    private func storeGone(_ store: UUID) async -> Bool {
+        for _ in 0..<100 {
+            if await !WKWebsiteDataStore.allDataStoreIdentifiers.contains(store) { return true }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return false
     }
 
     func test_openRecap_fromThePanel_opensTheSignedInWindow() async throws {
@@ -488,23 +676,64 @@ final class RecapWindowTests: XCTestCase {
         await waitUntil { app.recapWindow.window == nil }
     }
 
+    func test_openingTheRecapOffline_withAnExpiredMacSession_saysYoureOffline_andOpensNoBrowser() async throws {
+        fake.signInReturns(AuthServerStub.expiredSessionBody)
+        let app = try await signedInApp()
+        fake.server.stop()
+
+        await app.recapWindow.show(meetingId: meetingId, seriesId: fake.seriesId, title: "Weekly sync").value
+
+        await waitUntil { app.recapWindow.screen == .offline }
+        XCTAssertEqual(opened, [])
+        let seen = onScreen(app.recapWindow)
+        XCTAssertTrue(seen.has("You're offline"), seen.text)
+    }
+
     func test_signingOutOnTheMac_closesTheWindow_andErasesItsWebData() async throws {
         let app = try await signedInApp()
         app.openRecap(meetingId)
         await waitUntil { app.recapWindow.screen == .page }
-        let digest = Array(SHA256.hash(data: Data("\(fake.base.absoluteString)|\(signedInUser)".utf8)))
-        let store = NSUUID(uuidBytes: digest) as UUID
         let before = await WKWebsiteDataStore.allDataStoreIdentifiers
-        XCTAssertTrue(before.contains(store))
+        XCTAssertTrue(before.contains(signedInStore))
 
         await app.authManager.signOut()
 
         await waitUntil { app.recapWindow.window == nil }
-        var after = await WKWebsiteDataStore.allDataStoreIdentifiers
-        for _ in 0..<100 where after.contains(store) {
-            try? await Task.sleep(nanoseconds: 50_000_000)
-            after = await WKWebsiteDataStore.allDataStoreIdentifiers
-        }
-        XCTAssertFalse(after.contains(store))
+        let gone = await storeGone(signedInStore)
+        XCTAssertTrue(gone)
+    }
+
+    func test_switchingTheMacToAnotherServer_closesTheWindow_andErasesItsWebData() async throws {
+        let app = try await signedInApp()
+        app.openRecap(meetingId)
+        await waitUntil { app.recapWindow.screen == .page }
+
+        await app.authManager.adopt(testSupabase(elsewhere.base), instance: elsewhere.base)
+
+        await waitUntil { app.recapWindow.window == nil }
+        let gone = await storeGone(signedInStore)
+        XCTAssertTrue(gone)
+    }
+
+    func test_launchingSignedOut_erasesEveryRecapWebStore() async {
+        let leftovers = StoreDouble([UUID(), UUID()])
+        let all = leftovers.ids
+        let app = app(stores: leftovers.stores)
+        await app.authManager.adopt(testSupabase(fake.base), instance: fake.base)
+
+        await app.restoreSession()
+
+        XCTAssertEqual(Set(leftovers.removed), Set(all))
+    }
+
+    func test_launchingSignedIn_keepsThisAccountsWebStore_andErasesTheRest() async throws {
+        let stale = UUID()
+        let stores = StoreDouble([signedInStore, stale])
+        let app = try await signedInApp(stores: stores.stores)
+
+        await app.restoreSession()
+
+        XCTAssertEqual(stores.removed, [stale])
+        XCTAssertEqual(stores.ids, [signedInStore])
     }
 }

@@ -6,10 +6,11 @@ import WebKit
 enum RecapNavigation: Equatable {
     case allow, openInBrowser, deny
 
-    static func decide(url: URL, instance: URL, isMainFrame: Bool, isDownload: Bool) -> RecapNavigation {
-        if isDownload { return .openInBrowser }
-        guard ["http", "https"].contains(url.scheme?.lowercased() ?? "") else { return .deny }
-        return isMainFrame && origin(url) == origin(instance) ? .allow : .openInBrowser
+    static func decide(url: URL, instance: URL, isNewWindow: Bool, isDownload: Bool) -> RecapNavigation {
+        let scheme = url.scheme?.lowercased() ?? ""
+        if isDownload || scheme == "mailto" { return .openInBrowser }
+        guard ["http", "https"].contains(scheme) else { return .deny }
+        return !isNewWindow && origin(url) == origin(instance) ? .allow : .openInBrowser
     }
 
     static func origin(_ url: URL) -> String {
@@ -21,13 +22,33 @@ enum RecapNavigation: Equatable {
 
 enum RecapScreen: Equatable {
     case loading, slow, offline, insecure, page
+
+    var announcement: String? {
+        switch self {
+        case .slow: ReviewCopy.windowSlow
+        case .offline: ReviewCopy.windowOffline
+        case .insecure: ReviewCopy.windowCert
+        case .loading, .page: nil
+        }
+    }
 }
 
-/// The one Minutia window that shows a meeting's web page, signed in with a one-time handoff into a
-/// web data store of its own per server and account. The Mac's own session never enters it.
+struct RecapStores {
+    var all: @MainActor () async -> [UUID]
+    var remove: @MainActor (UUID) async throws -> Void
+
+    static let webKit = RecapStores(
+        all: { await WKWebsiteDataStore.allDataStoreIdentifiers },
+        remove: { try await WKWebsiteDataStore.remove(forIdentifier: $0) })
+}
+
+/// The one Minutia window that shows a meeting's web page. Each time the window opens it signs in
+/// with a fresh one-time handoff into a web data store of its own per server and account, so it is
+/// always the Mac's account; the Mac's own session never enters it.
 @MainActor
 final class RecapWindowController: NSObject, ObservableObject {
     typealias Account = (client: MinutiaClient, userId: String?)
+    private struct Handoff { let id: String, nonce: String, minted: Date }
 
     @Published private(set) var screen = RecapScreen.loading
     @Published private(set) var title = ""
@@ -40,14 +61,22 @@ final class RecapWindowController: NSObject, ObservableObject {
     private let copy: (String) -> Void
     private let clock: ReviewClock
     private let presence: WindowPresence
+    private let defaults: UserDefaults
+    private let stores: RecapStores
+    private let announce: (String) -> Void
     private let onSignedOut: () -> Void
     private var current: (meetingId: UUID, page: URL, next: String, client: MinutiaClient)?
-    private var handoffTried = false
-    private var handoff: Task<Void, Never>?
+    private var signedIn = false
+    private var generation = 0
+    private var epoch = 0
+    private var minting: Task<Result<Handoff, Error>, Never>?
+    private var unused: Handoff?
     private var slow: Task<Void, Never>?
 
     private static let presenceId = "recap"
     private static let frameName = "MinutiaRecap"
+    private static let removalKey = "recap.storesToRemove"
+    private static let handoffReuse: TimeInterval = 9 * 60
     private static let offline: Set<URLError.Code> = [
         .notConnectedToInternet, .networkConnectionLost, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
         .timedOut, .dataNotAllowed, .internationalRoamingOff,
@@ -62,6 +91,9 @@ final class RecapWindowController: NSObject, ObservableObject {
         },
         clock: ReviewClock = .live,
         presence: WindowPresence = .shared,
+        defaults: UserDefaults = .standard,
+        stores: RecapStores = .webKit,
+        announce: @escaping (String) -> Void = { AccessibilityNotification.Announcement($0).post() },
         onSignedOut: @escaping () -> Void = {}
     ) {
         self.account = account
@@ -69,6 +101,9 @@ final class RecapWindowController: NSObject, ObservableObject {
         self.copy = copy
         self.clock = clock
         self.presence = presence
+        self.defaults = defaults
+        self.stores = stores
+        self.announce = announce
         self.onSignedOut = onSignedOut
         super.init()
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -97,20 +132,21 @@ final class RecapWindowController: NSObject, ObservableObject {
         }
     }
 
-    /// Closes the window and erases every web data store, so a sign-out or a server switch leaves
-    /// no web session behind.
+    /// Closes the window and erases every recap web data store, so a sign-out or a server switch
+    /// leaves no web session behind. Stores WebKit cannot remove yet are retried at the next launch.
     func forgetWebSessions() async {
         window?.close()
-        for id in await WKWebsiteDataStore.allDataStoreIdentifiers {
-            for _ in 0..<20 {
-                do {
-                    try await WKWebsiteDataStore.remove(forIdentifier: id)
-                    break
-                } catch {
-                    try? await Task.sleep(nanoseconds: 100_000_000)
-                }
-            }
-        }
+        epoch += 1
+        minting?.cancel()
+        minting = nil
+        unused = nil
+        await remove(await stores.all())
+    }
+
+    /// At launch: erase every recap web data store except the signed-in account's, plus any whose
+    /// removal failed before.
+    func pruneStores(keeping current: UUID?) async {
+        await remove(await stores.all().filter { $0 != current })
     }
 
     func tryAgain() { Task { await load() } }
@@ -133,12 +169,28 @@ final class RecapWindowController: NSObject, ObservableObject {
         if window != nil { tryAgain() }
     }
 
+    private func remove(_ ids: [UUID]) async {
+        var pending = Set((defaults.stringArray(forKey: Self.removalKey) ?? []).compactMap(UUID.init(uuidString:)) + ids)
+        defaults.set(pending.map(\.uuidString), forKey: Self.removalKey)
+        for id in pending {
+            for attempt in 0..<10 {
+                if (try? await stores.remove(id)) != nil {
+                    pending.remove(id)
+                    break
+                }
+                if attempt < 9 { try? await Task.sleep(nanoseconds: 100_000_000) }
+            }
+        }
+        defaults.set(pending.map(\.uuidString), forKey: Self.removalKey)
+    }
+
     private func focus(_ window: NSWindow) {
         presence.opened(Self.presenceId)
         window.makeKeyAndOrderFront(nil)
     }
 
     private func setScreen(_ screen: RecapScreen) {
+        if let line = screen.announcement { announce(line) }
         self.screen = screen
         webView?.isHidden = screen != .page
         overlay?.isHidden = screen == .page
@@ -147,48 +199,71 @@ final class RecapWindowController: NSObject, ObservableObject {
 
     private func load() async {
         guard let current, let webView else { return }
-        handoff?.cancel()
-        handoff = nil
-        handoffTried = false
+        generation += 1
+        let mine = generation
         setScreen(.loading)
         slow?.cancel()
         slow = Task { [clock] in
             await clock.sleep(8)
-            if !Task.isCancelled, screen == .loading { setScreen(.slow) }
+            if !Task.isCancelled, mine == generation, screen == .loading { setScreen(.slow) }
         }
-        let cookies = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
-        guard self.current?.page == current.page, self.webView === webView else { return }
-        if cookies.isEmpty { mint() } else { webView.load(URLRequest(url: current.page)) }
+        guard !signedIn else {
+            webView.load(URLRequest(url: current.page))
+            return
+        }
+        let minted = await handoff(current.client)
+        guard mine == generation, self.webView === webView else { return }
+        switch minted {
+        case .success(let handoff):
+            webView.load(MinutiaClient.companionSessionRequest(
+                instance: current.client.instance, handoffId: handoff.id, nonce: handoff.nonce, next: current.next))
+        case .failure(MinutiaClientError.serverError(status: 404)):
+            window?.close()
+            openURL(current.page)
+        case .failure(let error as URLError) where Self.offline.contains(error.code):
+            setScreen(.offline)
+        case .failure(let error):
+            if error as? MinutiaClientError == .signedOut { onSignedOut() }
+            signedIn = true
+            webView.load(URLRequest(url: current.page))
+        }
     }
 
-    private func mint() {
-        guard handoff == nil, let current else { return }
-        handoffTried = true
-        handoff = Task {
+    /// One mint at a time: every attempt while one is pending waits for it, and a handoff minted but
+    /// not yet used (its window closed, or a newer attempt took over) is reused while still valid.
+    private func handoff(_ client: MinutiaClient) async -> Result<Handoff, Error> {
+        if let unused, clock.now().timeIntervalSince(unused.minted) < Self.handoffReuse { return .success(unused) }
+        let epoch = epoch
+        let task = minting ?? Task { [clock] in
             let (nonce, digest) = MinutiaClient.makeHandoffNonce()
-            let result: Result<String, Error>
-            do { result = .success(try await current.client.webSessionHandoff(nonceDigest: digest)) } catch { result = .failure(error) }
-            guard !Task.isCancelled else { return }
-            handoff = nil
-            switch result {
-            case .success(let id):
-                webView?.load(MinutiaClient.companionSessionRequest(
-                    instance: current.client.instance, handoffId: id, nonce: nonce, next: current.next))
-            case .failure(MinutiaClientError.serverError(status: 404)):
-                window?.close()
-                openURL(current.page)
-            case .failure(let error as URLError) where Self.offline.contains(error.code):
-                setScreen(.offline)
-            case .failure(let error):
-                if error as? MinutiaClientError == .signedOut { onSignedOut() }
-                webView?.load(URLRequest(url: current.page))
+            do {
+                return .success(Handoff(id: try await client.webSessionHandoff(nonceDigest: digest), nonce: nonce, minted: clock.now()))
+            } catch {
+                return .failure(error)
             }
         }
+        minting = task
+        let result = await task.value
+        guard epoch == self.epoch else { return .failure(CancellationError()) }
+        if minting == task { minting = nil }
+        if case .success(let handoff) = result { unused = handoff }
+        return result
     }
 
     private func openOutside(_ url: URL) {
         guard let current else { return }
-        openURL(["http", "https"].contains(url.scheme?.lowercased() ?? "") ? url : current.page)
+        openURL(["http", "https", "mailto"].contains(url.scheme?.lowercased() ?? "") ? url : current.page)
+    }
+
+    private func shortcut(_ event: NSEvent) -> Bool {
+        switch (event.modifierFlags.intersection(.deviceIndependentFlagsMask), event.charactersIgnoringModifiers?.lowercased()) {
+        case (.command, "w"): window?.performClose(nil)
+        case (.command, "["): goBack()
+        case (.command, "r"): reload()
+        case ([.command, .shift], "c"): copyLink()
+        default: return false
+        }
+        return true
     }
 
     private func makeWindow(store: WKWebsiteDataStore) -> NSWindow {
@@ -212,6 +287,7 @@ final class RecapWindowController: NSObject, ObservableObject {
         let window = RecapWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1040, height: 760),
             styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window.shortcut = { [weak self] in self?.shortcut($0) ?? false }
         window.isReleasedWhenClosed = false
         window.minSize = NSSize(width: 520, height: 400)
         window.contentView = content
@@ -226,24 +302,23 @@ final class RecapWindowController: NSObject, ObservableObject {
         self.window = window
         self.webView = webView
         self.overlay = overlay
+        signedIn = false
         return window
     }
 }
 
+/// Handles the window's own shortcuts: a menu-bar app may have no File or View menu to carry them.
 private final class RecapWindow: NSWindow {
+    var shortcut: (NSEvent) -> Bool = { _ in false }
+
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command, event.charactersIgnoringModifiers == "w" {
-            performClose(nil)
-            return true
-        }
-        return super.performKeyEquivalent(with: event)
+        shortcut(event) || super.performKeyEquivalent(with: event)
     }
 }
 
 extension RecapWindowController: NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
-        handoff?.cancel()
-        handoff = nil
+        generation += 1
         slow?.cancel()
         webView?.navigationDelegate = nil
         webView?.uiDelegate = nil
@@ -260,15 +335,12 @@ extension RecapWindowController: NSWindowDelegate {
 extension RecapWindowController: WKNavigationDelegate, WKUIDelegate {
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction) async -> WKNavigationActionPolicy {
         guard let current, let url = action.request.url else { return .cancel }
-        let mainFrame = action.targetFrame?.isMainFrame ?? true
+        let subframe = action.targetFrame.map { !$0.isMainFrame } ?? false
         switch RecapNavigation.decide(
-            url: url, instance: current.client.instance, isMainFrame: action.targetFrame != nil, isDownload: action.shouldPerformDownload) {
-        case .allow where mainFrame && url.path == "/login" && !handoffTried && screen != .page:
-            mint()
-            return .cancel
+            url: url, instance: current.client.instance, isNewWindow: action.targetFrame == nil, isDownload: action.shouldPerformDownload) {
         case .allow:
             return .allow
-        case .openInBrowser where mainFrame:
+        case .openInBrowser where !subframe:
             openOutside(url)
             return .cancel
         default:
@@ -283,8 +355,19 @@ extension RecapWindowController: WKNavigationDelegate, WKUIDelegate {
         return .cancel
     }
 
+    /// The server answered the sign-in post: the handoff is spent and the window is signed in.
+    func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) {
+        signedInByServer()
+    }
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        signedInByServer()
         setScreen(.page)
+    }
+
+    private func signedInByServer() {
+        unused = nil
+        signedIn = true
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -310,8 +393,8 @@ extension RecapWindowController: WKNavigationDelegate, WKUIDelegate {
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
         if let url = action.request.url, let current,
-           RecapNavigation.decide(url: url, instance: current.client.instance, isMainFrame: false, isDownload: false) == .openInBrowser {
-            openURL(url)
+           RecapNavigation.decide(url: url, instance: current.client.instance, isNewWindow: true, isDownload: false) == .openInBrowser {
+            openOutside(url)
         }
         return nil
     }
