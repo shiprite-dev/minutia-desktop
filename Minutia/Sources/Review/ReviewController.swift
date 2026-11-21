@@ -172,6 +172,7 @@ final class ReviewController: ObservableObject {
 
     /// An explicit sign-out: whoever signs in next starts with a quiet first queue load.
     func forgetPosted() {
+        generation += 1
         defaults.removeObject(forKey: Self.notifiedKey)
         defaults.removeObject(forKey: Self.accountKey)
         postedHere = []

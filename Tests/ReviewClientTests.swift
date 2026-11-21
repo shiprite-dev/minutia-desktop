@@ -71,6 +71,8 @@ final class ReviewClientTests: XCTestCase {
     private func authorizations() -> [String?] { ReviewStub.seen.map { $0.value(forHTTPHeaderField: "Authorization") } }
 
     private let notSignedIn = "{\"error\":\"Not authenticated\",\"code\":\"not_signed_in\",\"request_id\":\"8c1c2f3e-6a52-4f55-9d0b-0d1f7d9f9c11\"}"
+    private let notAuthenticated = "{\"error\":\"Not authenticated\"}"
+    private let notAuthenticatedWithRequest = "{\"error\":\"Not authenticated\",\"request_id\":\"8c1c2f3e-6a52-4f55-9d0b-0d1f7d9f9c11\"}"
     private let staleToken = "{\"error\":\"Sign in again to open this meeting.\",\"code\":\"stale_token\"}"
     private func body(_ index: Int = 0) -> [String: Any]? {
         try? JSONSerialization.jsonObject(with: ReviewStub.seenBodies[index]) as? [String: Any]
@@ -159,7 +161,7 @@ final class ReviewClientTests: XCTestCase {
     }
 
     func test_queueWhileSignedOut_saysSignedOut() async {
-        respond(401, "{}")
+        respond(401, notAuthenticated)
         do {
             _ = try await client().reviewQueue(meetingId: nil)
             XCTFail("expected signedOut")
@@ -280,7 +282,7 @@ final class ReviewClientTests: XCTestCase {
     }
 
     func test_regenerateWhileSignedOut_saysSignedOut() async {
-        respond(401, notSignedIn)
+        respond(401, notAuthenticatedWithRequest)
         do {
             try await client().regenerateSuggestions(meetingId: meeting)
             XCTFail("expected throw")
@@ -338,7 +340,7 @@ final class ReviewClientTests: XCTestCase {
     }
 
     func test_handoffNotSignedIn_saysSignedOutWithoutRefreshing() async {
-        respond(401, notSignedIn)
+        respond(401, notAuthenticated)
         let refreshes = Refreshes()
         do {
             _ = try await client(refreshes: refreshes).webSessionHandoff(nonceDigest: "x")

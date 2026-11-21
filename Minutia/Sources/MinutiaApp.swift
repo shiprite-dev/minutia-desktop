@@ -19,11 +19,7 @@ struct MinutiaApp: App {
             MenuContent(controller: controller, updater: updater)
                 .task { await controller.restoreSession() }
         } label: {
-            MenuBarIcon(
-                phase: controller.phase,
-                softHint: controller.softHint,
-                pendingConsent: controller.pendingRecordConsent != nil,
-                reviewDot: controller.review.hasDot)
+            controller.menuBarIcon
         }
         .menuBarExtraStyle(.window)
 
@@ -344,6 +340,11 @@ final class AppController: NSObject, ObservableObject {
         review.setPanelOpen(false)
     }
     var announce: (String) -> Void = { AccessibilityNotification.Announcement($0).post() }
+
+    var menuBarIcon: MenuBarIcon {
+        MenuBarIcon(phase: phase, softHint: softHint, pendingConsent: pendingRecordConsent != nil, reviewDot: review.hasDot)
+    }
+
     /// Opens a meeting's recap from the review panel.
     var openRecap: (UUID) -> Void = { _ in }
     let review: ReviewController
@@ -1724,9 +1725,9 @@ final class AppController: NSObject, ObservableObject {
         pendingRecordConsent = nil
     }
 
-    /// Registers the web-record consent notification category. (Local meeting detection now surfaces
-    /// through the floating prompt and the in-menu banner, not a notification.)
-    private static func registerNotificationCategories() {
+    /// The notification categories: web-record consent, recording started, and review. (Local meeting
+    /// detection surfaces through the floating prompt and the in-menu banner, not a notification.)
+    static var notificationCategories: Set<UNNotificationCategory> {
         let confirm = UNNotificationAction(
             identifier: confirmWebRecordActionId, title: "Start recording", options: [.foreground])
         let dismiss = UNNotificationAction(
@@ -1750,7 +1751,11 @@ final class AppController: NSObject, ObservableObject {
             identifier: reviewCategoryId,
             actions: [UNNotificationAction(identifier: reviewActionId, title: "Review", options: [.foreground])],
             intentIdentifiers: [], options: [])
-        UNUserNotificationCenter.current().setNotificationCategories([webRecord, webStart, recordingStarted, review])
+        return [webRecord, webStart, recordingStarted, review]
+    }
+
+    private static func registerNotificationCategories() {
+        UNUserNotificationCenter.current().setNotificationCategories(notificationCategories)
     }
 
     private static func postNotification(title: String, body: String) {

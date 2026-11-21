@@ -443,19 +443,20 @@ final class ReviewModelTests: XCTestCase {
         XCTAssertFalse(after.selection.contains(after.newRows[2].id))
     }
 
-    func test_manyRerunsInARow_aliasesAreDroppedOnceNothingIsInFlight() {
+    func test_manyRerunsInARow_aLateSaveStillLandsOnTheVisibleRow() {
         var m = ReviewModel.from(meeting(rows: [row("Ship it")]), now: now, previous: nil)
+        let pressed = m.newRows[0].id
+        m.rowState[pressed] = .saving
         for n in 1...5 {
             m = ReviewModel.from(meeting(statusAgo: TimeInterval(600 - n), rows: [row("Ship it")]), now: now, previous: m)
         }
-        XCTAssertEqual(m.aliases.count, 0)
-        m.rowState[m.newRows[0].id] = .saving
-        let before = m.newRows[0].id
-        m = ReviewModel.from(meeting(statusAgo: 100, rows: [row("Ship it")]), now: now, previous: m)
-        XCTAssertEqual(m.aliases.count, 1)
-        m.apply(.saved, to: before)
-        m = ReviewModel.from(meeting(statusAgo: 50, rows: []), now: now, previous: m)
-        XCTAssertEqual(m.aliases.count, 0)
+        XCTAssertEqual(m.newRows.map(\.title), ["Ship it"])
+        XCTAssertEqual(ReviewController.note(m.rowState[m.newRows[0].id] ?? .idle), "Saving")
+
+        m.apply(.saved, to: pressed)
+
+        XCTAssertEqual(ReviewController.note(m.rowState[m.newRows[0].id] ?? .idle), "Kept")
+        XCTAssertEqual(m.screen.message, "1 item tracked")
     }
 
     func test_plainRefresh_rowsReviewedOnTheWebJustVanishWithoutAListUpdatedNote() {

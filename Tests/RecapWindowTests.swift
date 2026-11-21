@@ -51,7 +51,7 @@ final class FakeMinutia: @unchecked Sendable {
                 digests.append(digest)
                 let reply: LocalWebServer.Reply = switch mintStatus {
                 case 200: .respond(status: 200, headers: json, body: "{\"handoff_id\":\"handoff-\(digests.count)\"}")
-                case 401: .respond(status: 401, headers: json, body: "{\"error\":\"Not authenticated\",\"code\":\"not_signed_in\"}")
+                case 401: .respond(status: 401, headers: json, body: "{\"error\":\"Not authenticated\"}")
                 default: .respond(status: mintStatus, headers: json, body: "{\"error\":\"refused\"}")
                 }
                 return mintDelay > 0 ? .delayed(mintDelay, reply) : reply
@@ -655,6 +655,20 @@ final class RecapWindowTests: XCTestCase {
         XCTAssertEqual(policies, [])
     }
 
+    func test_recapWindow_remembersItsSizeAndPosition() async {
+        defer { UserDefaults.standard.removeObject(forKey: "NSWindow Frame MinutiaRecap") }
+        let controller = recap()
+        await openedRecap(controller)
+        let frame = NSRect(x: 180, y: 140, width: 900, height: 640)
+        controller.window?.setFrame(frame, display: false)
+        controller.window?.performClose(nil)
+        await waitUntil { controller.window == nil }
+
+        let reopened = recap()
+        await openedRecap(reopened)
+        XCTAssertEqual(reopened.window?.frame, frame)
+    }
+
     func test_wakingFromSleep_reloadsTheMeeting() async {
         let controller = recap()
         await openedRecap(controller)
@@ -727,6 +741,11 @@ final class RecapWindowTests: XCTestCase {
         XCTAssertFalse(seen.hasLine("Keep 1"))
         XCTAssertFalse(seen.hasLine("Taking longer"))
         XCTAssertTrue(seen.hasLine("Taking longer than usual"))
+        let screen = Seen(text: "", frames: [("Weekly sync", CGRect(x: 0.1, y: 0.8, width: 0.3, height: 0.05)), ("Not available", CGRect(x: 0.1, y: 0.5, width: 0.3, height: 0.05))])
+        XCTAssertTrue(screen.reads(["Weekly sync", "Not available"]))
+        XCTAssertFalse(screen.reads(["Weekly sync", "available"]), "an extra word is not the same screen")
+        XCTAssertFalse(screen.reads(["Weekly sync"]), "a missing line is not the same screen")
+        XCTAssertFalse(screen.reads(["Not available", "Weekly sync"]), "order counts")
     }
 
     func test_launchPruning_leavesDataStoresTheAppDidNotMake() async {
@@ -815,6 +834,21 @@ final class RecapWindowTests: XCTestCase {
         XCTAssertEqual(opened, [])
         let seen = onScreen(app.recapWindow)
         XCTAssertTrue(seen.hasLine("You're offline"), seen.text)
+    }
+
+    func test_webSessionExpiresWhileReading_reloadShowsSignIn_macStaysSignedIn() async throws {
+        let app = try await signedInApp()
+        app.openRecap(meetingId)
+        await waitUntil { app.recapWindow.screen == .page }
+
+        fake.expireWebSessions()
+        press("r", .command, in: app.recapWindow.window)
+
+        await waitUntil { app.recapWindow.webView?.url?.path == "/login" && app.recapWindow.webView?.isLoading == false }
+        let text = await pageText(app.recapWindow)
+        XCTAssertEqual(text, "Sign in to Minutia")
+        XCTAssertEqual(app.authManager.userEmail, "first@example.com", "the Mac stays signed in")
+        XCTAssertNotNil(app.recapWindow.window, "the window stays open")
     }
 
     func test_signingOutOnTheMac_closesTheWindow_andErasesItsWebData() async throws {

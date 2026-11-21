@@ -351,6 +351,7 @@ private struct ReviewBadge: View {
     enum Kind { case check, dash, bang }
     let kind: Kind
     @Environment(\.motionReduced) private var reduceMotion
+    @Environment(\.checkElapsed) private var elapsed
     @State private var drawn = false
 
     var body: some View {
@@ -358,7 +359,7 @@ private struct ReviewBadge: View {
             Circle().fill(fill)
             switch kind {
             case .check:
-                CheckShape().trim(from: 0, to: drawn || reduceMotion ? 1 : 0)
+                CheckShape().trim(from: 0, to: reduceMotion || drawn ? 1 : elapsed.map(CheckReveal.progress) ?? 0)
                     .stroke(Brand.ok, style: StrokeStyle(lineWidth: 2.2, lineCap: .round, lineJoin: .round))
                     .frame(width: 20, height: 20)
             case .dash: Image(systemName: "minus").font(.system(size: 16, weight: .bold)).foregroundStyle(Brand.ink3)
@@ -368,7 +369,7 @@ private struct ReviewBadge: View {
         .frame(width: 38, height: 38)
         .accessibilityHidden(true)
         .onAppear {
-            guard !reduceMotion else { return }
+            guard !reduceMotion, elapsed == nil else { return }
             withAnimation(.easeOut(duration: CheckReveal.drawDuration).delay(CheckReveal.delay)) { drawn = true }
         }
     }

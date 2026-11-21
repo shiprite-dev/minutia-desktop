@@ -212,6 +212,12 @@ struct Seen {
         return !needle.isEmpty && frames.contains { Self.tokens($0.0) == needle }
     }
 
+    /// True only when the whole screen reads `expected`, top to bottom and left to right, and nothing else.
+    func reads(_ expected: [String]) -> Bool {
+        let ordered = frames.sorted { abs($0.1.midY - $1.1.midY) > 0.02 ? $0.1.midY > $1.1.midY : $0.1.minX < $1.1.minX }
+        return Self.tokens(ordered.map(\.0).joined(separator: " ")) == Self.tokens(expected.joined(separator: " "))
+    }
+
     func frame(of expected: String) -> CGRect? { frames(of: expected).first }
 
     func frames(of expected: String) -> [CGRect] {
