@@ -45,7 +45,7 @@ final class NotepadPanel {
         let panel = panel ?? makePanel()
         self.panel = panel
         panel.alphaValue = 1
-        presence.opened("notes", activate: focus)
+        presence.joined("notes")
         if focus {
             panel.makeKeyAndOrderFront(nil)
         } else {

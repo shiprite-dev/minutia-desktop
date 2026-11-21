@@ -18,12 +18,15 @@ final class WindowPresence {
         self.activate = activate
     }
 
-    /// `activate: false` keeps a window that must not steal focus (the notes panel during a call)
-    /// from pulling the app in front.
-    func opened(_ id: String, activate: Bool = true) {
+    func opened(_ id: String) {
         if open.isEmpty { setPolicy(.regular) }
         open.insert(id)
-        if activate { self.activate() }
+        activate()
+    }
+
+    /// A window that may keep an existing Dock icon but never brings one up (the notes panel during a call).
+    func joined(_ id: String) {
+        if !open.isEmpty { open.insert(id) }
     }
 
     func closed(_ id: String) {

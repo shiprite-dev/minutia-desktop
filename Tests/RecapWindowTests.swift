@@ -570,11 +570,11 @@ final class RecapWindowTests: XCTestCase {
         XCTAssertEqual(policies, [.regular, .accessory])
     }
 
-    func test_theDockIconStays_whileTheNotesWindowIsOpenAndTheRecapCloses() async {
+    func test_theDockIconStays_whileTheNotesWindowOpenedAfterTheRecapIsStillOpen() async {
         let notes = NotepadPanel(presence: presence) { NSView() }
         let controller = recap()
-        notes.show(focus: false)
         await openedRecap(controller)
+        notes.show(focus: false)
 
         controller.window?.performClose(nil)
         await waitUntil { controller.window == nil }
@@ -582,6 +582,19 @@ final class RecapWindowTests: XCTestCase {
 
         notes.hide()
         XCTAssertEqual(policies, [.regular, .accessory])
+    }
+
+    func test_recordingWithOnlyTheNotesWindow_neverGivesADockIcon() {
+        let notes = NotepadPanel(presence: presence) { NSView() }
+
+        notes.show(focus: false)
+        notes.show(focus: true)
+        notes.hide()
+        notes.show(focus: false)
+
+        XCTAssertEqual(policies, [], "the notes window never turns the menu-bar app into a Dock app")
+        notes.hide()
+        XCTAssertEqual(policies, [])
     }
 
     func test_wakingFromSleep_reloadsTheMeeting() async {
