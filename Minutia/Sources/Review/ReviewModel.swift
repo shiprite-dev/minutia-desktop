@@ -67,16 +67,17 @@ struct ReviewModel: Equatable {
         return collapsed.replacingOccurrences(of: #"[\p{P}\s]+$"#, with: "", options: .regularExpression)
     }
 
-    static func from(_ meeting: ReviewMeeting, now: Date, previous: ReviewModel?) -> ReviewModel {
+    /// `transcribingSince` is when transcription last started: the meeting's end, or a later Try again.
+    static func from(_ meeting: ReviewMeeting, now: Date, previous: ReviewModel?, transcribingSince: Date? = nil) -> ReviewModel {
         let previous = previous.flatMap { $0.meetingId == meeting.meetingId ? $0 : nil }
-        var model = screen(for: meeting, now: now, previous: previous)
+        var model = screen(for: meeting, now: now, previous: previous, transcribingSince: transcribingSince)
         model.meetingId = meeting.meetingId
         model.statusAt = meeting.statusAt
         return model
     }
 
-    private static func screen(for meeting: ReviewMeeting, now: Date, previous: ReviewModel?) -> ReviewModel {
-        let transcribingFor = meeting.endedAt.map { now.timeIntervalSince($0) } ?? 0
+    private static func screen(for meeting: ReviewMeeting, now: Date, previous: ReviewModel?, transcribingSince: Date?) -> ReviewModel {
+        let transcribingFor = (transcribingSince ?? meeting.endedAt).map { now.timeIntervalSince($0) } ?? 0
         let findingFor = meeting.statusAt.map { now.timeIntervalSince($0) } ?? 0
         switch (meeting.transcriptionStatus, meeting.suggestionsStatus, meeting.suggestionsReason) {
         case ("failed", _, _):
@@ -101,8 +102,8 @@ struct ReviewModel: Equatable {
         }
     }
 
-    private static func ready(_ meeting: ReviewMeeting, previous: ReviewModel?) -> ReviewModel {
-        let previous = previous.map { settlingLostAnswers($0, pending: meeting.rows) }
+    private static func ready(_ meeting: ReviewMeeting, previous original: ReviewModel?) -> ReviewModel {
+        let previous = original.map { settlingLostAnswers($0, pending: meeting.rows) }
         let carried = (previous?.newRows ?? []) + (previous?.updateRows ?? [])
         let resolved = carried.filter { (previous?.rowState[$0.id] ?? .idle).isResolved }
         let resolvedIds = Set(resolved.map(\.id))
@@ -152,7 +153,7 @@ struct ReviewModel: Equatable {
             let vanished = unresolved.contains { !present.contains(normalizedTitle($0.title)) }
             model.listUpdated = rerun ? vanished : previous.listUpdated
         }
-        model.settle()
+        if original?.screen != .ready || previous != original { model.settle() }
         return model
     }
 
@@ -177,7 +178,8 @@ struct ReviewModel: Equatable {
         case .saved: rowState[id] = .saved
         case .alreadyReviewed, .cannotKeepDuplicate: rowState[id] = .gone(.alreadyReviewed)
         case .alreadyInState: rowState[id] = .gone(.alreadyDone)
-        case .suggestionGone, .itemGone: rowState[id] = .gone(.itemRemoved)
+        case .suggestionGone: rowState[id] = .gone(.listUpdated)
+        case .itemGone: rowState[id] = .gone(.itemRemoved)
         case .notReviewer, .notAMember:
             readOnly = true
             selection = []

@@ -192,7 +192,7 @@ final class ReviewModelTests: XCTestCase {
             (.saved, .saved, nil),
             (.alreadyReviewed, .gone(.alreadyReviewed), "Already reviewed on the web"),
             (.alreadyInState, .gone(.alreadyDone), "Already done"),
-            (.suggestionGone, .gone(.itemRemoved), "That item was removed"),
+            (.suggestionGone, .gone(.listUpdated), "This list was updated"),
             (.itemGone, .gone(.itemRemoved), "That item was removed"),
             (.cannotKeepDuplicate, .gone(.alreadyReviewed), "Already reviewed on the web"),
             (.invalidRequest, .failed, nil),

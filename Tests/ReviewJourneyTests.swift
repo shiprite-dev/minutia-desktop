@@ -768,7 +768,9 @@ final class ReviewJourneyTests: XCTestCase {
         ReviewServer.delete(meetingId)
         await review.keep()
 
-        XCTAssertEqual(ReviewServer.saves.count, 2)
+        XCTAssertEqual(ReviewServer.saves.map(\.path), ["/api/meetings/3f95ffd6-fd1e-4640-aacc-89e1c051f742/suggestions/\(first.uuidString.lowercased())"],
+                       "the second row is never sent once the first says the list is gone")
+        XCTAssertNil(review.shown)
         XCTAssertNil(review.model)
         XCTAssertFalse(review.hasDot)
         await review.refreshQueue()
@@ -1360,6 +1362,68 @@ final class ReviewJourneyTests: XCTestCase {
         let seen = Host.text(menu(app))
         XCTAssertFalse(seen.has("to review"), seen.text)
         XCTAssertTrue(notices.isEmpty)
+    }
+
+    func test_saveForAMeetingWhoseListWasRerun_saysThisListWasUpdated_andSendsNothingMore() async throws {
+        let (first, second) = (UUID(), UUID())
+        ReviewServer.put(try meeting(rows: [row(first, "Send the budget"), row(second, "Book the Acme interview")]))
+        let review = review()
+        await openPanel(review)
+        await review.start(meetingId: meetingId).value
+        let rerun = try [row(UUID(), "Send the budget by Friday"), row(UUID(), "Book the Acme interview")]
+        ReviewServer.refuse(first, status: 404, code: "suggestion_gone")
+        ReviewServer.update(meetingId) { $0["rows"] = rerun; $0["status_at"] = self.stamp(self.clock.now) }
+
+        await review.keep()
+
+        XCTAssertEqual(ReviewServer.saves.map(\.path), ["/api/meetings/3f95ffd6-fd1e-4640-aacc-89e1c051f742/suggestions/\(first.uuidString.lowercased())"])
+        XCTAssertEqual(note(review, "Send the budget"), "This list was updated")
+        XCTAssertEqual(texts(review), ["New items", "Send the budget", "Send the budget by Friday", "Book the Acme interview"])
+        XCTAssertNil(note(review, "Book the Acme interview"), "the row that was never sent waits, untouched")
+        XCTAssertEqual(review.buttons.first?.title, "Keep 2")
+        XCTAssertEqual(ReviewServer.pendingRows(meetingId), ["Send the budget by Friday", "Book the Acme interview"])
+    }
+
+    func test_keepTwoThenReviewTheRestAndSkipOne_endsOnTwoItemsTracked() async throws {
+        let ids = [UUID(), UUID(), UUID()]
+        ReviewServer.put(try meeting(rows: [row(ids[0], "Send the budget"), row(ids[1], "Book the Acme interview"), row(ids[2], "Draft the hiring plan")]))
+        let review = review()
+        await openPanel(review)
+        await review.start(meetingId: meetingId).value
+        review.toggle(ids[2])
+        await review.keep()
+        XCTAssertEqual(review.shown?.screen.message, "2 items tracked. 1 still to review.")
+        XCTAssertEqual(review.buttons.map(\.title), ["Review the rest", "Done", "Open recap"])
+
+        review.reviewRest()
+        XCTAssertEqual(review.buttons.map(\.title), ["Keep", "Skip the rest", "Open recap"])
+        await tick(ReviewController.readyPoll)
+        await waitUntil { ReviewServer.meetingReads == 3 && clock.sleeping == 1 }
+        XCTAssertEqual(review.shown?.screen, .ready, "a check while reviewing the rest does not jump back to the tally")
+
+        await review.skipRest()
+        XCTAssertEqual(ReviewServer.saves.last?.body["action"] as? String, "reject")
+        XCTAssertEqual(review.shown?.screen.message, "2 items tracked")
+        XCTAssertEqual(ReviewServer.pendingRows(meetingId), [])
+    }
+
+    func test_tryAgainOnAFailedTranscription_countsTheSlowNoticeFromThePress() async throws {
+        ReviewServer.put(try meeting(transcription: "failed", suggestions: nil, endedAgo: 600))
+        ReviewServer.afterRetry(meetingId, becomes: try meeting(transcription: "processing", suggestions: nil, endedAgo: 600))
+        let review = review()
+        await openPanel(review)
+        await review.start(meetingId: meetingId).value
+
+        await review.tryAgain()
+        XCTAssertEqual(review.shown?.screen, .transcribing(elapsed: nil))
+        for n in 1...40 {
+            await tick(3)
+            await waitUntil { ReviewServer.meetingReads == 2 + n && clock.sleeping == 1 }
+        }
+        XCTAssertEqual(review.shown?.screen, .transcribing(elapsed: .seconds(120)), "two minutes after the press")
+        clock.advance(1)
+        await review.refresh()
+        XCTAssertEqual(review.shown?.screen.message, "Taking longer than usual. We'll let you know when it's ready.")
     }
 
     // MARK: - On screen

@@ -98,6 +98,7 @@ final class ReviewController: ObservableObject {
     private var postedHere: Set<UUID> = []
     private var generation = 0
     private var loadFailures = 0
+    private var transcribingSince: (meetingId: UUID, at: Date)?
     private var pollStarted = Date.distantPast
     private var pollTask: Task<Void, Never>?
     private var closeTask: Task<Void, Never>?
@@ -128,7 +129,7 @@ final class ReviewController: ObservableObject {
             loadFailures = 0
             let queued = queue.first { $0.meetingId == meetingId }
             meeting = queued
-            show(queued.map { ReviewModel.from($0, now: clock.now(), previous: nil) }
+            show(queued.map { reviewModel($0, previous: nil) }
                 ?? ReviewModel(meetingId: meetingId, screen: .transcribing(elapsed: nil)))
         } else if let line = spoken(model) {
             announce(line)
@@ -204,7 +205,7 @@ final class ReviewController: ObservableObject {
             loadFailures = 0
             meeting = fetched
             merge(fetched)
-            if !saving, retrying != id { show(ReviewModel.from(fetched, now: clock.now(), previous: model)) }
+            if !saving, retrying != id { show(reviewModel(fetched, previous: model)) }
         } catch ReviewQueueError.meetingGone {
             guard generation == self.generation, !saving else { return }
             queue.removeAll { $0.meetingId == id }
@@ -283,6 +284,7 @@ final class ReviewController: ObservableObject {
         guard transcription || (failed.screen == .findingFailed && meeting?.reviewer == true) else { return }
         let generation = generation
         retrying = id
+        if transcription { transcribingSince = (id, clock.now()) }
         show(ReviewModel(meetingId: id, screen: transcription ? .transcribing(elapsed: nil) : .finding))
         do {
             if transcription {
@@ -304,9 +306,17 @@ final class ReviewController: ObservableObject {
         await refresh()
     }
 
+    /// Back to the rows still open; what was already kept stays counted.
     func reviewRest() {
-        guard let meeting else { return }
-        show(ReviewModel.from(meeting, now: clock.now(), previous: nil))
+        guard var next = model else { return }
+        next.screen = .ready
+        show(next)
+        schedulePoll()
+    }
+
+    private func reviewModel(_ meeting: ReviewMeeting, previous: ReviewModel?) -> ReviewModel {
+        let since = transcribingSince.flatMap { $0.meetingId == meeting.meetingId ? $0.at : nil }
+        return ReviewModel.from(meeting, now: clock.now(), previous: previous, transcribingSince: since)
     }
 
     private func save(_ action: ReviewAction, _ ids: [UUID]) async {
@@ -324,6 +334,11 @@ final class ReviewController: ObservableObject {
             guard generation == self.generation else { return }
             guard var next = model, next.meetingId == meetingId else { saving = false; return }
             next.apply(result, to: id)
+            if result == .suggestionGone {
+                for rest in ids[(index + 1)...] { next.rowState[rest] = .idle }
+                show(next)
+                break
+            }
             if result == .signedOut {
                 for rest in ids[(index + 1)...] { next.rowState[rest] = .failed }
                 show(next)
